@@ -1,6 +1,6 @@
-﻿# MaixSense
+﻿# tof_pose
 
-MaixSense 项目当前围绕 3 个可直接运行的流程组织：
+tof_pose 项目当前围绕 3 个可直接运行的流程组织：
 
 - `scripts/tof_pose.py`：从 MaixSense 串口数据流进行实时姿态推理
 - `scripts/tof_record.py`：采集并保存 ToF 伪彩视频

@@ -9,8 +9,9 @@ import numpy as np
 import serial
 from ultralytics import YOLO
 
-from maixsense.paths import DEFAULT_MODEL_PATH
-from maixsense.pose_drawing import KPT_CONF_THRESHOLD, draw_stick_figure
+from tof_pose.paths import DEFAULT_MODEL_PATH
+from tof_pose.person_distance import estimate_person_distance
+from tof_pose.pose_drawing import KPT_CONF_THRESHOLD, draw_stick_figure
 
 
 BAUD = 921600
@@ -23,6 +24,8 @@ FRAME_QUEUE_MAXSIZE = 3
 DISPLAY_SIZE = (320, 320)
 DISPLAY_SCALE = 3
 CONF_THRESHOLD = 0.25
+WINDOW_NAME = "tof_pose"
+LOG_PREFIX = "[tof_pose]"
 
 
 def run(port: str = "COM8", model_path: Path | None = None) -> None:
@@ -34,7 +37,7 @@ def run(port: str = "COM8", model_path: Path | None = None) -> None:
     )
     stop_event = threading.Event()
 
-    print(f"[pose] port={port} model={model_file} size={DISPLAY_SIZE}")
+    print(f"{LOG_PREFIX} port={port} model={model_file} size={DISPLAY_SIZE}")
     ser.write(b"AT+FPS=19\r")
     time.sleep(0.1)
     ser.write(b"AT+DISP=2\r")
@@ -129,11 +132,11 @@ def run(port: str = "COM8", model_path: Path | None = None) -> None:
                         pass
 
     def processor_thread() -> None:
-        print("[pose] loading model...", flush=True)
+        print(f"{LOG_PREFIX} 正在加载模型...", flush=True)
         model = YOLO(str(model_file))
-        print("[pose] model ready, press q to quit.", flush=True)
+        print(f"{LOG_PREFIX} 模型加载完成，按 q 退出。", flush=True)
 
-        cv2.namedWindow("ToF Pose", cv2.WINDOW_AUTOSIZE)
+        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
         width, height = DISPLAY_SIZE
         last_print = time.time()
         interval_count = 0
@@ -145,7 +148,7 @@ def run(port: str = "COM8", model_path: Path | None = None) -> None:
                 now = time.time()
                 if now - last_print >= 5.0:
                     fps = interval_count / (now - last_print) if now > last_print else 0.0
-                    print(f"[{time.strftime('%H:%M:%S')}] fps={fps:.2f}", flush=True)
+                    print(f"[{time.strftime('%H:%M:%S')}] {LOG_PREFIX} fps={fps:.2f}", flush=True)
                     last_print = now
                     interval_count = 0
                 if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -164,8 +167,8 @@ def run(port: str = "COM8", model_path: Path | None = None) -> None:
             try:
                 results = model(color_img, conf=CONF_THRESHOLD, verbose=False)
             except Exception as exc:
-                print(f"[pose] inference failed: {exc}", flush=True)
-                cv2.imshow("ToF Pose", color_img)
+                print(f"{LOG_PREFIX} 推理失败: {exc}", flush=True)
+                cv2.imshow(WINDOW_NAME, color_img)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     stop_event.set()
                     break
@@ -174,19 +177,64 @@ def run(port: str = "COM8", model_path: Path | None = None) -> None:
             display = color_img.copy()
             result = results[0]
             num_persons = 0
-            if result.keypoints is not None:
+            distance_labels: list[str] = []
+            if result.keypoints is not None and result.boxes is not None:
                 kpts_xy = result.keypoints.xy.cpu().numpy()
                 kpts_conf = result.keypoints.conf.cpu().numpy()
-                num_persons = len(kpts_xy)
+                boxes_xyxy = result.boxes.xyxy.cpu().numpy()
+                num_persons = min(len(kpts_xy), len(boxes_xyxy))
+
                 for idx in range(num_persons):
                     draw_stick_figure(display, kpts_xy[idx], kpts_conf[idx], KPT_CONF_THRESHOLD)
+
+                    estimate = estimate_person_distance(
+                        depth_up,
+                        boxes_xyxy[idx],
+                        kpts_xy[idx],
+                        kpts_conf[idx],
+                        KPT_CONF_THRESHOLD,
+                    )
+
+                    if estimate.contour is not None:
+                        shifted_contour = estimate.contour + np.array([[[estimate.anchor[0], estimate.anchor[1]]]])
+                        cv2.drawContours(display, [shifted_contour], -1, (255, 255, 255), 1, cv2.LINE_AA)
+
+                    box = boxes_xyxy[idx]
+                    x1 = max(0, int(round(box[0])))
+                    y1 = max(0, int(round(box[1])) - 8)
+                    if estimate.distance is None:
+                        label = f"P{idx + 1} Dist=N/A"
+                    else:
+                        label = f"P{idx + 1} Dist~{estimate.distance:.1f}"
+                        distance_labels.append(f"P{idx + 1}:{estimate.distance:.1f}")
+                    cv2.putText(
+                        display,
+                        label,
+                        (x1, max(18, y1)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (255, 255, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
+                    cv2.putText(
+                        display,
+                        label,
+                        (x1, max(18, y1)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (20, 20, 20),
+                        1,
+                        cv2.LINE_AA,
+                    )
 
             interval_count += 1
             now = time.time()
             if now - last_print >= 5.0:
                 fps = interval_count / (now - last_print) if now > last_print else 0.0
+                distance_text = " ".join(distance_labels) if distance_labels else "none"
                 print(
-                    f"[{time.strftime('%H:%M:%S')}] fps={fps:.2f} detected={num_persons}",
+                    f"[{time.strftime('%H:%M:%S')}] {LOG_PREFIX} fps={fps:.2f} detected={num_persons} dist={distance_text}",
                     flush=True,
                 )
                 last_print = now
@@ -220,7 +268,7 @@ def run(port: str = "COM8", model_path: Path | None = None) -> None:
                 (width * DISPLAY_SCALE, height * DISPLAY_SCALE),
                 interpolation=cv2.INTER_NEAREST,
             )
-            cv2.imshow("ToF Pose", display_show)
+            cv2.imshow(WINDOW_NAME, display_show)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 stop_event.set()
                 break
@@ -240,7 +288,7 @@ def run(port: str = "COM8", model_path: Path | None = None) -> None:
         while not stop_event.is_set():
             time.sleep(0.1)
     except KeyboardInterrupt:
-        print("\n[pose] interrupted, shutting down...")
+        print(f"\n{LOG_PREFIX} 已中断，正在退出...")
         stop_event.set()
     finally:
         stop_event.set()

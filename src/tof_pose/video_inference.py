@@ -3,11 +3,13 @@
 import cv2
 from ultralytics import YOLO
 
-from maixsense.paths import DEFAULT_CAPTURE_VIDEO, DEFAULT_MODEL_PATH, DEFAULT_POSE_VIDEO
-from maixsense.pose_drawing import KPT_CONF_THRESHOLD, draw_stick_figure
+from tof_pose.paths import DEFAULT_CAPTURE_VIDEO, DEFAULT_MODEL_PATH, DEFAULT_POSE_VIDEO
+from tof_pose.pose_drawing import KPT_CONF_THRESHOLD, draw_stick_figure
 
 
 CONF_THRESHOLD = 0.25
+WINDOW_NAME = "tof_pose_video_inference"
+LOG_PREFIX = "[tof_pose_video_inference]"
 
 
 def run(
@@ -21,12 +23,12 @@ def run(
 
     target.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"[infer] loading model: {model_file}")
+    print(f"{LOG_PREFIX} 正在加载模型: {model_file}")
     model = YOLO(str(model_file))
 
     cap = cv2.VideoCapture(str(source))
     if not cap.isOpened():
-        print(f"[infer] cannot open video: {source}")
+        print(f"{LOG_PREFIX} 无法打开视频: {source}")
         return
 
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -41,7 +43,7 @@ def run(
         (width, height),
     )
 
-    print(f"[infer] processing {source} total_frames={total_frames}")
+    print(f"{LOG_PREFIX} 开始处理: {source} total_frames={total_frames}")
     frame_idx = 0
 
     while cap.isOpened():
@@ -64,13 +66,13 @@ def run(
 
         if frame_idx % 10 == 0 and total_frames:
             percent = (frame_idx / total_frames) * 100
-            print(f"[infer] {frame_idx}/{total_frames} ({percent:.1f}%)", end="\r")
+            print(f"{LOG_PREFIX} {frame_idx}/{total_frames} ({percent:.1f}%)", end="\r")
 
-        cv2.imshow("Video Inference", display_frame)
+        cv2.imshow(WINDOW_NAME, display_frame)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
     cap.release()
     out.release()
     cv2.destroyAllWindows()
-    print(f"\n[infer] done: {target}")
+    print(f"\n{LOG_PREFIX} 处理完成: {target}")

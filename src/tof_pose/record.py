@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 import serial
 
-from maixsense.paths import DEFAULT_CAPTURE_VIDEO
+from tof_pose.paths import DEFAULT_CAPTURE_VIDEO
 
 
 BAUD = 921600
@@ -22,6 +22,8 @@ DISPLAY_SIZE = (320, 320)
 DISPLAY_SCALE = 2
 VIDEO_FPS = 20.0
 FOURCC = cv2.VideoWriter_fourcc(*"mp4v")
+WINDOW_NAME = "tof_pose_record"
+LOG_PREFIX = "[tof_pose_record]"
 
 
 def run(port: str = "COM8", output_file: Path | None = None) -> None:
@@ -36,9 +38,9 @@ def run(port: str = "COM8", output_file: Path | None = None) -> None:
         time.sleep(0.1)
         ser.write(b"AT+DISP=2\r")
         time.sleep(0.1)
-        print(f"[record] serial ready: {port}")
+        print(f"{LOG_PREFIX} 串口已连接: {port}")
     except Exception as exc:
-        print(f"[record] serial open failed: {exc}")
+        print(f"{LOG_PREFIX} 串口打开失败: {exc}")
         return
 
     raw_queue: queue.Queue[bytes] = queue.Queue(maxsize=RAW_QUEUE_MAXSIZE)
@@ -122,9 +124,9 @@ def run(port: str = "COM8", output_file: Path | None = None) -> None:
                     frame_queue.put_nowait((res_r, res_c, payload))
 
     def processor() -> None:
-        print(f"[record] writing to {target_file}")
+        print(f"{LOG_PREFIX} 正在写入: {target_file}")
         video_writer = cv2.VideoWriter(str(target_file), FOURCC, VIDEO_FPS, DISPLAY_SIZE)
-        cv2.namedWindow("ToF Record", cv2.WINDOW_AUTOSIZE)
+        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
         frame_count = 0
 
         while not stop_event.is_set():
@@ -160,7 +162,7 @@ def run(port: str = "COM8", output_file: Path | None = None) -> None:
                 (0, 255, 0),
                 2,
             )
-            cv2.imshow("ToF Record", show_img)
+            cv2.imshow(WINDOW_NAME, show_img)
 
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 stop_event.set()
@@ -168,7 +170,7 @@ def run(port: str = "COM8", output_file: Path | None = None) -> None:
 
         video_writer.release()
         cv2.destroyAllWindows()
-        print(f"[record] saved: {target_file} frames={frame_count}")
+        print(f"{LOG_PREFIX} 已保存: {target_file} frames={frame_count}")
 
     threads = [
         threading.Thread(target=reader_thread, daemon=True),
@@ -187,4 +189,4 @@ def run(port: str = "COM8", output_file: Path | None = None) -> None:
             ser.close()
         except Exception:
             pass
-        print("[record] serial closed.")
+        print(f"{LOG_PREFIX} 串口已关闭。")

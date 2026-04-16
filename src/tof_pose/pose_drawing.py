@@ -2,7 +2,7 @@
 import numpy as np
 
 
-KPT_CONF_THRESHOLD = 0.4
+KPT_CONF_THRESHOLD = 0.5
 
 # YOLO 姿态模型使用的 COCO 17 点骨架连接关系。
 SKELETON_CONNECTIONS = [

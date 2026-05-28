@@ -20,6 +20,45 @@ python scripts/tof_record.py COM8
 python scripts/tof_video_inference.py
 ```
 
+## gRPC Server (Recommended Commands)
+
+Defaults: port `50052`, max message size `50MB`.
+
+### 1) Default mode (keeps cross-call cache/tracking)
+
+Best for continuous streams (serial/video).
+
+```powershell
+python scripts/grpc_server.py --host 0.0.0.0 --port 50052 --max-workers 1
+```
+
+### 2) Stateless mode (treat every call as the first frame)
+
+Best for single images or sparse frames.
+
+```powershell
+python scripts/grpc_server.py --host 0.0.0.0 --port 50052 --max-workers 1 --stateless
+```
+
+### 3) ToF pose-only (no segmentation; use your trained pose weights)
+
+If the segmentation model does not detect people on ToF pseudo-color inputs, use pose-only to derive `person_count` from pose keypoints and render skeleton output.
+
+```powershell
+python scripts/grpc_server.py --host 0.0.0.0 --port 50052 --max-workers 1 --stateless --pose-only --pose-model-path assets/models/tof_pose_best.pt --pose-conf 0.15
+```
+
+Optional knobs for pose-only counting:
+
+- `--pose-kpt-conf` (default 0.20)
+- `--pose-kpt-min-points` (default 4)
+
+### 4) Single-image client smoke test
+
+```powershell
+python scripts/grpc_client_test.py <input.png> <frame_id> --device-id device_0000 --host 127.0.0.1 --port 50052
+```
+
 ## Workflow
 
 ### Real-Time Pose Inference

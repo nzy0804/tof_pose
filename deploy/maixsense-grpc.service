@@ -1,0 +1,20 @@
+[Unit]
+Description=MaixSense AI gRPC Server
+After=network.target
+
+[Service]
+Type=simple
+User=maixsense
+WorkingDirectory=/opt/maixsense
+ExecStart=/opt/maixsense/maixsense-grpc-server --host 0.0.0.0 --port 50052
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Resource limits
+CPUQuota=80%
+MemoryLimit=4G
+
+[Install]
+WantedBy=multi-user.target

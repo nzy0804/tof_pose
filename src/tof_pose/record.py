@@ -2,6 +2,7 @@
 import struct
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -29,6 +30,8 @@ LOG_PREFIX = "[tof_pose_record]"
 def run(port: str = "COM8", output_file: Path | None = None) -> None:
     target_file = Path(output_file) if output_file else DEFAULT_CAPTURE_VIDEO
     target_file.parent.mkdir(parents=True, exist_ok=True)
+    snapshots_dir = target_file.parents[1] / "snapshots" if target_file.parent.name == "videos" else target_file.parent / "snapshots"
+    snapshots_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         ser = serial.Serial(port, BAUD, timeout=TIMEOUT)
@@ -129,6 +132,31 @@ def run(port: str = "COM8", output_file: Path | None = None) -> None:
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
         frame_count = 0
 
+        last_color_img: np.ndarray | None = None
+
+        btn_tl = (10, 50)
+        btn_br = (140, 90)
+
+        def save_snapshot() -> None:
+            nonlocal last_color_img, frame_count
+            if last_color_img is None:
+                return
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+            out_path = snapshots_dir / f"snap_{ts}_f{frame_count:06d}.png"
+            ok = cv2.imwrite(str(out_path), last_color_img)
+            if ok:
+                print(f"{LOG_PREFIX} 抓拍已保存: {out_path}")
+            else:
+                print(f"{LOG_PREFIX} 抓拍保存失败: {out_path}")
+
+        def on_mouse(event: int, x: int, y: int, flags: int, param: object) -> None:
+            if event != cv2.EVENT_LBUTTONDOWN:
+                return
+            if btn_tl[0] <= x <= btn_br[0] and btn_tl[1] <= y <= btn_br[1]:
+                save_snapshot()
+
+        cv2.setMouseCallback(WINDOW_NAME, on_mouse)
+
         while not stop_event.is_set():
             try:
                 res_r, res_c, payload = frame_queue.get(timeout=0.1)
@@ -145,6 +173,7 @@ def run(port: str = "COM8", output_file: Path | None = None) -> None:
             color_img = cv2.applyColorMap(depth_up, cv2.COLORMAP_MAGMA)
             video_writer.write(color_img)
             frame_count += 1
+            last_color_img = color_img
 
             show_img = cv2.resize(
                 color_img,
@@ -162,11 +191,25 @@ def run(port: str = "COM8", output_file: Path | None = None) -> None:
                 (0, 255, 0),
                 2,
             )
+
+            cv2.rectangle(show_img, btn_tl, btn_br, (255, 255, 255), 2)
+            cv2.putText(
+                show_img,
+                "SNAP",
+                (btn_tl[0] + 10, btn_br[1] - 12),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2,
+            )
             cv2.imshow(WINDOW_NAME, show_img)
 
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
                 stop_event.set()
                 break
+            if key == ord("s"):
+                save_snapshot()
 
         video_writer.release()
         cv2.destroyAllWindows()

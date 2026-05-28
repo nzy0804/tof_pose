@@ -2,4 +2,30 @@
 *.pyc
 .DS_Store
 
-outputs/videos/*.mp4
+outputs/
+runs/
+dist/
+build/
+
+# Local virtual environments
+maixsense/
+
+# Large media files
+*.avi
+*.mp4
+
+# Trained weights
+assets/models/*.pt
+
+# Local datasets (keep dataset.yaml / README.md tracked)
+dataset/images/
+dataset/labels/
+dataset/meta/
+
+# CVAT export tasks
+task_*/
+
+# Local sample images at repo root
+/*.png
+/*.jpg
+/*.jpeg

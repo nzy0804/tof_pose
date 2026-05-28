@@ -52,18 +52,19 @@ def draw_stick_figure(
     keypoints: np.ndarray,
     kpt_conf: np.ndarray,
     threshold: float = KPT_CONF_THRESHOLD,
+    color_override: tuple[int, int, int] | None = None,
 ) -> None:
     # 先画肢体连线，确保关键点圆点始终显示在最上层。
     for i, j in SKELETON_CONNECTIONS:
         if kpt_conf[i] >= threshold and kpt_conf[j] >= threshold:
             pt1 = (int(keypoints[i][0]), int(keypoints[i][1]))
             pt2 = (int(keypoints[j][0]), int(keypoints[j][1]))
-            color = SKELETON_COLORS.get((i, j), (0, 255, 0))
+            color = color_override if color_override is not None else SKELETON_COLORS.get((i, j), (0, 255, 0))
             cv2.line(img, pt1, pt2, color, 2, cv2.LINE_AA)
 
     for idx in range(len(keypoints)):
         if kpt_conf[idx] >= threshold:
-            color = KPT_COLOR_HEAD if idx < 5 else KPT_COLOR_BODY
+            color = color_override if color_override is not None else (KPT_COLOR_HEAD if idx < 5 else KPT_COLOR_BODY)
             center = (int(keypoints[idx][0]), int(keypoints[idx][1]))
             cv2.circle(img, center, 5, color, -1, cv2.LINE_AA)
             cv2.circle(img, center, 5, (255, 255, 255), 1, cv2.LINE_AA)

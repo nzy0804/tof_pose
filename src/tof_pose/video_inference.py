@@ -79,12 +79,18 @@ def run(
     if view not in (VIEW_GRAY, VIEW_COLOR, VIEW_SKELETON, VIEW_CONTOUR):
         raise ValueError(f"invalid view: {view}")
 
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
 
-        ok, buf = cv2.imencode(".png", frame, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.medianBlur(gray, 5)
+        gray = clahe.apply(gray)
+
+        ok, buf = cv2.imencode(".png", gray, [cv2.IMWRITE_PNG_COMPRESSION, 3])
         if not ok:
             raise RuntimeError("failed to encode frame as PNG")
 

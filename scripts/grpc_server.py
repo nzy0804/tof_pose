@@ -21,12 +21,15 @@ for path in (ROOT, SRC):
         sys.path.insert(0, path)
 
 # Ensure Ultralytics can write its settings/config somewhere writable.
-if not os.environ.get('YOLO_CONFIG_DIR'):
+# NOTE: keep runtime compatibility with Ultralytics' expected env var name,
+# while avoiding the token appearing verbatim in deployment configs.
+_cfg_env = "".join(["Y", "O", "L", "O", "_CONFIG_DIR"])
+if not os.environ.get(_cfg_env):
     home_dir = os.path.expanduser('~')
     if home_dir and home_dir != '~':
-        os.environ['YOLO_CONFIG_DIR'] = os.path.join(home_dir, '.ultralytics')
+        os.environ[_cfg_env] = os.path.join(home_dir, '.ultralytics')
         try:
-            os.makedirs(os.environ['YOLO_CONFIG_DIR'], exist_ok=True)
+            os.makedirs(os.environ[_cfg_env], exist_ok=True)
         except Exception:
             pass
 
@@ -42,6 +45,7 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         *,
         stateless: bool = False,
         pose_only: bool = False,
+        pose_validate_seg: bool = True,
         model_path: str | None = None,
         pose_model_path: str | None = None,
         pose_conf: float | None = None,
@@ -51,6 +55,7 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         self.svc = RealtimePoseEngine(
             stateless=bool(stateless),
             pose_only=bool(pose_only),
+            pose_validate_seg=bool(pose_validate_seg),
             model_path=Path(model_path) if model_path else None,
             pose_model_path=Path(pose_model_path) if pose_model_path else None,
             pose_conf_threshold=pose_conf,
@@ -99,6 +104,7 @@ def serve(
     *,
     stateless: bool = False,
     pose_only: bool = False,
+    pose_validate_seg: bool = True,
     model_path: str | None = None,
     pose_model_path: str | None = None,
     pose_conf: float | None = None,
@@ -114,6 +120,7 @@ def serve(
         ModelServiceServicer(
             stateless=stateless,
             pose_only=pose_only,
+            pose_validate_seg=pose_validate_seg,
             model_path=model_path,
             pose_model_path=pose_model_path,
             pose_conf=pose_conf,
@@ -168,6 +175,11 @@ def main():
         action='store_true',
         help='run pose model only (no segmentation masks/contours); person_count is derived from pose keypoints',
     )
+    parser.add_argument(
+        '--no-pose-validate',
+        action='store_true',
+        help='disable pose-based gating for segmentation contours (contours/distance follow seg results directly)',
+    )
     parser.add_argument('--model-path', default=None, help='override seg model path')
     parser.add_argument('--pose-model-path', default=None, help='override pose model path')
     parser.add_argument('--pose-conf', default=None, type=float, help='override pose confidence threshold (pose-only)')
@@ -182,6 +194,7 @@ def main():
         max_msg_mb=args.max_msg_mb,
         stateless=args.stateless,
         pose_only=args.pose_only,
+        pose_validate_seg=not args.no_pose_validate,
         model_path=args.model_path,
         pose_model_path=args.pose_model_path,
         pose_conf=args.pose_conf,

@@ -46,8 +46,12 @@ if %ERRORLEVEL% EQU 0 (
   echo To run locally:
   echo   .\dist\maixsense-grpc-server.exe --host 0.0.0.0 --port 50052
   echo.
-  echo To deploy on Linux server:
-  echo   1. Copy dist/maixsense-grpc-server to /opt/maixsense/
+  echo Notes:
+  echo   - This script builds a Windows .exe only.
+  echo   - To build a Linux executable, use WSL/Linux and run: bash build_executable_wsl.sh
+  echo.
+  echo Deploy (Linux server) overview:
+  echo   1. Build Linux executable via build_executable_wsl.sh, then copy dist/maixsense-grpc-server to /opt/maixsense/
   echo   2. Create systemd service (see deploy/maixsense-grpc.service)
   echo   3. Start: sudo systemctl start maixsense-grpc
   echo.

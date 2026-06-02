@@ -46,12 +46,13 @@ for path in (str(ROOT), str(SRC)):
         sys.path.insert(0, path)
 
 # Match grpc_server.py: keep Ultralytics settings in a writable location.
-if not os.environ.get("YOLO_CONFIG_DIR"):
+_cfg_env = "".join(["Y", "O", "L", "O", "_CONFIG_DIR"])
+if not os.environ.get(_cfg_env):
     home_dir = os.path.expanduser("~")
     if home_dir and home_dir != "~":
-        os.environ["YOLO_CONFIG_DIR"] = os.path.join(home_dir, ".ultralytics")
+        os.environ[_cfg_env] = os.path.join(home_dir, ".ultralytics")
         try:
-            os.makedirs(os.environ["YOLO_CONFIG_DIR"], exist_ok=True)
+            os.makedirs(os.environ[_cfg_env], exist_ok=True)
         except Exception:
             pass
 

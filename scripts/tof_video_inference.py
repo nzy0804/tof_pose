@@ -51,6 +51,11 @@ def _parse_args() -> argparse.Namespace:
         help="Use pose model only (no segmentation dependency); person_count is derived from keypoints.",
     )
     parser.add_argument(
+        "--no-pose-validate",
+        action="store_true",
+        help="Disable pose-based gating for segmentation contours (contours follow seg results directly).",
+    )
+    parser.add_argument(
         "--pose-model-path",
         type=Path,
         default=None,
@@ -96,6 +101,7 @@ if __name__ == "__main__":
         model_path=args.model,
         stateless=args.stateless,
         pose_only=args.pose_only,
+        pose_validate_seg=not args.no_pose_validate,
         pose_model_path=args.pose_model_path,
         pose_conf=args.pose_conf,
         pose_kpt_conf=args.pose_kpt_conf,

@@ -24,6 +24,7 @@ def run(
     *,
     stateless: bool = False,
     pose_only: bool = False,
+    pose_validate_seg: bool = True,
     pose_model_path: Path | None = None,
     pose_conf: float | None = None,
     pose_kpt_conf: float | None = None,
@@ -46,6 +47,7 @@ def run(
         pose_model_path=pose_model_file,
         stateless=bool(stateless),
         pose_only=bool(pose_only),
+        pose_validate_seg=bool(pose_validate_seg),
         pose_conf_threshold=pose_conf,
         pose_kpt_conf_threshold=pose_kpt_conf,
         pose_kpt_min_points=int(pose_kpt_min_points),
@@ -79,16 +81,12 @@ def run(
     if view not in (VIEW_GRAY, VIEW_COLOR, VIEW_SKELETON, VIEW_CONTOUR):
         raise ValueError(f"invalid view: {view}")
 
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.medianBlur(gray, 5)
-        gray = clahe.apply(gray)
 
         ok, buf = cv2.imencode(".png", gray, [cv2.IMWRITE_PNG_COMPRESSION, 3])
         if not ok:

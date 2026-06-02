@@ -4,13 +4,33 @@
 
 ### 1. 在本地生成可执行文件
 
-首先，在 Windows 本地机器上生成可执行文件：
+在 Linux 服务器上运行的可执行文件，必须在 **Linux/WSL** 环境里构建（PyInstaller 不能从 Windows 直接产出 Linux 可执行文件）。
+
+推荐在 Windows 上用 WSL2（Ubuntu）构建：
 
 ```bash
-.\build_executable.bat
+# 进入仓库根目录（WSL 路径通常是 /mnt/e/...）
+cd /mnt/e/Project/Lab\ Project/MaixSense
+
+# 创建并激活一个 venv（脚本默认使用 maixsense 这个目录名）
+python3 -m venv maixsense
+source maixsense/bin/activate
+
+# 安装打包所需依赖（没有 requirements.txt 时按项目 import 安装）
+python -m pip install -U pip
+pip install pyinstaller ultralytics opencv-python-headless grpcio numpy
+
+# 生成 Linux 可执行文件（输出到 dist/maixsense-grpc-server）
+bash build_executable_wsl.sh
 ```
 
-构建完成后，在 `dist/` 目录下会生成 `maixsense-grpc-server` 可执行文件。
+构建完成后，在 `dist/` 目录下会生成 Linux 可执行文件 `maixsense-grpc-server`。
+
+如果你要在 Windows 上生成 Windows 可执行文件（仅用于 Windows 部署/本地调试），再使用：
+
+```bat
+build_executable.bat
+```
 
 ### 2. 上传到服务器
 
@@ -221,4 +241,4 @@ server {
 4. `sudo systemctl start maixsense-grpc`
 5. 验证：`sudo systemctl status maixsense-grpc`
 
-就这样。代码和模型权重都不用传，只传一个可执行文件即可。
+就这样。默认情况下 `assets/` 会被打包进可执行文件（见仓库根目录的 `maixsense-grpc-server.spec`），通常只需要传一个可执行文件即可。

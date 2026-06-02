@@ -1,6 +1,6 @@
 # AI 模型 gRPC 接口对接说明
 
-本文档说明平台如何调用当前的 AI 模型接口。接口以 `ai.proto` 为准，调用方式为 gRPC Unary RPC。当前服务端内部接的是实时 YOLO/ToF 处理链路，对外仍然只暴露一个 `Infer` 接口。
+本文档说明平台如何调用当前的 AI 模型接口。接口以 `ai.proto` 为准，调用方式为 gRPC Unary RPC。当前服务端内部接的是实时 ToF 姿态/轮廓处理链路（基于 Ultralytics 推理），对外仍然只暴露一个 `Infer` 接口。
 
 ## 1. 接口概览
 

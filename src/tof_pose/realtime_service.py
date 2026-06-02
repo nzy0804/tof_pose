@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 import threading
 import time
 from dataclasses import dataclass
@@ -14,7 +15,7 @@ from tof_pose.person_distance import estimate_person_distance_from_mask
 from tof_pose.pose_drawing import draw_stick_figure
 
 
-CONF_THRESHOLD = 0.25
+CONF_THRESHOLD = 0.2
 TRACKER_CONFIG = "botsort.yaml"
 SEG_INFER_IMGSZ = 320
 POSE_INFER_IMGSZ = 320
@@ -23,11 +24,22 @@ MASK_BLEND_ALPHA = 0.25
 DISPLAY_SIZE = (320, 320)
 DISPLAY_SCALE = 3
 
+MEDIAN_BLUR_K = 5
+CLAHE_CLIP_LIMIT = 2.0
+CLAHE_TILE_GRID = (8, 8)
+
 DISPLAY_MODE_BOTH = "both"
 DISPLAY_MODE_CONTOUR_ONLY = "contour"
 DISPLAY_MODE_SKELETON_ONLY = "skeleton"
 DISPLAY_MODE_RAW_ONLY = "raw"
 
+TRACK_VOTE_WINDOW = 5
+TRACK_VOTE_MIN_POS = 2
+TRACK_TTL_FRAMES = 5
+TRACK_STATE_STALE_AFTER = 30
+MASK_MAX_AREA_RATIO = 0.5
+MASK_AREA_JUMP_RATIO = 1.5
+MASK_JUMP_HOLD_FRAMES = 2
 
 TRACK_COLORS = [
     (40, 210, 255),
@@ -148,6 +160,21 @@ class _FrameViewSet:
     person_count: int
 
 
+@dataclass
+class _TrackGateState:
+    votes: deque
+    ttl_remaining: int
+    confirmed: bool
+    last_seen_frame: int
+
+
+@dataclass
+class _MaskJumpState:
+    mask: np.ndarray
+    last_seen_frame: int
+    rejected_frames: int
+
+
 class RealtimePoseEngine:
     def __init__(
         self,
@@ -157,6 +184,7 @@ class RealtimePoseEngine:
         stateless: bool = False,
         persist_tracks: bool | None = None,
         pose_only: bool = False,
+        pose_validate_seg: bool = True,
         pose_conf_threshold: float | None = None,
         pose_kpt_conf_threshold: float | None = None,
         pose_kpt_min_points: int = 4,
@@ -170,6 +198,7 @@ class RealtimePoseEngine:
         self._stateless = bool(stateless)
         self._persist_tracks = (not self._stateless) if persist_tracks is None else bool(persist_tracks)
         self._pose_only = bool(pose_only)
+        self._pose_validate_seg = bool(pose_validate_seg)
         if pose_conf_threshold is None and self._pose_only:
             self._pose_conf_threshold = 0.15
         else:
@@ -184,7 +213,11 @@ class RealtimePoseEngine:
         self._cached_kpt_conf: np.ndarray | None = None
         self._warned_no_masks = False
         self._warned_no_keypoints = False
+        self._warned_pose_gate_fallback = False
         self._last_views: tuple[bytes, bytes, bytes, bytes] | None = None
+        self._clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP_LIMIT, tileGridSize=CLAHE_TILE_GRID)
+        self._track_gate: dict[int, _TrackGateState] = {}
+        self._mask_jump_state: dict[int, _MaskJumpState] = {}
 
     def reset(self) -> None:
         """Reset per-stream caches so next infer behaves like the first frame."""
@@ -193,6 +226,58 @@ class RealtimePoseEngine:
         self._cached_kpt_xy = None
         self._cached_kpt_conf = None
         self._last_views = None
+        self._track_gate.clear()
+        self._mask_jump_state.clear()
+
+    def _guard_mask_jump(self, track_id: int, mask: np.ndarray) -> np.ndarray | None:
+        """Reject short-lived, per-track mask area spikes without averaging masks."""
+        if mask.ndim != 2:
+            raise ValueError("mask must be single-channel")
+        current = (mask > 0).astype(np.uint8)
+        current_area = int(np.count_nonzero(current))
+        max_area = int(current.size * float(MASK_MAX_AREA_RATIO))
+        state = self._mask_jump_state.get(int(track_id))
+
+        if state is None:
+            if current_area > max_area:
+                return None
+            self._mask_jump_state[int(track_id)] = _MaskJumpState(
+                mask=current.copy(),
+                last_seen_frame=int(self._frame_idx),
+                rejected_frames=0,
+            )
+            return current
+
+        previous = state.mask
+        if previous.shape != current.shape:
+            previous = cv2.resize(previous, (current.shape[1], current.shape[0]), interpolation=cv2.INTER_NEAREST)
+        previous_area = int(np.count_nonzero(previous))
+
+        if current_area > max_area:
+            if previous_area > 0 and previous_area <= max_area and int(state.rejected_frames) < int(MASK_JUMP_HOLD_FRAMES):
+                state.mask = previous.copy()
+                state.last_seen_frame = int(self._frame_idx)
+                state.rejected_frames = int(state.rejected_frames) + 1
+                return previous.copy()
+            return None
+
+        area_jump = False
+        if previous_area > 0 and current_area > 0:
+            area_ratio = float(max(current_area / previous_area, previous_area / current_area))
+            area_jump = area_ratio > float(MASK_AREA_JUMP_RATIO)
+        elif previous_area > 0 and current_area == 0:
+            area_jump = True
+
+        if area_jump and int(state.rejected_frames) < int(MASK_JUMP_HOLD_FRAMES):
+            state.mask = previous.copy()
+            state.last_seen_frame = int(self._frame_idx)
+            state.rejected_frames = int(state.rejected_frames) + 1
+            return previous.copy()
+
+        state.mask = current.copy()
+        state.last_seen_frame = int(self._frame_idx)
+        state.rejected_frames = 0
+        return current
 
     def _decode_image(self, data: bytes) -> np.ndarray:
         arr = np.frombuffer(data, dtype=np.uint8)
@@ -203,10 +288,42 @@ class RealtimePoseEngine:
             return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         return img
 
+    def _ensure_uint8_gray(self, gray: np.ndarray) -> np.ndarray:
+        """Ensure input is a single-channel uint8 image.
+
+        The gRPC pipeline assumes an 8-bit depth-like grayscale image.
+        If upstream data is 16-bit or float, normalize to 0..255.
+        """
+        if gray.ndim != 2:
+            raise ValueError("expected single-channel grayscale image")
+        if gray.dtype == np.uint8:
+            return gray
+
+        gray_float = gray.astype(np.float32, copy=False)
+        min_val = float(np.min(gray_float)) if gray_float.size else 0.0
+        max_val = float(np.max(gray_float)) if gray_float.size else 0.0
+        if not gray_float.size or max_val <= min_val:
+            return np.zeros_like(gray_float, dtype=np.uint8)
+
+        normalized = cv2.normalize(gray_float, None, 0, 255, cv2.NORM_MINMAX)
+        return normalized.astype(np.uint8)
+
     def _analyze_frame(self, depth_gray: np.ndarray) -> dict:
         self._frame_idx += 1
         width, height = DISPLAY_SIZE
-        depth_up = cv2.resize(depth_gray, DISPLAY_SIZE, interpolation=cv2.INTER_LINEAR)
+        depth_u8 = self._ensure_uint8_gray(depth_gray)
+
+        # Keep a non-equalized copy (resized only) for distance estimation.
+        depth_raw = cv2.resize(depth_u8, DISPLAY_SIZE, interpolation=cv2.INTER_LINEAR)
+
+        # Match the previous offline video inference pipeline:
+        # grayscale -> median blur -> CLAHE -> (then) resize to 320x320.
+        enhanced = depth_u8
+        if MEDIAN_BLUR_K and MEDIAN_BLUR_K >= 3:
+            enhanced = cv2.medianBlur(enhanced, MEDIAN_BLUR_K)
+        enhanced = self._clahe.apply(enhanced)
+
+        depth_up = cv2.resize(enhanced, DISPLAY_SIZE, interpolation=cv2.INTER_LINEAR)
         color_img = cv2.applyColorMap(depth_up, cv2.COLORMAP_MAGMA)
 
         # Pose-only mode: do not rely on segmentation model outputs.
@@ -317,11 +434,19 @@ class RealtimePoseEngine:
                 if result.boxes.id is not None
                 else list(range(1, len(boxes_xyxy) + 1))
             )
+            conf_scores = (
+                result.boxes.conf.cpu().numpy()
+                if getattr(result.boxes, "conf", None) is not None
+                else np.ones(len(boxes_xyxy), dtype=np.float32)
+            )
             masks_data = result.masks.data.cpu().numpy()
 
-            match_count = min(len(boxes_xyxy), len(masks_data), len(track_ids))
+            match_count = min(len(boxes_xyxy), len(masks_data), len(track_ids), len(conf_scores))
             seg_boxes_for_match = [boxes_xyxy[idx].copy() for idx in range(match_count)]
             seg_track_ids_for_match = [int(track_ids[idx]) for idx in range(match_count)]
+
+            # Pose-based validation candidates for this frame.
+            pose_validated_track_ids: set[int] = set()
 
             if pose_boxes_np:
                 pose_to_track = _match_pose_to_seg_tracks(seg_boxes_for_match, seg_track_ids_for_match, pose_boxes_np)
@@ -331,6 +456,71 @@ class RealtimePoseEngine:
                             continue
                         confident_points = int(np.sum(kpt_conf_np[pose_idx] >= 0.35))
                         if confident_points >= 4:
+                            pose_validated_track_ids.add(int(track_id))
+
+            if not self._pose_validate_seg:
+                # Disable pose-based gating: allow all seg tracks to contribute contours/distances.
+                validated_track_ids = set(int(tid) for tid in seg_track_ids_for_match)
+            else:
+                # Track-level temporal gating:
+                # - Sliding window votes to confirm a track (reduces flicker).
+                # - TTL keep-alive to avoid brief pose dropouts causing gaps.
+                pose_available = kpt_conf_np is not None
+                if not pose_available:
+                    # If pose model produces no keypoints at all, gating cannot work.
+                    # Fall back to seg-only (same as --no-pose-validate) for continuity.
+                    validated_track_ids = set(int(tid) for tid in seg_track_ids_for_match)
+                    if not self._warned_pose_gate_fallback:
+                        print(
+                            "[tof_pose] pose 门控不可用(当前无 keypoints 输出)，已回退为 seg-only 以避免输出断档。",
+                            flush=True,
+                        )
+                        self._warned_pose_gate_fallback = True
+                else:
+                    for track_id in seg_track_ids_for_match:
+                        state = self._track_gate.get(int(track_id))
+                        if state is None:
+                            state = _TrackGateState(
+                                votes=deque(maxlen=TRACK_VOTE_WINDOW),
+                                ttl_remaining=0,
+                                confirmed=False,
+                                last_seen_frame=self._frame_idx,
+                            )
+                            self._track_gate[int(track_id)] = state
+
+                        supported = int(track_id) in pose_validated_track_ids
+                        state.votes.append(bool(supported))
+                        state.last_seen_frame = self._frame_idx
+                        if supported:
+                            state.ttl_remaining = int(TRACK_TTL_FRAMES)
+                        else:
+                            state.ttl_remaining = max(0, int(state.ttl_remaining) - 1)
+
+                        # Sliding-window confirmation: require >=K positives within last N frames.
+                        vote_pos = int(sum(1 for v in state.votes if v))
+                        if (not state.confirmed) and (vote_pos >= TRACK_VOTE_MIN_POS):
+                            state.confirmed = True
+
+                    # Drop stale states to avoid unbounded growth.
+                    stale: list[int] = []
+                    for tid, state in self._track_gate.items():
+                        if (self._frame_idx - int(state.last_seen_frame)) > int(TRACK_STATE_STALE_AFTER):
+                            stale.append(int(tid))
+                    for tid in stale:
+                        self._track_gate.pop(int(tid), None)
+
+                    validated_track_ids = set()
+                    for track_id in seg_track_ids_for_match:
+                        state = self._track_gate.get(int(track_id))
+                        if state is None:
+                            continue
+
+                        vote_pos = int(sum(1 for v in state.votes if v))
+                        passes_vote = vote_pos >= TRACK_VOTE_MIN_POS
+                        passes_ttl = int(state.ttl_remaining) > 0
+                        passes_instant = int(track_id) in pose_validated_track_ids
+
+                        if passes_instant or passes_vote or passes_ttl:
                             validated_track_ids.add(int(track_id))
 
             for idx in range(match_count):
@@ -339,16 +529,23 @@ class RealtimePoseEngine:
                 if track_id not in validated_track_ids:
                     continue
                 track_color = _track_color(track_id)
+                person_conf = float(conf_scores[idx])
                 mask = (masks_data[idx] > 0.5).astype(np.uint8)
-                estimate = estimate_person_distance_from_mask(depth_up, box, mask)
+                if mask.shape[:2] != (height, width):
+                    mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+                mask = self._guard_mask_jump(track_id, mask)
+                if mask is None:
+                    continue
+                # Use non-equalized depth values for distance estimation.
+                estimate = estimate_person_distance_from_mask(depth_raw, box, mask)
                 person_count += 1
 
                 if estimate.distance is None:
                     tracked_labels.append(f"{track_id}:N/A")
-                    label = f"ID {track_id} Dist=N/A"
+                    label = f"ID {track_id} P={person_conf * 100:.0f}% Dist=N/A"
                 else:
                     tracked_labels.append(f"{track_id}:{estimate.distance:.1f}")
-                    label = f"ID {track_id} Dist~{estimate.distance:.1f}"
+                    label = f"ID {track_id} P={person_conf * 100:.0f}% Dist~{estimate.distance:.1f}"
 
                 pair_records.append((track_id, box.copy(), estimate.distance))
                 records.append(
@@ -359,10 +556,18 @@ class RealtimePoseEngine:
                         "contour": estimate.contour,
                         "anchor": getattr(estimate, "anchor", None),
                         "distance": estimate.distance,
+                        "person_conf": person_conf,
                         "label": label,
                         "track_color": track_color,
                     }
                 )
+
+            stale_mask_states: list[int] = []
+            for tid, state in self._mask_jump_state.items():
+                if (self._frame_idx - int(state.last_seen_frame)) > int(TRACK_STATE_STALE_AFTER):
+                    stale_mask_states.append(int(tid))
+            for tid in stale_mask_states:
+                self._mask_jump_state.pop(int(tid), None)
 
         if kpt_xy_np is not None and kpt_conf_np is not None:
             for idx in range(min(len(kpt_xy_np), len(kpt_conf_np))):
@@ -373,6 +578,7 @@ class RealtimePoseEngine:
         pair_text, pair_stats = _compute_pairwise_distances(pair_records, width)
         return {
             "depth_up": depth_up,
+            "depth_raw": depth_raw,
             "color_img": color_img,
             "records": records,
             "person_count": person_count,
@@ -429,6 +635,26 @@ class RealtimePoseEngine:
 
                 x1 = max(0, int(round(box[0])))
                 y1 = max(18, int(round(box[1])) - 8)
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 0.42
+                thickness = 1
+                (text_w, text_h), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+                label_x = min(x1, max(0, width - text_w - 6))
+                label_y = min(max(y1, text_h + 4), height - baseline - 2)
+                bg_top = max(0, label_y - text_h - baseline - 4)
+                bg_bottom = min(height - 1, label_y + baseline + 2)
+                bg_right = min(width - 1, label_x + text_w + 5)
+                cv2.rectangle(display, (label_x, bg_top), (bg_right, bg_bottom), (0, 0, 0), -1)
+                cv2.putText(
+                    display,
+                    label,
+                    (label_x + 2, label_y),
+                    font,
+                    font_scale,
+                    (255, 255, 255),
+                    thickness,
+                    cv2.LINE_AA,
+                )
 
         if display_mode in (DISPLAY_MODE_BOTH, DISPLAY_MODE_SKELETON_ONLY) and kpt_xy_np is not None and kpt_conf_np is not None:
             if pose_only:

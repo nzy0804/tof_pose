@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x08\x61i.proto\x12\x02\x61i\"e\n\x0cInferRequest\x12\x11\n\tdevice_id\x18\x01 \x01(\t\x12\x10\n\x08\x66rame_id\x18\x02 \x01(\t\x12\x1c\n\x14\x63\x61pture_timestamp_ms\x18\x03 \x01(\x03\x12\x12\n\nimage_data\x18\x04 \x01(\x0c\"\xd4\x02\n\rInferResponse\x12\x11\n\tdevice_id\x18\x01 \x01(\t\x12\x10\n\x08\x66rame_id\x18\x02 \x01(\t\x12\x1c\n\x14\x63\x61pture_timestamp_ms\x18\x03 \x01(\x03\x12\x18\n\x10output_image_S11\x18\x04 \x01(\x0c\x12\x18\n\x10output_image_S12\x18\x05 \x01(\x0c\x12\x18\n\x10output_image_S13\x18\x06 \x01(\x0c\x12\x18\n\x10output_image_S14\x18\x07 \x01(\x0c\x12\x18\n\x10output_image_S21\x18\x08 \x01(\x0c\x12\x18\n\x10output_image_S22\x18\t \x01(\x0c\x12\x18\n\x10output_image_S23\x18\n \x01(\x0c\x12\x18\n\x10output_image_S24\x18\x0b \x01(\x0c\x12\x14\n\x0cperson_count\x18\x0c \x01(\x05\x12\x1a\n\x12processing_time_ms\x18\r \x01(\x05\x32<\n\x0cModelService\x12,\n\x05Infer\x12\x10.ai.InferRequest\x1a\x11.ai.InferResponseB\x0fZ\r./proto;protob\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x08\x61i.proto\x12\x02\x61i\"e\n\x0cInferRequest\x12\x11\n\tdevice_id\x18\x01 \x01(\t\x12\x10\n\x08\x66rame_id\x18\x02 \x01(\t\x12\x1c\n\x14\x63\x61pture_timestamp_ms\x18\x03 \x01(\x03\x12\x12\n\nimage_data\x18\x04 \x01(\x0c\"\x88\x02\n\rInferResponse\x12\x11\n\tdevice_id\x18\x01 \x01(\t\x12\x10\n\x08\x66rame_id\x18\x02 \x01(\t\x12\x1c\n\x14\x63\x61pture_timestamp_ms\x18\x03 \x01(\x03\x12\x1d\n\x15pseudo_color_image_s1\x18\x04 \x01(\x0c\x12!\n\x19skeleton_contour_image_s1\x18\x05 \x01(\x0c\x12\x1d\n\x15pseudo_color_image_s2\x18\x06 \x01(\x0c\x12!\n\x19skeleton_contour_image_s2\x18\x07 \x01(\x0c\x12\x14\n\x0cperson_count\x18\x08 \x01(\x05\x12\x1a\n\x12processing_time_ms\x18\t \x01(\x05\x32<\n\x0cModelService\x12,\n\x05Infer\x12\x10.ai.InferRequest\x1a\x11.ai.InferResponseB\x0fZ\r./proto;protob\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -35,7 +35,7 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_INFERREQUEST']._serialized_start=16
   _globals['_INFERREQUEST']._serialized_end=117
   _globals['_INFERRESPONSE']._serialized_start=120
-  _globals['_INFERRESPONSE']._serialized_end=460
-  _globals['_MODELSERVICE']._serialized_start=462
-  _globals['_MODELSERVICE']._serialized_end=522
+  _globals['_INFERRESPONSE']._serialized_end=384
+  _globals['_MODELSERVICE']._serialized_start=386
+  _globals['_MODELSERVICE']._serialized_end=446
 # @@protoc_insertion_point(module_scope)

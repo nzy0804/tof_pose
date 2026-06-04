@@ -23,14 +23,10 @@ import ai_pb2_grpc
 def save_outputs(resp, outdir):
     os.makedirs(outdir, exist_ok=True)
     mapping = [
-        ('S11', resp.output_image_S11),
-        ('S12', resp.output_image_S12),
-        ('S13', resp.output_image_S13),
-        ('S14', resp.output_image_S14),
-        ('S21', resp.output_image_S21),
-        ('S22', resp.output_image_S22),
-        ('S23', resp.output_image_S23),
-        ('S24', resp.output_image_S24),
+        ('S1_pseudo_color', resp.pseudo_color_image_s1),
+        ('S1_skeleton_contour', resp.skeleton_contour_image_s1),
+        ('S2_pseudo_color', resp.pseudo_color_image_s2),
+        ('S2_skeleton_contour', resp.skeleton_contour_image_s2),
     ]
     result = {}
     prefix = f"{resp.device_id}_{resp.frame_id}_{resp.capture_timestamp_ms}" if getattr(resp, 'device_id', '') else f"{resp.frame_id}"

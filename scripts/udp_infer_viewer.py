@@ -237,21 +237,17 @@ def _make_montage(images: list[np.ndarray | None]) -> np.ndarray:
 
 
 def _select_display_image(result: dict, view: str) -> np.ndarray | None:
-    if view == "gray":
-        return _decode_png_result(result.get("output_image_S21", b""))
-    if view == "color":
-        return _decode_png_result(result.get("output_image_S22", b""))
-    if view == "skeleton":
-        return _decode_png_result(result.get("output_image_S23", b""))
-    if view == "contour":
-        return _decode_png_result(result.get("output_image_S24", b""))
+    if view in ("gray", "color"):
+        return _decode_png_result(result.get("pseudo_color_image_s2", b""))
+    if view in ("skeleton", "contour"):
+        return _decode_png_result(result.get("skeleton_contour_image_s2", b""))
 
     return _make_montage(
         [
-            _decode_png_result(result.get("output_image_S21", b"")),
-            _decode_png_result(result.get("output_image_S22", b"")),
-            _decode_png_result(result.get("output_image_S23", b"")),
-            _decode_png_result(result.get("output_image_S24", b"")),
+            _decode_png_result(result.get("pseudo_color_image_s1", b"")),
+            _decode_png_result(result.get("skeleton_contour_image_s1", b"")),
+            _decode_png_result(result.get("pseudo_color_image_s2", b"")),
+            _decode_png_result(result.get("skeleton_contour_image_s2", b"")),
         ]
     )
 

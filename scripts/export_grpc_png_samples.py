@@ -25,14 +25,10 @@ INPUTS = [
 ]
 WARMUP_INPUT = ROOT / "outputs" / "tmp_png_size_check.png"
 OUTPUT_FIELDS = [
-    "output_image_S11",
-    "output_image_S12",
-    "output_image_S13",
-    "output_image_S14",
-    "output_image_S21",
-    "output_image_S22",
-    "output_image_S23",
-    "output_image_S24",
+    "pseudo_color_image_s1",
+    "skeleton_contour_image_s1",
+    "pseudo_color_image_s2",
+    "skeleton_contour_image_s2",
 ]
 INPUT_SIZE = (100, 100)
 OUTPUT_SIZE = (320, 320)
@@ -151,14 +147,10 @@ def main() -> None:
             device_id=device_id,
             frame_id=res["frame_id"],
             capture_timestamp_ms=capture_timestamp_ms,
-            output_image_S11=res["output_image_S11"],
-            output_image_S12=res["output_image_S12"],
-            output_image_S13=res["output_image_S13"],
-            output_image_S14=res["output_image_S14"],
-            output_image_S21=res["output_image_S21"],
-            output_image_S22=res["output_image_S22"],
-            output_image_S23=res["output_image_S23"],
-            output_image_S24=res["output_image_S24"],
+            pseudo_color_image_s1=res["pseudo_color_image_s1"],
+            skeleton_contour_image_s1=res["skeleton_contour_image_s1"],
+            pseudo_color_image_s2=res["pseudo_color_image_s2"],
+            skeleton_contour_image_s2=res["skeleton_contour_image_s2"],
             person_count=int(res["person_count"]),
             processing_time_ms=int(res["processing_time_ms"]),
         )

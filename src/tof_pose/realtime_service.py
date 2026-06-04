@@ -163,10 +163,8 @@ def _compute_pairwise_distances(
 
 @dataclass
 class _FrameViewSet:
-    output_image_S21: bytes
-    output_image_S22: bytes
-    output_image_S23: bytes
-    output_image_S24: bytes
+    pseudo_color_image: bytes
+    skeleton_contour_image: bytes
     person_count: int
 
 
@@ -232,7 +230,7 @@ class RealtimePoseEngine:
         self._warned_no_masks = False
         self._warned_no_keypoints = False
         self._warned_pose_gate_fallback = False
-        self._last_views: tuple[bytes, bytes, bytes, bytes] | None = None
+        self._last_views: tuple[bytes, bytes] | None = None
         self._clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP_LIMIT, tileGridSize=CLAHE_TILE_GRID)
         self._track_gate: dict[int, _TrackGateState] = {}
         self._mask_jump_state: dict[int, _MaskJumpState] = {}
@@ -791,6 +789,49 @@ class RealtimePoseEngine:
 
         return display
 
+    def _render_skeleton_contour(self, analysis: dict) -> np.ndarray:
+        """Return pseudo color image with only contour and skeleton overlays."""
+        records = analysis["records"]
+        kpt_xy_np = analysis["kpt_xy_np"]
+        kpt_conf_np = analysis["kpt_conf_np"]
+        pose_to_track = analysis["pose_to_track"]
+        validated_track_ids = analysis["validated_track_ids"]
+        pose_only = bool(analysis.get("pose_only", False))
+        pose_draw_indices = analysis.get("pose_draw_indices") or []
+        width = int(analysis["width"])
+        height = int(analysis["height"])
+        display = analysis["color_img"].copy()
+
+        for record in records:
+            contour = record["contour"]
+            if contour is None:
+                continue
+
+            box = record["box"]
+            anchor = record.get("anchor")
+            if anchor is not None and len(anchor) >= 2:
+                offset_x, offset_y = int(anchor[0]), int(anchor[1])
+            else:
+                offset_x, offset_y = int(round(box[0])), int(round(box[1]))
+
+            shifted_contour = contour + np.array([[[offset_x, offset_y]]])
+            cv2.drawContours(display, [shifted_contour], -1, record["track_color"], 2, cv2.LINE_AA)
+
+        if kpt_xy_np is not None and kpt_conf_np is not None:
+            if pose_only:
+                for idx in pose_draw_indices:
+                    if idx < 0 or idx >= len(kpt_xy_np) or idx >= len(kpt_conf_np):
+                        continue
+                    draw_stick_figure(display, kpt_xy_np[idx], kpt_conf_np[idx], color_override=_track_color(idx + 1))
+            else:
+                for idx in range(min(len(kpt_xy_np), len(kpt_conf_np))):
+                    matched_track = pose_to_track.get(idx)
+                    if matched_track is None or matched_track not in validated_track_ids:
+                        continue
+                    draw_stick_figure(display, kpt_xy_np[idx], kpt_conf_np[idx], color_override=_track_color(matched_track))
+
+        return display
+
     def _render_gray_depth(self, analysis: dict) -> np.ndarray:
         """Return 320x320 uint8 grayscale depth image."""
         depth_up = analysis.get("depth_up")
@@ -824,29 +865,22 @@ class RealtimePoseEngine:
             depth = self._decode_image(image_bytes)
             analysis = self._analyze_frame(depth)
 
-            # Match IoT doc semantics/order:
-            # S1: gray depth, S2: color depth, S3: skeleton, S4: contour.
+            # Two views per frame group: pseudo color and skeleton+contour.
             current_views = (
-                self._encode_png(self._render_gray_depth(analysis)),
                 self._encode_png(self._render_color_depth(analysis)),
-                self._encode_png(self._render_display(analysis, DISPLAY_MODE_SKELETON_ONLY)),
-                self._encode_png(self._render_display(analysis, DISPLAY_MODE_CONTOUR_ONLY)),
+                self._encode_png(self._render_skeleton_contour(analysis)),
             )
 
-            prev_views = self._last_views or (b"", b"", b"", b"")
+            prev_views = self._last_views or (b"", b"")
             self._last_views = current_views
 
             elapsed = int((time.time() - start) * 1000)
             return {
                 "frame_id": frame_id,
-                "output_image_S11": prev_views[0],
-                "output_image_S12": prev_views[1],
-                "output_image_S13": prev_views[2],
-                "output_image_S14": prev_views[3],
-                "output_image_S21": current_views[0],
-                "output_image_S22": current_views[1],
-                "output_image_S23": current_views[2],
-                "output_image_S24": current_views[3],
+                "pseudo_color_image_s1": prev_views[0],
+                "skeleton_contour_image_s1": prev_views[1],
+                "pseudo_color_image_s2": current_views[0],
+                "skeleton_contour_image_s2": current_views[1],
                 "person_count": int(analysis["person_count"]),
                 "processing_time_ms": elapsed,
             }

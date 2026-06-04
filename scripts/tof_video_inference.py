@@ -83,7 +83,7 @@ def _parse_args() -> argparse.Namespace:
         "--view",
         choices=["gray", "color", "skeleton", "contour"],
         default="skeleton",
-        help="Which gRPC view to write: gray(S21), color(S22), skeleton(S23), contour(S24).",
+        help="Which view to write: gray/color use pseudo color; skeleton/contour use combined skeleton+contour.",
     )
     parser.add_argument(
         "--no-display",

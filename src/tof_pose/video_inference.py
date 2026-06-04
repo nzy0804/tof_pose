@@ -93,14 +93,10 @@ def run(
             raise RuntimeError("failed to encode frame as PNG")
 
         res = engine.infer(str(frame_idx), buf.tobytes())
-        if view == VIEW_GRAY:
-            view_bytes = res.get("output_image_S21", b"")
-        elif view == VIEW_COLOR:
-            view_bytes = res.get("output_image_S22", b"")
-        elif view == VIEW_CONTOUR:
-            view_bytes = res.get("output_image_S24", b"")
+        if view in (VIEW_GRAY, VIEW_COLOR):
+            view_bytes = res.get("pseudo_color_image_s2", b"")
         else:
-            view_bytes = res.get("output_image_S23", b"")
+            view_bytes = res.get("skeleton_contour_image_s2", b"")
 
         if not view_bytes:
             if not warned_empty_view:

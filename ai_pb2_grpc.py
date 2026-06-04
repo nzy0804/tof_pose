@@ -26,8 +26,7 @@ if _version_not_supported:
 
 
 class ModelServiceStub(object):
-    """模型推理服务
-    """
+    """Missing associated documentation comment in .proto file."""
 
     def __init__(self, channel):
         """Constructor.
@@ -43,12 +42,10 @@ class ModelServiceStub(object):
 
 
 class ModelServiceServicer(object):
-    """模型推理服务
-    """
+    """Missing associated documentation comment in .proto file."""
 
     def Infer(self, request, context):
-        """单帧推理
-        """
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -70,8 +67,7 @@ def add_ModelServiceServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class ModelService(object):
-    """模型推理服务
-    """
+    """Missing associated documentation comment in .proto file."""
 
     @staticmethod
     def Infer(request,

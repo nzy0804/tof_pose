@@ -3,9 +3,7 @@ syntax = "proto3";
 package ai;
 option go_package = "./proto;proto";
 
-// 模型推理服务
 service ModelService {
-  // 单帧推理
   rpc Infer(InferRequest) returns (InferResponse);
 }
 
@@ -13,21 +11,17 @@ message InferRequest {
   string device_id = 1;
   string frame_id = 2;
   int64 capture_timestamp_ms = 3;
-  bytes image_data = 4;        // PNG 二进制
+  bytes image_data = 4;
 }
 
 message InferResponse {
   string device_id = 1;
   string frame_id = 2;
   int64 capture_timestamp_ms = 3;
-  bytes output_image_S11 = 4;
-  bytes output_image_S12 = 5;
-  bytes output_image_S13 = 6;
-  bytes output_image_S14 = 7;
-  bytes output_image_S21 = 8;
-  bytes output_image_S22 = 9;
-  bytes output_image_S23 = 10;
-  bytes output_image_S24 = 11;
-  int32 person_count = 12;
-  int32 processing_time_ms = 13;
+  bytes pseudo_color_image_s1 = 4;
+  bytes skeleton_contour_image_s1 = 5;
+  bytes pseudo_color_image_s2 = 6;
+  bytes skeleton_contour_image_s2 = 7;
+  int32 person_count = 8;
+  int32 processing_time_ms = 9;
 }

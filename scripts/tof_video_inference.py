@@ -53,7 +53,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-pose-validate",
         action="store_true",
-        help="Disable pose-based gating for segmentation contours (contours follow seg results directly).",
+        help="Disable pose-based gating for skeleton drawing (contours use segmentation plus shape rules).",
     )
     parser.add_argument(
         "--pose-model-path",

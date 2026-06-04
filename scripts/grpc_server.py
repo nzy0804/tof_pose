@@ -51,6 +51,7 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         pose_conf: float | None = None,
         pose_kpt_conf: float | None = None,
         pose_kpt_min_points: int = 4,
+        device: str | None = None,
     ):
         self.svc = RealtimePoseEngine(
             stateless=bool(stateless),
@@ -61,6 +62,7 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
             pose_conf_threshold=pose_conf,
             pose_kpt_conf_threshold=pose_kpt_conf,
             pose_kpt_min_points=pose_kpt_min_points,
+            device=device,
         )
 
     def Infer(self, request, context):
@@ -110,6 +112,7 @@ def serve(
     pose_conf: float | None = None,
     pose_kpt_conf: float | None = None,
     pose_kpt_min_points: int = 4,
+    device: str | None = None,
 ):
     server_opts = [
         ('grpc.max_send_message_length', max_msg_mb * 1024 * 1024),
@@ -126,6 +129,7 @@ def serve(
             pose_conf=pose_conf,
             pose_kpt_conf=pose_kpt_conf,
             pose_kpt_min_points=pose_kpt_min_points,
+            device=device,
         ),
         server,
     )
@@ -178,13 +182,14 @@ def main():
     parser.add_argument(
         '--no-pose-validate',
         action='store_true',
-        help='disable pose-based gating for segmentation contours (contours/distance follow seg results directly)',
+        help='disable pose-based gating for skeleton drawing (contours use segmentation plus shape rules)',
     )
     parser.add_argument('--model-path', default=None, help='override seg model path')
     parser.add_argument('--pose-model-path', default=None, help='override pose model path')
     parser.add_argument('--pose-conf', default=None, type=float, help='override pose confidence threshold (pose-only)')
     parser.add_argument('--pose-kpt-conf', default=None, type=float, help='override pose keypoint conf threshold (pose-only)')
     parser.add_argument('--pose-kpt-min-points', default=4, type=int, help='min confident keypoints to count one person (pose-only)')
+    parser.add_argument('--device', default=None, help='YOLO inference device, for example cuda:0 or cpu')
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     serve(
@@ -200,6 +205,7 @@ def main():
         pose_conf=args.pose_conf,
         pose_kpt_conf=args.pose_kpt_conf,
         pose_kpt_min_points=args.pose_kpt_min_points,
+        device=args.device,
     )
 
 

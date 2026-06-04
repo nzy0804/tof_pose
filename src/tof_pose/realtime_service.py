@@ -37,7 +37,17 @@ TRACK_VOTE_WINDOW = 5
 TRACK_VOTE_MIN_POS = 2
 TRACK_TTL_FRAMES = 5
 TRACK_STATE_STALE_AFTER = 30
+CONTOUR_NEW_TRACK_CONF_THRESHOLD = 0.35
+CONTOUR_EXISTING_TRACK_CONF_THRESHOLD = 0.20
+CONTOUR_TRACK_STALE_AFTER = 30
+CONTOUR_EXISTING_MAX_CENTER_JUMP_PX = 80.0
+CONTOUR_EXISTING_MAX_AREA_CHANGE_RATIO = 2.5
+MASK_MIN_AREA_RATIO = 0.003
 MASK_MAX_AREA_RATIO = 0.5
+LOW_CONF_SHAPE_THRESHOLD = 0.35
+LOW_CONF_EDGE_MARGIN = 3
+LOW_CONF_MAX_HEIGHT_RATIO = 0.85
+LOW_CONF_MAX_ASPECT_RATIO = 4.5
 MASK_AREA_JUMP_RATIO = 1.5
 MASK_JUMP_HOLD_FRAMES = 2
 
@@ -175,6 +185,12 @@ class _MaskJumpState:
     rejected_frames: int
 
 
+@dataclass
+class _ContourTrackState:
+    box: np.ndarray
+    last_seen_frame: int
+
+
 class RealtimePoseEngine:
     def __init__(
         self,
@@ -188,12 +204,14 @@ class RealtimePoseEngine:
         pose_conf_threshold: float | None = None,
         pose_kpt_conf_threshold: float | None = None,
         pose_kpt_min_points: int = 4,
+        device: str | None = None,
     ) -> None:
         model_file = Path(model_path) if model_path else DEFAULT_MODEL_PATH
         pose_model_file = Path(pose_model_path) if pose_model_path else DEFAULT_POSE_MODEL_PATH
 
         self.seg_model = YOLO(str(model_file))
         self.pose_model = YOLO(str(pose_model_file))
+        self._device = str(device).strip() if device else None
         self._lock = threading.Lock()
         self._stateless = bool(stateless)
         self._persist_tracks = (not self._stateless) if persist_tracks is None else bool(persist_tracks)
@@ -218,6 +236,7 @@ class RealtimePoseEngine:
         self._clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP_LIMIT, tileGridSize=CLAHE_TILE_GRID)
         self._track_gate: dict[int, _TrackGateState] = {}
         self._mask_jump_state: dict[int, _MaskJumpState] = {}
+        self._contour_track_state: dict[int, _ContourTrackState] = {}
 
     def reset(self) -> None:
         """Reset per-stream caches so next infer behaves like the first frame."""
@@ -228,6 +247,7 @@ class RealtimePoseEngine:
         self._last_views = None
         self._track_gate.clear()
         self._mask_jump_state.clear()
+        self._contour_track_state.clear()
 
     def _guard_mask_jump(self, track_id: int, mask: np.ndarray) -> np.ndarray | None:
         """Reject short-lived, per-track mask area spikes without averaging masks."""
@@ -278,6 +298,96 @@ class RealtimePoseEngine:
         state.last_seen_frame = int(self._frame_idx)
         state.rejected_frames = 0
         return current
+
+    def _passes_contour_shape_rules(
+        self,
+        box: np.ndarray,
+        mask: np.ndarray,
+        person_conf: float,
+        width: int,
+        height: int,
+    ) -> bool:
+        """Validate segmentation shape without requiring pose support."""
+        if mask.ndim != 2:
+            return False
+
+        mask_area = int(np.count_nonzero(mask > 0))
+        image_area = max(1, int(width) * int(height))
+        if mask_area < int(image_area * float(MASK_MIN_AREA_RATIO)):
+            return False
+        if mask_area > int(image_area * float(MASK_MAX_AREA_RATIO)):
+            return False
+
+        x1, y1, x2, y2 = [float(v) for v in box[:4]]
+        x1 = max(0.0, min(x1, float(width - 1)))
+        y1 = max(0.0, min(y1, float(height - 1)))
+        x2 = max(0.0, min(x2, float(width)))
+        y2 = max(0.0, min(y2, float(height)))
+        box_w = max(0.0, x2 - x1)
+        box_h = max(0.0, y2 - y1)
+        if box_w < 2.0 or box_h < 2.0:
+            return False
+
+        aspect = box_h / max(box_w, 1.0)
+        low_conf = float(person_conf) < float(LOW_CONF_SHAPE_THRESHOLD)
+        if low_conf and aspect > float(LOW_CONF_MAX_ASPECT_RATIO):
+            return False
+
+        margin = float(LOW_CONF_EDGE_MARGIN)
+        touches_edge = (
+            x1 <= margin
+            or y1 <= margin
+            or x2 >= float(width) - margin
+            or y2 >= float(height) - margin
+        )
+        if low_conf and touches_edge and box_h > float(height) * float(LOW_CONF_MAX_HEIGHT_RATIO):
+            return False
+
+        return True
+
+    def _get_active_contour_track(self, track_id: int) -> _ContourTrackState | None:
+        state = self._contour_track_state.get(int(track_id))
+        if state is None:
+            return None
+        if (self._frame_idx - int(state.last_seen_frame)) > int(CONTOUR_TRACK_STALE_AFTER):
+            return None
+        return state
+
+    def _passes_existing_contour_position_rules(self, state: _ContourTrackState, box: np.ndarray) -> bool:
+        previous_box = state.box
+        center_distance = _box_center_distance(previous_box, box)
+        if center_distance > float(CONTOUR_EXISTING_MAX_CENTER_JUMP_PX):
+            return False
+
+        prev_area = max(1.0, float(max(0.0, previous_box[2] - previous_box[0]) * max(0.0, previous_box[3] - previous_box[1])))
+        curr_area = max(1.0, float(max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])))
+        area_ratio = max(curr_area / prev_area, prev_area / curr_area)
+        return area_ratio <= float(CONTOUR_EXISTING_MAX_AREA_CHANGE_RATIO)
+
+    def _passes_contour_conf_rules(self, track_id: int, box: np.ndarray, person_conf: float) -> bool:
+        if float(person_conf) >= float(CONTOUR_NEW_TRACK_CONF_THRESHOLD):
+            return True
+        if float(person_conf) < float(CONTOUR_EXISTING_TRACK_CONF_THRESHOLD):
+            return False
+
+        state = self._get_active_contour_track(track_id)
+        if state is None:
+            return False
+        return self._passes_existing_contour_position_rules(state, box)
+
+    def _remember_contour_track(self, track_id: int, box: np.ndarray) -> None:
+        self._contour_track_state[int(track_id)] = _ContourTrackState(
+            box=box.astype(np.float32, copy=True),
+            last_seen_frame=int(self._frame_idx),
+        )
+
+    def _prune_contour_track_state(self) -> None:
+        stale: list[int] = []
+        for tid, state in self._contour_track_state.items():
+            if (self._frame_idx - int(state.last_seen_frame)) > int(CONTOUR_TRACK_STALE_AFTER):
+                stale.append(int(tid))
+        for tid in stale:
+            self._contour_track_state.pop(int(tid), None)
 
     def _decode_image(self, data: bytes) -> np.ndarray:
         arr = np.frombuffer(data, dtype=np.uint8)
@@ -333,6 +443,7 @@ class RealtimePoseEngine:
                 conf=self._pose_conf_threshold,
                 classes=[0],
                 imgsz=POSE_INFER_IMGSZ,
+                device=self._device,
                 verbose=False,
             )
             pose_result = pose_results[0] if pose_results else None
@@ -377,6 +488,7 @@ class RealtimePoseEngine:
             tracker=TRACKER_CONFIG,
             classes=[0],
             imgsz=SEG_INFER_IMGSZ,
+            device=self._device,
             verbose=False,
         )
         result = results[0]
@@ -389,6 +501,7 @@ class RealtimePoseEngine:
                 conf=CONF_THRESHOLD,
                 classes=[0],
                 imgsz=POSE_INFER_IMGSZ,
+                device=self._device,
                 verbose=False,
             )
             pose_result = pose_results[0] if pose_results else None
@@ -459,16 +572,16 @@ class RealtimePoseEngine:
                             pose_validated_track_ids.add(int(track_id))
 
             if not self._pose_validate_seg:
-                # Disable pose-based gating: allow all seg tracks to contribute contours/distances.
+                # Disable pose-based skeleton gating: draw any pose matched to a seg track.
                 validated_track_ids = set(int(tid) for tid in seg_track_ids_for_match)
             else:
                 # Track-level temporal gating:
-                # - Sliding window votes to confirm a track (reduces flicker).
-                # - TTL keep-alive to avoid brief pose dropouts causing gaps.
+                # - Sliding window votes to confirm a pose-supported skeleton.
+                # - TTL keep-alive to avoid brief pose dropouts causing skeleton gaps.
                 pose_available = kpt_conf_np is not None
                 if not pose_available:
                     # If pose model produces no keypoints at all, gating cannot work.
-                    # Fall back to seg-only (same as --no-pose-validate) for continuity.
+                    # Contours still follow seg+shape rules; skeleton output is skipped.
                     validated_track_ids = set(int(tid) for tid in seg_track_ids_for_match)
                     if not self._warned_pose_gate_fallback:
                         print(
@@ -526,15 +639,17 @@ class RealtimePoseEngine:
             for idx in range(match_count):
                 box = boxes_xyxy[idx]
                 track_id = int(track_ids[idx])
-                if track_id not in validated_track_ids:
-                    continue
                 track_color = _track_color(track_id)
                 person_conf = float(conf_scores[idx])
+                if not self._passes_contour_conf_rules(track_id, box, person_conf):
+                    continue
                 mask = (masks_data[idx] > 0.5).astype(np.uint8)
                 if mask.shape[:2] != (height, width):
                     mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
                 mask = self._guard_mask_jump(track_id, mask)
                 if mask is None:
+                    continue
+                if not self._passes_contour_shape_rules(box, mask, person_conf, width, height):
                     continue
                 # Use non-equalized depth values for distance estimation.
                 estimate = estimate_person_distance_from_mask(depth_raw, box, mask)
@@ -561,6 +676,7 @@ class RealtimePoseEngine:
                         "track_color": track_color,
                     }
                 )
+                self._remember_contour_track(track_id, box)
 
             stale_mask_states: list[int] = []
             for tid, state in self._mask_jump_state.items():
@@ -568,6 +684,8 @@ class RealtimePoseEngine:
                     stale_mask_states.append(int(tid))
             for tid in stale_mask_states:
                 self._mask_jump_state.pop(int(tid), None)
+
+        self._prune_contour_track_state()
 
         if kpt_xy_np is not None and kpt_conf_np is not None:
             for idx in range(min(len(kpt_xy_np), len(kpt_conf_np))):

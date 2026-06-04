@@ -42,31 +42,27 @@ READ_TIMEOUT_S = 0.05
 ENDIAN = "<"
 FRAME_HEAD = b"\x00\xFF"
 ALLOWED_TAILS = (0xCC, 0xDD)
+BATCH_SIZE = 10
 
 
 def _save_outputs(resp: ai_pb2.InferResponse, outdir: Path) -> dict[str, int]:
     outdir.mkdir(parents=True, exist_ok=True)
-    mapping = [
-        ("S1_pseudo_color", resp.pseudo_color_image_s1),
-        ("S1_skeleton_contour", resp.skeleton_contour_image_s1),
-        ("S2_pseudo_color", resp.pseudo_color_image_s2),
-        ("S2_skeleton_contour", resp.skeleton_contour_image_s2),
-    ]
-
-    prefix = (
-        f"{getattr(resp, 'device_id', '')}_{resp.frame_id}_{getattr(resp, 'capture_timestamp_ms', 0)}"
-        if getattr(resp, 'device_id', '')
-        else f"{resp.frame_id}"
-    )
-
+    batch_prefix = f"{getattr(resp, 'device_id', '')}_{resp.batch_id}" if getattr(resp, 'device_id', '') else resp.batch_id
     sizes: dict[str, int] = {}
-    for name, blob in mapping:
-        path = outdir / f"{prefix}_{name}.png"
-        if blob:
-            path.write_bytes(blob)
-            sizes[name] = len(blob)
-        else:
-            sizes[name] = 0
+    for idx, item in enumerate(resp.results, start=1):
+        frame_prefix = f"{batch_prefix}_{idx:02d}_{item.frame_id}"
+        mapping = [
+            ("pseudo_color", item.pseudo_color_image),
+            ("skeleton_contour", item.skeleton_contour_image),
+        ]
+        for name, blob in mapping:
+            key = f"{idx:02d}_{name}"
+            path = outdir / f"{frame_prefix}_{name}.png"
+            if blob:
+                path.write_bytes(blob)
+                sizes[key] = len(blob)
+            else:
+                sizes[key] = 0
     return sizes
 
 
@@ -172,11 +168,13 @@ def main() -> int:
         action="store_true",
         help="do not stop the local server after test",
     )
-    parser.add_argument("--frames", type=int, default=10, help="number of frames to send")
+    parser.add_argument("--frames", type=int, default=10, help="number of frames to send; full batches of 10 are sent")
     parser.add_argument("--timeout", type=float, default=120.0, help="grpc per-call timeout seconds")
     parser.add_argument("--max-msg-mb", type=int, default=50)
     parser.add_argument("--outdir", default=str(Path("outputs") / "serial_grpc_test"))
     args = parser.parse_args()
+    if int(args.frames) < BATCH_SIZE or int(args.frames) % BATCH_SIZE != 0:
+        raise SystemExit(f"--frames must be a positive multiple of {BATCH_SIZE}")
 
     outdir = Path(args.outdir)
 
@@ -252,6 +250,8 @@ def main() -> int:
         pass
 
     sent = 0
+    batches = 0
+    pending_batch: list[tuple[str, int, bytes, int, int]] = []
     t0 = time.time()
 
     try:
@@ -263,25 +263,37 @@ def main() -> int:
             png_bytes = _encode_depth_png(depth)
 
             frame_id = f"serial_{frameid:06d}"
-            req = ai_pb2.InferRequest(
-                device_id=str(args.device_id),
-                frame_id=frame_id,
-                capture_timestamp_ms=int(time.time() * 1000),
-                image_data=png_bytes,
-            )
+            pending_batch.append((frame_id, int(time.time() * 1000), png_bytes, int(res_c), int(res_r)))
+            if len(pending_batch) < BATCH_SIZE:
+                continue
+
+            batches += 1
+            batch_id = f"serial_batch_{batches:06d}"
+            req = ai_pb2.InferRequest(device_id=str(args.device_id), batch_id=batch_id)
+            for item_frame_id, timestamp_ms, item_png, _res_c, _res_r in pending_batch:
+                req.images.append(
+                    ai_pb2.InferImage(
+                        frame_id=item_frame_id,
+                        capture_timestamp_ms=timestamp_ms,
+                        image_data=item_png,
+                    )
+                )
 
             call_start = time.time()
             resp = stub.Infer(req, timeout=float(args.timeout))
             call_end = time.time()
 
             sizes = _save_outputs(resp, outdir)
-            sent += 1
+            sent += len(pending_batch)
+            src_shapes = ",".join(f"{item[3]}x{item[4]}" for item in pending_batch)
+            person_counts = [item.person_count for item in resp.results]
             print(
-                f"[{sent}/{args.frames}] device_id={getattr(resp, 'device_id', '')} {frame_id} src={res_c}x{res_r} "
-                f"server_ms={resp.processing_time_ms} roundtrip_ms={int((call_end - call_start) * 1000)} "
-                f"ts_ms={getattr(resp, 'capture_timestamp_ms', 0)} person_count={resp.person_count} sizes={sizes}",
+                f"[{sent}/{args.frames}] device_id={getattr(resp, 'device_id', '')} batch_id={resp.batch_id} "
+                f"src={src_shapes} results={len(resp.results)} server_ms={resp.processing_time_ms} "
+                f"roundtrip_ms={int((call_end - call_start) * 1000)} person_counts={person_counts} sizes={sizes}",
                 flush=True,
             )
+            pending_batch.clear()
 
             if sent >= int(args.frames):
                 break

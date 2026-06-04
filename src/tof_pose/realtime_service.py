@@ -230,7 +230,6 @@ class RealtimePoseEngine:
         self._warned_no_masks = False
         self._warned_no_keypoints = False
         self._warned_pose_gate_fallback = False
-        self._last_views: tuple[bytes, bytes] | None = None
         self._clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP_LIMIT, tileGridSize=CLAHE_TILE_GRID)
         self._track_gate: dict[int, _TrackGateState] = {}
         self._mask_jump_state: dict[int, _MaskJumpState] = {}
@@ -242,7 +241,6 @@ class RealtimePoseEngine:
         self._cached_pose_boxes = []
         self._cached_kpt_xy = None
         self._cached_kpt_conf = None
-        self._last_views = None
         self._track_gate.clear()
         self._mask_jump_state.clear()
         self._contour_track_state.clear()
@@ -856,31 +854,27 @@ class RealtimePoseEngine:
             raise RuntimeError("failed to encode PNG")
         return buf.tobytes()
 
+    def _infer_one_unlocked(self, frame_id: str, image_bytes: bytes) -> dict:
+        if self._stateless:
+            self.reset()
+
+        start = time.time()
+        depth = self._decode_image(image_bytes)
+        analysis = self._analyze_frame(depth)
+
+        elapsed = int((time.time() - start) * 1000)
+        return {
+            "frame_id": frame_id,
+            "pseudo_color_image": self._encode_png(self._render_color_depth(analysis)),
+            "skeleton_contour_image": self._encode_png(self._render_skeleton_contour(analysis)),
+            "person_count": int(analysis["person_count"]),
+            "processing_time_ms": elapsed,
+        }
+
     def infer(self, frame_id: str, image_bytes: bytes) -> dict:
         with self._lock:
-            if self._stateless:
-                self.reset()
+            return self._infer_one_unlocked(frame_id, image_bytes)
 
-            start = time.time()
-            depth = self._decode_image(image_bytes)
-            analysis = self._analyze_frame(depth)
-
-            # Two views per frame group: pseudo color and skeleton+contour.
-            current_views = (
-                self._encode_png(self._render_color_depth(analysis)),
-                self._encode_png(self._render_skeleton_contour(analysis)),
-            )
-
-            prev_views = self._last_views or (b"", b"")
-            self._last_views = current_views
-
-            elapsed = int((time.time() - start) * 1000)
-            return {
-                "frame_id": frame_id,
-                "pseudo_color_image_s1": prev_views[0],
-                "skeleton_contour_image_s1": prev_views[1],
-                "pseudo_color_image_s2": current_views[0],
-                "skeleton_contour_image_s2": current_views[1],
-                "person_count": int(analysis["person_count"]),
-                "processing_time_ms": elapsed,
-            }
+    def infer_batch(self, frames: list[tuple[str, bytes]]) -> list[dict]:
+        with self._lock:
+            return [self._infer_one_unlocked(frame_id, image_bytes) for frame_id, image_bytes in frames]

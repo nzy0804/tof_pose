@@ -15,8 +15,7 @@ import numpy as np
 
 class ModelService:
     def __init__(self):
-        self.prev_frame = None  # numpy array (H,W) or (H,W,3)
-        self.prev_frame_id = None
+        pass
 
     def _decode_image(self, data: bytes) -> np.ndarray:
         arr = np.frombuffer(data, dtype=np.uint8)
@@ -75,44 +74,18 @@ class ModelService:
     def infer(self, frame_id: str, image_bytes: bytes) -> dict:
         start = time.time()
         depth = self._decode_image(image_bytes)
-
-        # first frame
-        if self.prev_frame is None:
-            pseudo_color, skeleton_contour = self.process_single(depth)
-            self.prev_frame = depth.copy()
-            self.prev_frame_id = frame_id
-            elapsed = int((time.time() - start) * 1000)
-            return {
-                'frame_id': frame_id,
-                'pseudo_color_image_s1': b'',
-                'skeleton_contour_image_s1': b'',
-                'pseudo_color_image_s2': pseudo_color,
-                'skeleton_contour_image_s2': skeleton_contour,
-                'person_count': 0,
-                'processing_time_ms': elapsed,
-            }
-
-        # interpolate
-        mid = self.interpolate_depth(self.prev_frame, depth)
-
-        # process mid and current
-        pseudo_color_s1, skeleton_contour_s1 = self.process_single(mid)
-        pseudo_color_s2, skeleton_contour_s2 = self.process_single(depth)
-
-        # update cache
-        self.prev_frame = depth.copy()
-        self.prev_frame_id = frame_id
-
+        pseudo_color, skeleton_contour = self.process_single(depth)
         elapsed = int((time.time() - start) * 1000)
         return {
             'frame_id': frame_id,
-            'pseudo_color_image_s1': pseudo_color_s1,
-            'skeleton_contour_image_s1': skeleton_contour_s1,
-            'pseudo_color_image_s2': pseudo_color_s2,
-            'skeleton_contour_image_s2': skeleton_contour_s2,
+            'pseudo_color_image': pseudo_color,
+            'skeleton_contour_image': skeleton_contour,
             'person_count': 0,
             'processing_time_ms': elapsed,
         }
+
+    def infer_batch(self, frames: list[tuple[str, bytes]]) -> list[dict]:
+        return [self.infer(frame_id, image_bytes) for frame_id, image_bytes in frames]
 
 
 def main(argv):
@@ -130,10 +103,8 @@ def main(argv):
         res = svc.infer(frame_id, data)
         # save outputs
         outputs = {
-            'S1_pseudo_color': res.get('pseudo_color_image_s1'),
-            'S1_skeleton_contour': res.get('skeleton_contour_image_s1'),
-            'S2_pseudo_color': res.get('pseudo_color_image_s2'),
-            'S2_skeleton_contour': res.get('skeleton_contour_image_s2'),
+            'pseudo_color': res.get('pseudo_color_image'),
+            'skeleton_contour': res.get('skeleton_contour_image'),
         }
         for name, b in outputs.items():
             outp = outdir / f'{frame_id}_{name}.png'

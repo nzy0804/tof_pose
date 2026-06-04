@@ -6,6 +6,7 @@ Usage:
 """
 import argparse
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -39,6 +40,9 @@ import ai_pb2_grpc
 from tof_pose.realtime_service import RealtimePoseEngine
 
 
+BATCH_SIZE = 10
+
+
 class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
     def __init__(
         self,
@@ -67,31 +71,42 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
 
     def Infer(self, request, context):
         device_id = getattr(request, 'device_id', '')
-        frame_id = getattr(request, 'frame_id', '')
-        capture_timestamp_ms = int(getattr(request, 'capture_timestamp_ms', 0) or 0)
+        batch_id = getattr(request, 'batch_id', '')
+        images = list(getattr(request, 'images', []))
+        if len(images) != BATCH_SIZE:
+            context.set_details(f"expected exactly {BATCH_SIZE} images, got {len(images)}")
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            return ai_pb2.InferResponse(device_id=device_id, batch_id=batch_id)
+
+        batch_start = time.time()
         try:
-            res = self.svc.infer(frame_id, request.image_data)
+            frames = [(image.frame_id, image.image_data) for image in images]
+            results = self.svc.infer_batch(frames)
         except Exception as e:
             context.set_details(str(e))
             context.set_code(grpc.StatusCode.INTERNAL)
             return ai_pb2.InferResponse(
                 device_id=device_id,
-                frame_id=frame_id,
-                capture_timestamp_ms=capture_timestamp_ms,
+                batch_id=batch_id,
             )
 
-        # build response
-        return ai_pb2.InferResponse(
+        response = ai_pb2.InferResponse(
             device_id=device_id,
-            frame_id=frame_id,
-            capture_timestamp_ms=capture_timestamp_ms,
-            pseudo_color_image_s1=res.get('pseudo_color_image_s1', b''),
-            skeleton_contour_image_s1=res.get('skeleton_contour_image_s1', b''),
-            pseudo_color_image_s2=res.get('pseudo_color_image_s2', b''),
-            skeleton_contour_image_s2=res.get('skeleton_contour_image_s2', b''),
-            person_count=int(res.get('person_count', 0)),
-            processing_time_ms=int(res.get('processing_time_ms', 0)),
+            batch_id=batch_id,
+            processing_time_ms=int((time.time() - batch_start) * 1000),
         )
+        for image, result in zip(images, results):
+            response.results.append(
+                ai_pb2.InferResult(
+                    frame_id=image.frame_id or result.get('frame_id', ''),
+                    capture_timestamp_ms=int(getattr(image, 'capture_timestamp_ms', 0) or 0),
+                    pseudo_color_image=result.get('pseudo_color_image', b''),
+                    skeleton_contour_image=result.get('skeleton_contour_image', b''),
+                    person_count=int(result.get('person_count', 0)),
+                    processing_time_ms=int(result.get('processing_time_ms', 0)),
+                )
+            )
+        return response
 
 
 def serve(

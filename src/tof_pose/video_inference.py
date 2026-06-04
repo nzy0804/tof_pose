@@ -94,9 +94,9 @@ def run(
 
         res = engine.infer(str(frame_idx), buf.tobytes())
         if view in (VIEW_GRAY, VIEW_COLOR):
-            view_bytes = res.get("pseudo_color_image_s2", b"")
+            view_bytes = res.get("pseudo_color_image", b"")
         else:
-            view_bytes = res.get("skeleton_contour_image_s2", b"")
+            view_bytes = res.get("skeleton_contour_image", b"")
 
         if not view_bytes:
             if not warned_empty_view:

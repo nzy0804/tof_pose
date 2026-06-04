@@ -7,21 +7,30 @@ service ModelService {
   rpc Infer(InferRequest) returns (InferResponse);
 }
 
+message InferImage {
+  string frame_id = 1;
+  int64 capture_timestamp_ms = 2;
+  bytes image_data = 3;
+}
+
+message InferResult {
+  string frame_id = 1;
+  int64 capture_timestamp_ms = 2;
+  bytes pseudo_color_image = 3;
+  bytes skeleton_contour_image = 4;
+  int32 person_count = 5;
+  int32 processing_time_ms = 6;
+}
+
 message InferRequest {
   string device_id = 1;
-  string frame_id = 2;
-  int64 capture_timestamp_ms = 3;
-  bytes image_data = 4;
+  string batch_id = 2;
+  repeated InferImage images = 3;
 }
 
 message InferResponse {
   string device_id = 1;
-  string frame_id = 2;
-  int64 capture_timestamp_ms = 3;
-  bytes pseudo_color_image_s1 = 4;
-  bytes skeleton_contour_image_s1 = 5;
-  bytes pseudo_color_image_s2 = 6;
-  bytes skeleton_contour_image_s2 = 7;
-  int32 person_count = 8;
-  int32 processing_time_ms = 9;
+  string batch_id = 2;
+  repeated InferResult results = 3;
+  int32 processing_time_ms = 4;
 }

@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Simple gRPC client to call ModelService.Infer and save returned PNGs.
+"""Simple gRPC client to call ModelService.Infer with a 10-image batch.
 
 Usage:
-    python scripts/grpc_client_test.py input.png frame_000001 --host 127.0.0.1 --port 50052 --device-id dev01
+    python scripts/grpc_client_test.py img01.png ... img10.png --host 127.0.0.1 --port 50052 --device-id dev01
 """
 import argparse
 import os
 import time
+from pathlib import Path
 
 import grpc
 import sys
@@ -22,26 +23,30 @@ import ai_pb2_grpc
 
 def save_outputs(resp, outdir):
     os.makedirs(outdir, exist_ok=True)
-    mapping = [
-        ('S1_pseudo_color', resp.pseudo_color_image_s1),
-        ('S1_skeleton_contour', resp.skeleton_contour_image_s1),
-        ('S2_pseudo_color', resp.pseudo_color_image_s2),
-        ('S2_skeleton_contour', resp.skeleton_contour_image_s2),
-    ]
     result = {}
-    prefix = f"{resp.device_id}_{resp.frame_id}_{resp.capture_timestamp_ms}" if getattr(resp, 'device_id', '') else f"{resp.frame_id}"
-    for name, b in mapping:
-        path = os.path.join(outdir, f"{prefix}_{name}.png")
-        if b:
-            with open(path, 'wb') as f:
-                f.write(b)
-            result[name] = len(b)
-        else:
-            result[name] = 0
+    batch_prefix = f"{resp.device_id}_{resp.batch_id}" if getattr(resp, 'device_id', '') else f"{resp.batch_id}"
+    for idx, item in enumerate(resp.results, start=1):
+        frame_prefix = f"{batch_prefix}_{idx:02d}_{item.frame_id}"
+        mapping = [
+            ('pseudo_color', item.pseudo_color_image),
+            ('skeleton_contour', item.skeleton_contour_image),
+        ]
+        for name, b in mapping:
+            path = os.path.join(outdir, f"{frame_prefix}_{name}.png")
+            key = f"{idx:02d}_{name}"
+            if b:
+                with open(path, 'wb') as f:
+                    f.write(b)
+                result[key] = len(b)
+            else:
+                result[key] = 0
     return result
 
 
-def call_infer(host, port, device_id, frame_id, capture_timestamp_ms, img_path, timeout=10.0, max_msg_mb=50):
+def call_infer(host, port, device_id, batch_id, img_paths, timeout=10.0, max_msg_mb=50):
+    if len(img_paths) != 10:
+        raise ValueError(f"expected exactly 10 input images, got {len(img_paths)}")
+
     opts = [
         ('grpc.max_send_message_length', max_msg_mb * 1024 * 1024),
         ('grpc.max_receive_message_length', max_msg_mb * 1024 * 1024),
@@ -60,17 +65,21 @@ def call_infer(host, port, device_id, frame_id, capture_timestamp_ms, img_path, 
 
     stub = ai_pb2_grpc.ModelServiceStub(channel)
 
-    with open(img_path, 'rb') as f:
-        data = f.read()
+    if batch_id is None:
+        batch_id = f"batch_{int(time.time() * 1000)}"
 
-    if capture_timestamp_ms is None:
-        capture_timestamp_ms = int(time.time() * 1000)
-    req = ai_pb2.InferRequest(
-        device_id=device_id,
-        frame_id=frame_id,
-        capture_timestamp_ms=int(capture_timestamp_ms),
-        image_data=data,
-    )
+    req = ai_pb2.InferRequest(device_id=device_id, batch_id=batch_id)
+    now_ms = int(time.time() * 1000)
+    for idx, img_path in enumerate(img_paths, start=1):
+        path = Path(img_path)
+        req.images.append(
+            ai_pb2.InferImage(
+                frame_id=path.stem or f"frame_{idx:06d}",
+                capture_timestamp_ms=now_ms + idx,
+                image_data=path.read_bytes(),
+            )
+        )
+
     t0 = time.time()
     resp = stub.Infer(req, timeout=timeout)
     t1 = time.time()
@@ -78,10 +87,10 @@ def call_infer(host, port, device_id, frame_id, capture_timestamp_ms, img_path, 
     outdir = os.path.join('outputs', 'client_test')
     sizes = save_outputs(resp, outdir)
     print('device_id', getattr(resp, 'device_id', ''))
-    print('frame_id', resp.frame_id)
-    print('capture_timestamp_ms', getattr(resp, 'capture_timestamp_ms', 0))
-    print('person_count:', resp.person_count)
-    print('processing_time_ms (reported):', resp.processing_time_ms)
+    print('batch_id', resp.batch_id)
+    print('result_count:', len(resp.results))
+    print('person_counts:', [item.person_count for item in resp.results])
+    print('processing_time_ms (batch reported):', resp.processing_time_ms)
     print('roundtrip_ms:', int((t1 - t0) * 1000))
     print('saved sizes:', sizes)
     return resp
@@ -89,15 +98,9 @@ def call_infer(host, port, device_id, frame_id, capture_timestamp_ms, img_path, 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('input', help='input image path')
-    parser.add_argument('frame_id', help='frame id string')
+    parser.add_argument('inputs', nargs=10, help='exactly 10 input image paths')
     parser.add_argument('--device-id', default='device_0000')
-    parser.add_argument(
-        '--capture-timestamp-ms',
-        default=None,
-        type=int,
-        help='capture timestamp in milliseconds; default: now()'
-    )
+    parser.add_argument('--batch-id', default=None)
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', default=50052, type=int)
     # First request can be slow due to model load; use a safer default.
@@ -109,9 +112,8 @@ def main():
         args.host,
         args.port,
         args.device_id,
-        args.frame_id,
-        args.capture_timestamp_ms,
-        args.input,
+        args.batch_id,
+        args.inputs,
         timeout=args.timeout,
         max_msg_mb=args.max_msg_mb,
     )

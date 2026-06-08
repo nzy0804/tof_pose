@@ -1,0 +1,2 @@
+2026-06-05 11:27:27 [INFO] Starting gRPC server on 0.0.0.0:50052 (max_msg_mb=100)
+2026-06-05 11:28:48 [INFO] Infer batch timing: inputs=1 outputs=2 decode_ms=36 interpolate_ms=0 yolo_prepare_ms=25 yolo_infer_ms=2549 seg_yolo_ms=2290 pose_yolo_ms=258 postprocess_ms=4 render_ms=1 png_encode_ms=9 total_ms=2625 decode_workers=4 render_workers=4 device=cuda:0

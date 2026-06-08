@@ -39,6 +39,10 @@ import cv2
 import numpy as np
 
 
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
+LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 for path in (str(ROOT), str(SRC)):
@@ -376,7 +380,7 @@ def main() -> int:
     parser.add_argument("--log-level", default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
     args = parser.parse_args()
 
-    logging.basicConfig(level=getattr(logging, args.log_level), format="[%(levelname)s] %(message)s")
+    logging.basicConfig(level=getattr(logging, args.log_level), format=LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
     return run(
         host=args.host,
         port=int(args.port),

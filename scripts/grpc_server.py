@@ -40,7 +40,8 @@ import ai_pb2_grpc
 from tof_pose.realtime_service import RealtimePoseEngine
 
 
-BATCH_SIZE = 10
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
+LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
 class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
@@ -56,6 +57,8 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         pose_kpt_conf: float | None = None,
         pose_kpt_min_points: int = 4,
         device: str | None = None,
+        render_workers: int = 1,
+        decode_workers: int = 1,
     ):
         self.svc = RealtimePoseEngine(
             stateless=bool(stateless),
@@ -67,14 +70,21 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
             pose_kpt_conf_threshold=pose_kpt_conf,
             pose_kpt_min_points=pose_kpt_min_points,
             device=device,
+            render_workers=render_workers,
+            decode_workers=decode_workers,
         )
 
     def Infer(self, request, context):
         device_id = getattr(request, 'device_id', '')
         batch_id = getattr(request, 'batch_id', '')
         images = list(getattr(request, 'images', []))
-        if len(images) != BATCH_SIZE:
-            context.set_details(f"expected exactly {BATCH_SIZE} images, got {len(images)}")
+        batch_size = int(getattr(request, 'batch_size', 0) or 0)
+        if not images:
+            context.set_details("images must not be empty")
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            return ai_pb2.InferResponse(device_id=device_id, batch_id=batch_id)
+        if batch_size and batch_size != len(images):
+            context.set_details(f"batch_size={batch_size} does not match images count={len(images)}")
             context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
             return ai_pb2.InferResponse(device_id=device_id, batch_id=batch_id)
 
@@ -82,6 +92,8 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         try:
             frames = [(image.frame_id, image.image_data) for image in images]
             results = self.svc.infer_batch(frames)
+            if len(results) != len(images) * 2:
+                raise RuntimeError(f"expected {len(images) * 2} results for {len(images)} inputs, got {len(results)}")
         except Exception as e:
             context.set_details(str(e))
             context.set_code(grpc.StatusCode.INTERNAL)
@@ -95,15 +107,29 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
             batch_id=batch_id,
             processing_time_ms=int((time.time() - batch_start) * 1000),
         )
-        for image, result in zip(images, results):
+        kind_map = {
+            'interpolated': ai_pb2.RESULT_KIND_INTERPOLATED,
+            'current': ai_pb2.RESULT_KIND_CURRENT,
+        }
+        for result in results:
+            input_index = int(result.get('input_index', -1))
+            image = images[input_index] if 0 <= input_index < len(images) else None
+            capture_timestamp_ms = int(getattr(image, 'capture_timestamp_ms', 0) or 0) if image is not None else 0
+            if result.get('result_kind') == 'interpolated' and input_index > 0:
+                prev_ts = int(getattr(images[input_index - 1], 'capture_timestamp_ms', 0) or 0)
+                if prev_ts and capture_timestamp_ms:
+                    capture_timestamp_ms = int((prev_ts + capture_timestamp_ms) // 2)
             response.results.append(
                 ai_pb2.InferResult(
-                    frame_id=image.frame_id or result.get('frame_id', ''),
-                    capture_timestamp_ms=int(getattr(image, 'capture_timestamp_ms', 0) or 0),
+                    frame_id=result.get('frame_id', ''),
+                    capture_timestamp_ms=capture_timestamp_ms,
                     pseudo_color_image=result.get('pseudo_color_image', b''),
                     skeleton_contour_image=result.get('skeleton_contour_image', b''),
                     person_count=int(result.get('person_count', 0)),
                     processing_time_ms=int(result.get('processing_time_ms', 0)),
+                    result_kind=kind_map.get(result.get('result_kind'), ai_pb2.RESULT_KIND_UNSPECIFIED),
+                    input_index=input_index,
+                    output_index=int(result.get('output_index', len(response.results))),
                 )
             )
         return response
@@ -124,6 +150,8 @@ def serve(
     pose_kpt_conf: float | None = None,
     pose_kpt_min_points: int = 4,
     device: str | None = None,
+    render_workers: int = 1,
+    decode_workers: int = 1,
 ):
     server_opts = [
         ('grpc.max_send_message_length', max_msg_mb * 1024 * 1024),
@@ -141,6 +169,8 @@ def serve(
             pose_kpt_conf=pose_kpt_conf,
             pose_kpt_min_points=pose_kpt_min_points,
             device=device,
+            render_workers=render_workers,
+            decode_workers=decode_workers,
         ),
         server,
     )
@@ -201,8 +231,20 @@ def main():
     parser.add_argument('--pose-kpt-conf', default=None, type=float, help='override pose keypoint conf threshold (pose-only)')
     parser.add_argument('--pose-kpt-min-points', default=4, type=int, help='min confident keypoints to count one person (pose-only)')
     parser.add_argument('--device', default=None, help='YOLO inference device, for example cuda:0 or cpu')
+    parser.add_argument(
+        '--render-workers',
+        default=1,
+        type=int,
+        help='CPU worker threads for rendering and PNG encoding returned images',
+    )
+    parser.add_argument(
+        '--decode-workers',
+        default=1,
+        type=int,
+        help='CPU worker threads for decoding input PNG images',
+    )
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
     serve(
         host=args.host,
         port=args.port,
@@ -217,6 +259,8 @@ def main():
         pose_kpt_conf=args.pose_kpt_conf,
         pose_kpt_min_points=args.pose_kpt_min_points,
         device=args.device,
+        render_workers=args.render_workers,
+        decode_workers=args.decode_workers,
     )
 
 

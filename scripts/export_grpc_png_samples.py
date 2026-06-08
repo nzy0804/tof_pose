@@ -24,7 +24,7 @@ INPUTS = [
     ROOT / "outputs" / "png_size_samples" / "mid_frame_000826.png",
     ROOT / "outputs" / "png_size_samples" / "mid_frame_000954.png",
 ]
-BATCH_SIZE = 10
+SAMPLE_BATCH_SIZE = 10
 INPUT_SIZE = (100, 100)
 OUTPUT_SIZE = (320, 320)
 
@@ -100,10 +100,10 @@ def main() -> None:
     svc = ModelService()
     device_id = "device_sample"
     batch_id = "batch_sample_000001"
-    req = ai_pb2.InferRequest(device_id=device_id, batch_id=batch_id)
+    req = ai_pb2.InferRequest(device_id=device_id, batch_id=batch_id, batch_size=SAMPLE_BATCH_SIZE)
     frames: list[tuple[str, bytes]] = []
 
-    for idx in range(BATCH_SIZE):
+    for idx in range(SAMPLE_BATCH_SIZE):
         input_path = existing_inputs[idx % len(existing_inputs)]
         frame_id = f"frame_sample_{idx + 1:06d}"
         image_data = make_request_png(input_path.read_bytes())
@@ -120,15 +120,24 @@ def main() -> None:
 
     batch_start_results = svc.infer_batch(frames)
     resp = ai_pb2.InferResponse(device_id=device_id, batch_id=batch_id)
-    for request_image, result in zip(req.images, batch_start_results):
+    kind_map = {
+        "interpolated": ai_pb2.RESULT_KIND_INTERPOLATED,
+        "current": ai_pb2.RESULT_KIND_CURRENT,
+    }
+    for output_index, result in enumerate(batch_start_results):
+        input_index = int(result.get("input_index", -1))
+        request_image = req.images[input_index]
         resp.results.append(
             ai_pb2.InferResult(
-                frame_id=request_image.frame_id,
+                frame_id=result["frame_id"],
                 capture_timestamp_ms=request_image.capture_timestamp_ms,
                 pseudo_color_image=result["pseudo_color_image"],
                 skeleton_contour_image=result["skeleton_contour_image"],
                 person_count=int(result["person_count"]),
                 processing_time_ms=int(result["processing_time_ms"]),
+                result_kind=kind_map.get(result.get("result_kind"), ai_pb2.RESULT_KIND_UNSPECIFIED),
+                input_index=input_index,
+                output_index=output_index,
             )
         )
     resp.processing_time_ms = sum(item.processing_time_ms for item in resp.results)
@@ -151,22 +160,24 @@ def main() -> None:
         f"- batch_id: `{batch_id}`",
         f"- images: `{len(req.images)}`",
         f"- results: `{len(resp.results)}`",
+        f"- output images: `{len(resp.results) * 2}`",
         f"- request protobuf bytes: `{len(req_pb)}`, sha256 `{digest(req_pb)}`",
         f"- response protobuf bytes: `{len(resp_pb)}`, sha256 `{digest(resp_pb)}`",
         "",
-        "| index | frame_id | request bytes | pseudo color bytes | skeleton contour bytes | person_count |",
-        "|---:|---|---:|---:|---:|---:|",
+        "| output index | input index | kind | frame_id | pseudo color bytes | skeleton contour bytes | person_count |",
+        "|---:|---:|---|---|---:|---:|---:|",
     ]
 
-    for idx, (request_image, result) in enumerate(zip(req.images, resp.results), start=1):
+    for idx, result in enumerate(resp.results, start=1):
         require_size("pseudo_color_image", result.pseudo_color_image, OUTPUT_SIZE)
         require_size("skeleton_contour_image", result.skeleton_contour_image, OUTPUT_SIZE)
-        write_bytes(sample_dir / f"{idx:02d}_pseudo_color.png.bin", result.pseudo_color_image)
-        write_hex(sample_dir / f"{idx:02d}_pseudo_color.png.hex", result.pseudo_color_image)
-        write_bytes(sample_dir / f"{idx:02d}_skeleton_contour.png.bin", result.skeleton_contour_image)
-        write_hex(sample_dir / f"{idx:02d}_skeleton_contour.png.hex", result.skeleton_contour_image)
+        kind = "interpolated" if result.result_kind == ai_pb2.RESULT_KIND_INTERPOLATED else "current"
+        write_bytes(sample_dir / f"{idx:02d}_{kind}_pseudo_color.png.bin", result.pseudo_color_image)
+        write_hex(sample_dir / f"{idx:02d}_{kind}_pseudo_color.png.hex", result.pseudo_color_image)
+        write_bytes(sample_dir / f"{idx:02d}_{kind}_skeleton_contour.png.bin", result.skeleton_contour_image)
+        write_hex(sample_dir / f"{idx:02d}_{kind}_skeleton_contour.png.hex", result.skeleton_contour_image)
         lines.append(
-            f"| {idx} | `{request_image.frame_id}` | {len(request_image.image_data)} | "
+            f"| {result.output_index} | {result.input_index} | `{kind}` | `{result.frame_id}` | "
             f"{len(result.pseudo_color_image)} | {len(result.skeleton_contour_image)} | {result.person_count} |"
         )
 

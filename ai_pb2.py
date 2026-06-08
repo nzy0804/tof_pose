@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x08\x61i.proto\x12\x02\x61i\"P\n\nInferImage\x12\x10\n\x08\x66rame_id\x18\x01 \x01(\t\x12\x1c\n\x14\x63\x61pture_timestamp_ms\x18\x02 \x01(\x03\x12\x12\n\nimage_data\x18\x03 \x01(\x0c\"\xab\x01\n\x0bInferResult\x12\x10\n\x08\x66rame_id\x18\x01 \x01(\t\x12\x1c\n\x14\x63\x61pture_timestamp_ms\x18\x02 \x01(\x03\x12\x1a\n\x12pseudo_color_image\x18\x03 \x01(\x0c\x12\x1e\n\x16skeleton_contour_image\x18\x04 \x01(\x0c\x12\x14\n\x0cperson_count\x18\x05 \x01(\x05\x12\x1a\n\x12processing_time_ms\x18\x06 \x01(\x05\"S\n\x0cInferRequest\x12\x11\n\tdevice_id\x18\x01 \x01(\t\x12\x10\n\x08\x62\x61tch_id\x18\x02 \x01(\t\x12\x1e\n\x06images\x18\x03 \x03(\x0b\x32\x0e.ai.InferImage\"r\n\rInferResponse\x12\x11\n\tdevice_id\x18\x01 \x01(\t\x12\x10\n\x08\x62\x61tch_id\x18\x02 \x01(\t\x12 \n\x07results\x18\x03 \x03(\x0b\x32\x0f.ai.InferResult\x12\x1a\n\x12processing_time_ms\x18\x04 \x01(\x05\x32<\n\x0cModelService\x12,\n\x05Infer\x12\x10.ai.InferRequest\x1a\x11.ai.InferResponseB\x0fZ\r./proto;protob\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x08\x61i.proto\x12\x02\x61i\"P\n\nInferImage\x12\x10\n\x08\x66rame_id\x18\x01 \x01(\t\x12\x1c\n\x14\x63\x61pture_timestamp_ms\x18\x02 \x01(\x03\x12\x12\n\nimage_data\x18\x03 \x01(\x0c\"\xfb\x01\n\x0bInferResult\x12\x10\n\x08\x66rame_id\x18\x01 \x01(\t\x12\x1c\n\x14\x63\x61pture_timestamp_ms\x18\x02 \x01(\x03\x12\x1a\n\x12pseudo_color_image\x18\x03 \x01(\x0c\x12\x1e\n\x16skeleton_contour_image\x18\x04 \x01(\x0c\x12\x14\n\x0cperson_count\x18\x05 \x01(\x05\x12\x1a\n\x12processing_time_ms\x18\x06 \x01(\x05\x12#\n\x0bresult_kind\x18\x07 \x01(\x0e\x32\x0e.ai.ResultKind\x12\x13\n\x0binput_index\x18\x08 \x01(\x05\x12\x14\n\x0coutput_index\x18\t \x01(\x05\"g\n\x0cInferRequest\x12\x11\n\tdevice_id\x18\x01 \x01(\t\x12\x10\n\x08\x62\x61tch_id\x18\x02 \x01(\t\x12\x1e\n\x06images\x18\x03 \x03(\x0b\x32\x0e.ai.InferImage\x12\x12\n\nbatch_size\x18\x04 \x01(\x05\"r\n\rInferResponse\x12\x11\n\tdevice_id\x18\x01 \x01(\t\x12\x10\n\x08\x62\x61tch_id\x18\x02 \x01(\t\x12 \n\x07results\x18\x03 \x03(\x0b\x32\x0f.ai.InferResult\x12\x1a\n\x12processing_time_ms\x18\x04 \x01(\x05*`\n\nResultKind\x12\x1b\n\x17RESULT_KIND_UNSPECIFIED\x10\x00\x12\x1c\n\x18RESULT_KIND_INTERPOLATED\x10\x01\x12\x17\n\x13RESULT_KIND_CURRENT\x10\x02\x32<\n\x0cModelService\x12,\n\x05Infer\x12\x10.ai.InferRequest\x1a\x11.ai.InferResponseB\x0fZ\r./proto;protob\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -32,14 +32,16 @@ _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'ai_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   _globals['DESCRIPTOR']._loaded_options = None
   _globals['DESCRIPTOR']._serialized_options = b'Z\r./proto;proto'
+  _globals['_RESULTKIND']._serialized_start=573
+  _globals['_RESULTKIND']._serialized_end=669
   _globals['_INFERIMAGE']._serialized_start=16
   _globals['_INFERIMAGE']._serialized_end=96
   _globals['_INFERRESULT']._serialized_start=99
-  _globals['_INFERRESULT']._serialized_end=270
-  _globals['_INFERREQUEST']._serialized_start=272
-  _globals['_INFERREQUEST']._serialized_end=355
-  _globals['_INFERRESPONSE']._serialized_start=357
-  _globals['_INFERRESPONSE']._serialized_end=471
-  _globals['_MODELSERVICE']._serialized_start=473
-  _globals['_MODELSERVICE']._serialized_end=533
+  _globals['_INFERRESULT']._serialized_end=350
+  _globals['_INFERREQUEST']._serialized_start=352
+  _globals['_INFERREQUEST']._serialized_end=455
+  _globals['_INFERRESPONSE']._serialized_start=457
+  _globals['_INFERRESPONSE']._serialized_end=571
+  _globals['_MODELSERVICE']._serialized_start=671
+  _globals['_MODELSERVICE']._serialized_end=731
 # @@protoc_insertion_point(module_scope)

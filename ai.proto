@@ -7,6 +7,12 @@ service ModelService {
   rpc Infer(InferRequest) returns (InferResponse);
 }
 
+enum ResultKind {
+  RESULT_KIND_UNSPECIFIED = 0;
+  RESULT_KIND_INTERPOLATED = 1;
+  RESULT_KIND_CURRENT = 2;
+}
+
 message InferImage {
   string frame_id = 1;
   int64 capture_timestamp_ms = 2;
@@ -20,12 +26,16 @@ message InferResult {
   bytes skeleton_contour_image = 4;
   int32 person_count = 5;
   int32 processing_time_ms = 6;
+  ResultKind result_kind = 7;
+  int32 input_index = 8;
+  int32 output_index = 9;
 }
 
 message InferRequest {
   string device_id = 1;
   string batch_id = 2;
   repeated InferImage images = 3;
+  int32 batch_size = 4;
 }
 
 message InferResponse {

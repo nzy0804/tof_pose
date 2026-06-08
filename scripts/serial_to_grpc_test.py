@@ -42,7 +42,14 @@ READ_TIMEOUT_S = 0.05
 ENDIAN = "<"
 FRAME_HEAD = b"\x00\xFF"
 ALLOWED_TAILS = (0xCC, 0xDD)
-BATCH_SIZE = 10
+
+
+def _result_kind_name(kind: int) -> str:
+    if kind == ai_pb2.RESULT_KIND_INTERPOLATED:
+        return "interpolated"
+    if kind == ai_pb2.RESULT_KIND_CURRENT:
+        return "current"
+    return "unknown"
 
 
 def _save_outputs(resp: ai_pb2.InferResponse, outdir: Path) -> dict[str, int]:
@@ -50,13 +57,14 @@ def _save_outputs(resp: ai_pb2.InferResponse, outdir: Path) -> dict[str, int]:
     batch_prefix = f"{getattr(resp, 'device_id', '')}_{resp.batch_id}" if getattr(resp, 'device_id', '') else resp.batch_id
     sizes: dict[str, int] = {}
     for idx, item in enumerate(resp.results, start=1):
-        frame_prefix = f"{batch_prefix}_{idx:02d}_{item.frame_id}"
+        kind = _result_kind_name(item.result_kind)
+        frame_prefix = f"{batch_prefix}_{idx:02d}_{kind}_{item.frame_id}"
         mapping = [
             ("pseudo_color", item.pseudo_color_image),
             ("skeleton_contour", item.skeleton_contour_image),
         ]
         for name, blob in mapping:
-            key = f"{idx:02d}_{name}"
+            key = f"{idx:02d}_{kind}_{name}"
             path = outdir / f"{frame_prefix}_{name}.png"
             if blob:
                 path.write_bytes(blob)
@@ -168,13 +176,17 @@ def main() -> int:
         action="store_true",
         help="do not stop the local server after test",
     )
-    parser.add_argument("--frames", type=int, default=10, help="number of frames to send; full batches of 10 are sent")
+    parser.add_argument("--frames", type=int, default=10, help="number of frames to send; full batches are sent")
+    parser.add_argument("--batch-size", type=int, default=10, help="number of frames per gRPC batch")
     parser.add_argument("--timeout", type=float, default=120.0, help="grpc per-call timeout seconds")
     parser.add_argument("--max-msg-mb", type=int, default=50)
     parser.add_argument("--outdir", default=str(Path("outputs") / "serial_grpc_test"))
     args = parser.parse_args()
-    if int(args.frames) < BATCH_SIZE or int(args.frames) % BATCH_SIZE != 0:
-        raise SystemExit(f"--frames must be a positive multiple of {BATCH_SIZE}")
+    batch_size = int(args.batch_size)
+    if batch_size <= 0:
+        raise SystemExit("--batch-size must be positive")
+    if int(args.frames) < batch_size or int(args.frames) % batch_size != 0:
+        raise SystemExit(f"--frames must be a positive multiple of --batch-size ({batch_size})")
 
     outdir = Path(args.outdir)
 
@@ -264,12 +276,16 @@ def main() -> int:
 
             frame_id = f"serial_{frameid:06d}"
             pending_batch.append((frame_id, int(time.time() * 1000), png_bytes, int(res_c), int(res_r)))
-            if len(pending_batch) < BATCH_SIZE:
+            if len(pending_batch) < batch_size:
                 continue
 
             batches += 1
             batch_id = f"serial_batch_{batches:06d}"
-            req = ai_pb2.InferRequest(device_id=str(args.device_id), batch_id=batch_id)
+            req = ai_pb2.InferRequest(
+                device_id=str(args.device_id),
+                batch_id=batch_id,
+                batch_size=len(pending_batch),
+            )
             for item_frame_id, timestamp_ms, item_png, _res_c, _res_r in pending_batch:
                 req.images.append(
                     ai_pb2.InferImage(
@@ -289,7 +305,7 @@ def main() -> int:
             person_counts = [item.person_count for item in resp.results]
             print(
                 f"[{sent}/{args.frames}] device_id={getattr(resp, 'device_id', '')} batch_id={resp.batch_id} "
-                f"src={src_shapes} results={len(resp.results)} server_ms={resp.processing_time_ms} "
+                f"src={src_shapes} results={len(resp.results)} output_images={len(resp.results) * 2} server_ms={resp.processing_time_ms} "
                 f"roundtrip_ms={int((call_end - call_start) * 1000)} person_counts={person_counts} sizes={sizes}",
                 flush=True,
             )

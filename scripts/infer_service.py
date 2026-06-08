@@ -15,7 +15,7 @@ import numpy as np
 
 class ModelService:
     def __init__(self):
-        pass
+        self.prev_frame = None
 
     def _decode_image(self, data: bytes) -> np.ndarray:
         arr = np.frombuffer(data, dtype=np.uint8)
@@ -85,7 +85,35 @@ class ModelService:
         }
 
     def infer_batch(self, frames: list[tuple[str, bytes]]) -> list[dict]:
-        return [self.infer(frame_id, image_bytes) for frame_id, image_bytes in frames]
+        results: list[dict] = []
+        for input_index, (frame_id, image_bytes) in enumerate(frames):
+            depth = self._decode_image(image_bytes)
+            if self.prev_frame is None:
+                interpolated = depth
+            else:
+                previous = self.prev_frame
+                if previous.shape != depth.shape:
+                    previous = cv2.resize(previous, (depth.shape[1], depth.shape[0]), interpolation=cv2.INTER_LINEAR)
+                interpolated = self.interpolate_depth(previous, depth)
+
+            for kind, output_depth in (("interpolated", interpolated), ("current", depth)):
+                start = time.time()
+                pseudo_color, skeleton_contour = self.process_single(output_depth)
+                results.append(
+                    {
+                        "frame_id": f"{frame_id}_{kind}",
+                        "source_frame_id": frame_id,
+                        "input_index": input_index,
+                        "output_index": len(results),
+                        "result_kind": kind,
+                        "pseudo_color_image": pseudo_color,
+                        "skeleton_contour_image": skeleton_contour,
+                        "person_count": 0,
+                        "processing_time_ms": int((time.time() - start) * 1000),
+                    }
+                )
+            self.prev_frame = depth.copy()
+        return results
 
 
 def main(argv):

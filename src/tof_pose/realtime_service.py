@@ -213,6 +213,8 @@ class RealtimePoseEngine:
         device: str | None = None,
         render_workers: int = 1,
         decode_workers: int = 1,
+        png_compression: int = 1,
+        instance_name: str | None = None,
     ) -> None:
         model_file = Path(model_path) if model_path else DEFAULT_MODEL_PATH
         pose_model_file = Path(pose_model_path) if pose_model_path else DEFAULT_POSE_MODEL_PATH
@@ -222,6 +224,8 @@ class RealtimePoseEngine:
         self._device = str(device).strip() if device else None
         self._render_workers = max(1, int(render_workers))
         self._decode_workers = max(1, int(decode_workers))
+        self._png_compression = min(9, max(0, int(png_compression)))
+        self._instance_name = str(instance_name).strip() if instance_name else "model-0"
         self._lock = threading.Lock()
         self._stateless = bool(stateless)
         self._persist_tracks = (not self._stateless) if persist_tracks is None else bool(persist_tracks)
@@ -888,7 +892,7 @@ class RealtimePoseEngine:
         return color_img
 
     def _encode_png(self, img: np.ndarray) -> bytes:
-        ok, buf = cv2.imencode(".png", img, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+        ok, buf = cv2.imencode(".png", img, [cv2.IMWRITE_PNG_COMPRESSION, self._png_compression])
         if not ok:
             raise RuntimeError("failed to encode PNG")
         return buf.tobytes()
@@ -941,6 +945,21 @@ class RealtimePoseEngine:
             "processing_time_ms": elapsed,
         }
 
+    def _reuse_analyzed_result_with_depth(self, analyzed: dict, frame_id: str, depth: np.ndarray) -> dict:
+        prepared = self._prepare_depth_views(depth)
+        analysis = dict(analyzed["analysis"])
+        analysis["depth_up"] = prepared["depth_up"]
+        analysis["depth_raw"] = prepared["depth_raw"]
+        analysis["color_img"] = prepared["color_img"]
+        analysis["width"] = prepared["width"]
+        analysis["height"] = prepared["height"]
+        return {
+            "frame_id": frame_id,
+            "analysis": analysis,
+            "person_count": int(analyzed["person_count"]),
+            "processing_time_ms": 0,
+        }
+
     def _render_analyzed_result(self, analyzed: dict) -> dict:
         analysis = analyzed["analysis"]
         return {
@@ -952,11 +971,17 @@ class RealtimePoseEngine:
         }
 
     def _encode_rendered_result(self, rendered: dict) -> dict:
+        person_count = int(rendered["person_count"])
+        pseudo_color_image = self._encode_png(rendered["pseudo_color_image"])
+        if person_count <= 0:
+            skeleton_contour_image = pseudo_color_image
+        else:
+            skeleton_contour_image = self._encode_png(rendered["skeleton_contour_image"])
         return {
             "frame_id": rendered["frame_id"],
-            "pseudo_color_image": self._encode_png(rendered["pseudo_color_image"]),
-            "skeleton_contour_image": self._encode_png(rendered["skeleton_contour_image"]),
-            "person_count": int(rendered["person_count"]),
+            "pseudo_color_image": pseudo_color_image,
+            "skeleton_contour_image": skeleton_contour_image,
+            "person_count": person_count,
             "processing_time_ms": int(rendered["processing_time_ms"]),
         }
 
@@ -996,20 +1021,27 @@ class RealtimePoseEngine:
         return self._encode_analyzed_result(analyzed)
 
     def infer(self, frame_id: str, image_bytes: bytes) -> dict:
-        with self._lock:
+        self._lock.acquire()
+        try:
             return self._infer_one_unlocked(frame_id, image_bytes)
+        finally:
+            self._lock.release()
 
     def _log_batch_timings(self, input_count: int, output_count: int, timings: dict[str, int]) -> None:
         LOGGER.info(
             (
-                "Infer batch timing: inputs=%d outputs=%d "
-                "decode_ms=%d interpolate_ms=%d yolo_prepare_ms=%d "
+                "Infer batch timing: inputs=%d outputs=%d yolo_inputs=%d "
+                "postprocess_inputs=%d instance=%s queue_wait_ms=%d decode_ms=%d interpolate_ms=%d yolo_prepare_ms=%d "
                 "yolo_infer_ms=%d seg_yolo_ms=%d pose_yolo_ms=%d "
                 "postprocess_ms=%d render_ms=%d png_encode_ms=%d total_ms=%d "
-                "decode_workers=%d render_workers=%d device=%s"
+                "decode_workers=%d render_workers=%d png_compression=%d device=%s"
             ),
             input_count,
             output_count,
+            int(timings.get("yolo_input_count", input_count)),
+            int(timings.get("postprocess_input_count", output_count)),
+            self._instance_name,
+            int(timings.get("queue_wait_ms", 0)),
             int(timings.get("decode_ms", 0)),
             int(timings.get("interpolate_ms", 0)),
             int(timings.get("yolo_prepare_ms", 0)),
@@ -1022,15 +1054,20 @@ class RealtimePoseEngine:
             int(timings.get("total_ms", 0)),
             self._decode_workers,
             self._render_workers,
+            self._png_compression,
             self._device or "auto",
         )
 
     def infer_batch(self, frames: list[tuple[str, bytes]]) -> list[dict]:
-        with self._lock:
+        lock_start = time.perf_counter()
+        self._lock.acquire()
+        try:
             if not frames:
                 return []
 
-            timings: dict[str, int] = {}
+            timings: dict[str, int] = {
+                "queue_wait_ms": _elapsed_ms(lock_start),
+            }
             total_start = time.perf_counter()
 
             decode_start = time.perf_counter()
@@ -1039,9 +1076,17 @@ class RealtimePoseEngine:
 
             interpolate_start = time.perf_counter()
             output_frames: list[dict] = []
+            source_frames: list[dict] = []
             previous_source = None if self._stateless else self._last_source_depth
             for input_index, (frame_id, current_depth) in enumerate(decoded_frames):
                 interpolated_depth = self._interpolate_depth(previous_source, current_depth)
+                source_frames.append(
+                    {
+                        "frame_id": frame_id,
+                        "input_index": input_index,
+                        "depth": current_depth,
+                    }
+                )
                 output_frames.append(
                     {
                         "frame_id": f"{frame_id}_interpolated",
@@ -1064,9 +1109,11 @@ class RealtimePoseEngine:
 
             self._last_source_depth = previous_source.copy() if previous_source is not None and not self._stateless else None
             timings["interpolate_ms"] = _elapsed_ms(interpolate_start)
+            timings["yolo_input_count"] = len(source_frames)
+            timings["postprocess_input_count"] = len(source_frames)
 
             yolo_prepare_start = time.perf_counter()
-            color_imgs = [self._prepare_depth_views(item["depth"])["color_img"] for item in output_frames]
+            color_imgs = [self._prepare_depth_views(item["depth"])["color_img"] for item in source_frames]
             timings["yolo_prepare_ms"] = _elapsed_ms(yolo_prepare_start)
 
             if self._pose_only:
@@ -1082,14 +1129,34 @@ class RealtimePoseEngine:
                 timings["pose_yolo_ms"] = _elapsed_ms(yolo_start)
                 timings["seg_yolo_ms"] = 0
                 timings["yolo_infer_ms"] = int(timings["pose_yolo_ms"])
-                if len(pose_results) != len(output_frames):
-                    raise RuntimeError(f"pose batch returned {len(pose_results)} results for {len(output_frames)} frames")
+                if len(pose_results) != len(source_frames):
+                    raise RuntimeError(f"pose batch returned {len(pose_results)} results for {len(source_frames)} source frames")
 
                 postprocess_start = time.perf_counter()
-                analyzed_results = [
-                    self._analyze_predecoded_unlocked(item["frame_id"], item["depth"], pose_result=pose_result)
-                    for item, pose_result in zip(output_frames, pose_results)
-                ]
+                current_analyzed_by_input: dict[int, dict] = {}
+                for item in output_frames:
+                    if item["result_kind"] != "current":
+                        continue
+                    input_index = int(item["input_index"])
+                    current_analyzed_by_input[input_index] = self._analyze_predecoded_unlocked(
+                        item["frame_id"],
+                        item["depth"],
+                        pose_result=pose_results[input_index],
+                    )
+                analyzed_results = []
+                for item in output_frames:
+                    input_index = int(item["input_index"])
+                    current_analyzed = current_analyzed_by_input[input_index]
+                    if item["result_kind"] == "current":
+                        analyzed_results.append(current_analyzed)
+                    else:
+                        analyzed_results.append(
+                            self._reuse_analyzed_result_with_depth(
+                                current_analyzed,
+                                item["frame_id"],
+                                item["depth"],
+                            )
+                        )
                 timings["postprocess_ms"] = _elapsed_ms(postprocess_start)
 
                 results = self._encode_analyzed_results(analyzed_results, timings)
@@ -1115,8 +1182,8 @@ class RealtimePoseEngine:
                 verbose=False,
             )
             timings["seg_yolo_ms"] = _elapsed_ms(seg_yolo_start)
-            if len(seg_results) != len(output_frames):
-                raise RuntimeError(f"seg batch returned {len(seg_results)} results for {len(output_frames)} frames")
+            if len(seg_results) != len(source_frames):
+                raise RuntimeError(f"seg batch returned {len(seg_results)} results for {len(source_frames)} source frames")
             pose_yolo_start = time.perf_counter()
             pose_results = self.pose_model.predict(
                 color_imgs,
@@ -1128,19 +1195,35 @@ class RealtimePoseEngine:
             )
             timings["pose_yolo_ms"] = _elapsed_ms(pose_yolo_start)
             timings["yolo_infer_ms"] = _elapsed_ms(yolo_start)
-            if len(pose_results) != len(output_frames):
-                raise RuntimeError(f"pose batch returned {len(pose_results)} results for {len(output_frames)} frames")
+            if len(pose_results) != len(source_frames):
+                raise RuntimeError(f"pose batch returned {len(pose_results)} results for {len(source_frames)} source frames")
 
             postprocess_start = time.perf_counter()
-            analyzed_results = [
-                self._analyze_predecoded_unlocked(
+            current_analyzed_by_input: dict[int, dict] = {}
+            for item in output_frames:
+                if item["result_kind"] != "current":
+                    continue
+                input_index = int(item["input_index"])
+                current_analyzed_by_input[input_index] = self._analyze_predecoded_unlocked(
                     item["frame_id"],
                     item["depth"],
-                    seg_result=seg_result,
-                    pose_result=pose_result,
+                    seg_result=seg_results[input_index],
+                    pose_result=pose_results[input_index],
                 )
-                for item, seg_result, pose_result in zip(output_frames, seg_results, pose_results)
-            ]
+            analyzed_results = []
+            for item in output_frames:
+                input_index = int(item["input_index"])
+                current_analyzed = current_analyzed_by_input[input_index]
+                if item["result_kind"] == "current":
+                    analyzed_results.append(current_analyzed)
+                else:
+                    analyzed_results.append(
+                        self._reuse_analyzed_result_with_depth(
+                            current_analyzed,
+                            item["frame_id"],
+                            item["depth"],
+                        )
+                    )
             timings["postprocess_ms"] = _elapsed_ms(postprocess_start)
 
             results = self._encode_analyzed_results(analyzed_results, timings)
@@ -1152,3 +1235,5 @@ class RealtimePoseEngine:
             timings["total_ms"] = _elapsed_ms(total_start)
             self._log_batch_timings(len(frames), len(output_frames), timings)
             return results
+        finally:
+            self._lock.release()

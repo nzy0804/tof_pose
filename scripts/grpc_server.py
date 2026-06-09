@@ -6,6 +6,7 @@ Usage:
 """
 import argparse
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -59,20 +60,61 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         device: str | None = None,
         render_workers: int = 1,
         decode_workers: int = 1,
+        png_compression: int = 1,
+        model_instances: int = 1,
     ):
-        self.svc = RealtimePoseEngine(
-            stateless=bool(stateless),
-            pose_only=bool(pose_only),
-            pose_validate_seg=bool(pose_validate_seg),
-            model_path=Path(model_path) if model_path else None,
-            pose_model_path=Path(pose_model_path) if pose_model_path else None,
-            pose_conf_threshold=pose_conf,
-            pose_kpt_conf_threshold=pose_kpt_conf,
-            pose_kpt_min_points=pose_kpt_min_points,
-            device=device,
-            render_workers=render_workers,
-            decode_workers=decode_workers,
-        )
+        self._engine_count = max(1, int(model_instances))
+        self._engines: list[RealtimePoseEngine] = []
+        self._dispatch_lock = threading.Lock()
+        self._device_bindings: dict[str, int] = {}
+        self._engine_inflight = [0 for _ in range(self._engine_count)]
+        self._engine_device_counts = [0 for _ in range(self._engine_count)]
+        for idx in range(self._engine_count):
+            logging.info("Initializing AI model instance %d/%d on device=%s", idx + 1, self._engine_count, device or "auto")
+            self._engines.append(
+                RealtimePoseEngine(
+                    stateless=bool(stateless),
+                    pose_only=bool(pose_only),
+                    pose_validate_seg=bool(pose_validate_seg),
+                    model_path=Path(model_path) if model_path else None,
+                    pose_model_path=Path(pose_model_path) if pose_model_path else None,
+                    pose_conf_threshold=pose_conf,
+                    pose_kpt_conf_threshold=pose_kpt_conf,
+                    pose_kpt_min_points=pose_kpt_min_points,
+                    device=device,
+                    render_workers=render_workers,
+                    decode_workers=decode_workers,
+                    png_compression=png_compression,
+                    instance_name=f"model-{idx}",
+                )
+            )
+
+    def _acquire_engine(self, device_id: str, batch_id: str) -> tuple[int, RealtimePoseEngine, str]:
+        key = str(device_id or batch_id or "default")
+        with self._dispatch_lock:
+            index = self._device_bindings.get(key)
+            if index is None:
+                index = min(
+                    range(self._engine_count),
+                    key=lambda idx: (self._engine_inflight[idx], self._engine_device_counts[idx], idx),
+                )
+                self._device_bindings[key] = index
+                self._engine_device_counts[index] += 1
+                logging.info(
+                    "Binding AI stream key=%s to model-%d (engine_device_counts=%s)",
+                    key,
+                    index,
+                    self._engine_device_counts,
+                )
+            self._engine_inflight[index] += 1
+            inflight_snapshot = list(self._engine_inflight)
+
+        return index, self._engines[index], ",".join(str(value) for value in inflight_snapshot)
+
+    def _release_engine(self, index: int) -> None:
+        with self._dispatch_lock:
+            if 0 <= index < len(self._engine_inflight):
+                self._engine_inflight[index] = max(0, self._engine_inflight[index] - 1)
 
     def Infer(self, request, context):
         device_id = getattr(request, 'device_id', '')
@@ -88,24 +130,31 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
             context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
             return ai_pb2.InferResponse(device_id=device_id, batch_id=batch_id)
 
-        batch_start = time.time()
+        grpc_start = time.perf_counter()
+        engine_index, engine, engine_inflight = self._acquire_engine(device_id, batch_id)
+        engine_infer_ms = 0
         try:
             frames = [(image.frame_id, image.image_data) for image in images]
-            results = self.svc.infer_batch(frames)
+            engine_start = time.perf_counter()
+            results = engine.infer_batch(frames)
+            engine_infer_ms = int((time.perf_counter() - engine_start) * 1000)
             if len(results) != len(images) * 2:
                 raise RuntimeError(f"expected {len(images) * 2} results for {len(images)} inputs, got {len(results)}")
         except Exception as e:
+            logging.exception("Infer failed: device_id=%s batch_id=%s instance=%d", device_id, batch_id, engine_index)
             context.set_details(str(e))
             context.set_code(grpc.StatusCode.INTERNAL)
             return ai_pb2.InferResponse(
                 device_id=device_id,
                 batch_id=batch_id,
             )
+        finally:
+            self._release_engine(engine_index)
 
+        response_build_start = time.perf_counter()
         response = ai_pb2.InferResponse(
             device_id=device_id,
             batch_id=batch_id,
-            processing_time_ms=int((time.time() - batch_start) * 1000),
         )
         kind_map = {
             'interpolated': ai_pb2.RESULT_KIND_INTERPOLATED,
@@ -132,6 +181,24 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
                     output_index=int(result.get('output_index', len(response.results))),
                 )
             )
+        response_build_ms = int((time.perf_counter() - response_build_start) * 1000)
+        grpc_total_ms = int((time.perf_counter() - grpc_start) * 1000)
+        response.processing_time_ms = grpc_total_ms
+        logging.info(
+            (
+                "Infer request timing: device_id=%s batch_id=%s instance=model-%d "
+                "inputs=%d results=%d engine_infer_ms=%d grpc_response_build_ms=%d grpc_total_ms=%d engine_inflight=%s"
+            ),
+            device_id,
+            batch_id,
+            engine_index,
+            len(images),
+            len(results),
+            engine_infer_ms,
+            response_build_ms,
+            grpc_total_ms,
+            engine_inflight,
+        )
         return response
 
 
@@ -152,7 +219,10 @@ def serve(
     device: str | None = None,
     render_workers: int = 1,
     decode_workers: int = 1,
+    png_compression: int = 1,
+    model_instances: int = 1,
 ):
+    model_instances = max(1, int(model_instances))
     server_opts = [
         ('grpc.max_send_message_length', max_msg_mb * 1024 * 1024),
         ('grpc.max_receive_message_length', max_msg_mb * 1024 * 1024),
@@ -171,6 +241,8 @@ def serve(
             device=device,
             render_workers=render_workers,
             decode_workers=decode_workers,
+            png_compression=png_compression,
+            model_instances=model_instances,
         ),
         server,
     )
@@ -195,7 +267,19 @@ def serve(
     if bound_address is None:
         raise RuntimeError(f"Failed to bind gRPC server on {bind_candidates}") from last_error
 
-    logging.info('Starting gRPC server on %s (max_msg_mb=%d)', bound_address, max_msg_mb)
+    if max_workers < model_instances:
+        logging.warning(
+            "max_workers=%d is lower than model_instances=%d; not all model instances can receive concurrent RPCs",
+            max_workers,
+            model_instances,
+        )
+    logging.info(
+        'Starting gRPC server on %s (max_msg_mb=%d, max_workers=%d, model_instances=%d)',
+        bound_address,
+        max_msg_mb,
+        max_workers,
+        model_instances,
+    )
     server.start()
     try:
         server.wait_for_termination()
@@ -243,6 +327,18 @@ def main():
         type=int,
         help='CPU worker threads for decoding input PNG images',
     )
+    parser.add_argument(
+        '--png-compression',
+        default=1,
+        type=int,
+        help='PNG compression level for returned images, 0 is fastest and 9 is smallest',
+    )
+    parser.add_argument(
+        '--model-instances',
+        default=1,
+        type=int,
+        help='number of AI model instances to keep in this process; device_id is routed sticky to one instance',
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
     serve(
@@ -261,6 +357,8 @@ def main():
         device=args.device,
         render_workers=args.render_workers,
         decode_workers=args.decode_workers,
+        png_compression=args.png_compression,
+        model_instances=args.model_instances,
     )
 
 

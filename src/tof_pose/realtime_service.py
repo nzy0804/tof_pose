@@ -214,6 +214,8 @@ class RealtimePoseEngine:
         render_workers: int = 1,
         decode_workers: int = 1,
         png_compression: int = 1,
+        output_format: str = "png",
+        jpeg_quality: int = 80,
         instance_name: str | None = None,
     ) -> None:
         model_file = Path(model_path) if model_path else DEFAULT_MODEL_PATH
@@ -225,6 +227,13 @@ class RealtimePoseEngine:
         self._render_workers = max(1, int(render_workers))
         self._decode_workers = max(1, int(decode_workers))
         self._png_compression = min(9, max(0, int(png_compression)))
+        normalized_output_format = str(output_format or "png").strip().lower()
+        if normalized_output_format == "jpg":
+            normalized_output_format = "jpeg"
+        if normalized_output_format not in {"png", "jpeg"}:
+            raise ValueError("output_format must be png or jpeg")
+        self._output_format = normalized_output_format
+        self._jpeg_quality = min(100, max(1, int(jpeg_quality)))
         self._instance_name = str(instance_name).strip() if instance_name else "model-0"
         self._lock = threading.Lock()
         self._stateless = bool(stateless)
@@ -262,6 +271,56 @@ class RealtimePoseEngine:
         self._track_gate.clear()
         self._mask_jump_state.clear()
         self._contour_track_state.clear()
+
+    def warmup(self, batch_size: int = 1) -> None:
+        """Run one synthetic model batch so CUDA kernels and model graphs are ready before serving traffic."""
+        batch_size = max(1, int(batch_size))
+        color_imgs = [
+            np.zeros((DISPLAY_SIZE[1], DISPLAY_SIZE[0], 3), dtype=np.uint8)
+            for _ in range(batch_size)
+        ]
+
+        with self._lock:
+            warmup_start = time.perf_counter()
+            seg_yolo_ms = 0
+
+            if not self._pose_only:
+                seg_start = time.perf_counter()
+                self.seg_model.track(
+                    color_imgs,
+                    conf=CONF_THRESHOLD,
+                    persist=False,
+                    tracker=TRACKER_CONFIG,
+                    classes=[0],
+                    imgsz=SEG_INFER_IMGSZ,
+                    device=self._device,
+                    verbose=False,
+                )
+                seg_yolo_ms = _elapsed_ms(seg_start)
+
+            pose_start = time.perf_counter()
+            self.pose_model.predict(
+                color_imgs,
+                conf=self._pose_conf_threshold if self._pose_only else CONF_THRESHOLD,
+                classes=[0],
+                imgsz=POSE_INFER_IMGSZ,
+                device=self._device,
+                verbose=False,
+            )
+            pose_yolo_ms = _elapsed_ms(pose_start)
+            total_ms = _elapsed_ms(warmup_start)
+
+            self.reset()
+
+        LOGGER.info(
+            "Warmup timing: instance=%s batch_size=%d seg_model_ms=%d pose_model_ms=%d total_ms=%d device=%s",
+            self._instance_name,
+            batch_size,
+            seg_yolo_ms,
+            pose_yolo_ms,
+            total_ms,
+            self._device or "auto",
+        )
 
     def _guard_mask_jump(self, track_id: int, mask: np.ndarray) -> np.ndarray | None:
         """Reject short-lived, per-track mask area spikes without averaging masks."""
@@ -553,7 +612,7 @@ class RealtimePoseEngine:
                         self._cached_kpt_conf = keypoints_conf.cpu().numpy()
                 elif not self._warned_no_keypoints:
                     print(
-                        "[tof_pose] 当前姿态模型没有输出 keypoints，请改用 YOLO pose 权重，例如 yolo11n-pose.pt。",
+                        "[tof_pose] 当前姿态模型没有输出 keypoints，请改用 pose 权重。",
                         flush=True,
                     )
                     self._warned_no_keypoints = True
@@ -567,7 +626,7 @@ class RealtimePoseEngine:
 
         if result.boxes is not None and len(result.boxes) > 0 and result.masks is None and not self._warned_no_masks:
             print(
-                "[tof_pose] 当前模型没有输出 segmentation masks，请改用 YOLO segment 权重，例如 yolo11n-seg.pt。",
+                "[tof_pose] 当前模型没有输出 segmentation masks，请改用 segment 权重。",
                 flush=True,
             )
             self._warned_no_masks = True
@@ -897,6 +956,17 @@ class RealtimePoseEngine:
             raise RuntimeError("failed to encode PNG")
         return buf.tobytes()
 
+    def _encode_jpeg(self, img: np.ndarray) -> bytes:
+        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, self._jpeg_quality])
+        if not ok:
+            raise RuntimeError("failed to encode JPEG")
+        return buf.tobytes()
+
+    def _encode_output_image(self, img: np.ndarray) -> tuple[bytes, str]:
+        if self._output_format == "jpeg":
+            return self._encode_jpeg(img), "jpeg"
+        return self._encode_png(img), "png"
+
     def _map_cpu_stage(self, func, items: list):
         if self._render_workers <= 1 or len(items) <= 1:
             return [func(item) for item in items]
@@ -972,15 +1042,18 @@ class RealtimePoseEngine:
 
     def _encode_rendered_result(self, rendered: dict) -> dict:
         person_count = int(rendered["person_count"])
-        pseudo_color_image = self._encode_png(rendered["pseudo_color_image"])
+        pseudo_color_image, pseudo_color_format = self._encode_output_image(rendered["pseudo_color_image"])
         if person_count <= 0:
             skeleton_contour_image = pseudo_color_image
+            skeleton_contour_format = pseudo_color_format
         else:
-            skeleton_contour_image = self._encode_png(rendered["skeleton_contour_image"])
+            skeleton_contour_image, skeleton_contour_format = self._encode_output_image(rendered["skeleton_contour_image"])
         return {
             "frame_id": rendered["frame_id"],
             "pseudo_color_image": pseudo_color_image,
             "skeleton_contour_image": skeleton_contour_image,
+            "pseudo_color_image_format": pseudo_color_format,
+            "skeleton_contour_image_format": skeleton_contour_format,
             "person_count": person_count,
             "processing_time_ms": int(rendered["processing_time_ms"]),
         }
@@ -1030,24 +1103,24 @@ class RealtimePoseEngine:
     def _log_batch_timings(self, input_count: int, output_count: int, timings: dict[str, int]) -> None:
         LOGGER.info(
             (
-                "Infer batch timing: inputs=%d outputs=%d yolo_inputs=%d "
-                "postprocess_inputs=%d instance=%s queue_wait_ms=%d decode_ms=%d interpolate_ms=%d yolo_prepare_ms=%d "
-                "yolo_infer_ms=%d seg_yolo_ms=%d pose_yolo_ms=%d "
+                "Infer batch timing: inputs=%d outputs=%d model_inputs=%d "
+                "postprocess_inputs=%d instance=%s queue_wait_ms=%d decode_ms=%d interpolate_ms=%d model_prepare_ms=%d "
+                "model_infer_ms=%d seg_model_ms=%d pose_model_ms=%d "
                 "postprocess_ms=%d render_ms=%d png_encode_ms=%d total_ms=%d "
-                "decode_workers=%d render_workers=%d png_compression=%d device=%s"
+                "decode_workers=%d render_workers=%d png_compression=%d output_format=%s jpeg_quality=%d device=%s"
             ),
             input_count,
             output_count,
-            int(timings.get("yolo_input_count", input_count)),
+            int(timings.get("model_input_count", input_count)),
             int(timings.get("postprocess_input_count", output_count)),
             self._instance_name,
             int(timings.get("queue_wait_ms", 0)),
             int(timings.get("decode_ms", 0)),
             int(timings.get("interpolate_ms", 0)),
-            int(timings.get("yolo_prepare_ms", 0)),
-            int(timings.get("yolo_infer_ms", 0)),
-            int(timings.get("seg_yolo_ms", 0)),
-            int(timings.get("pose_yolo_ms", 0)),
+            int(timings.get("model_prepare_ms", 0)),
+            int(timings.get("model_infer_ms", 0)),
+            int(timings.get("seg_model_ms", 0)),
+            int(timings.get("pose_model_ms", 0)),
             int(timings.get("postprocess_ms", 0)),
             int(timings.get("render_ms", 0)),
             int(timings.get("png_encode_ms", 0)),
@@ -1055,6 +1128,8 @@ class RealtimePoseEngine:
             self._decode_workers,
             self._render_workers,
             self._png_compression,
+            self._output_format,
+            self._jpeg_quality,
             self._device or "auto",
         )
 
@@ -1109,12 +1184,12 @@ class RealtimePoseEngine:
 
             self._last_source_depth = previous_source.copy() if previous_source is not None and not self._stateless else None
             timings["interpolate_ms"] = _elapsed_ms(interpolate_start)
-            timings["yolo_input_count"] = len(source_frames)
+            timings["model_input_count"] = len(source_frames)
             timings["postprocess_input_count"] = len(source_frames)
 
             yolo_prepare_start = time.perf_counter()
             color_imgs = [self._prepare_depth_views(item["depth"])["color_img"] for item in source_frames]
-            timings["yolo_prepare_ms"] = _elapsed_ms(yolo_prepare_start)
+            timings["model_prepare_ms"] = _elapsed_ms(yolo_prepare_start)
 
             if self._pose_only:
                 yolo_start = time.perf_counter()
@@ -1126,9 +1201,9 @@ class RealtimePoseEngine:
                     device=self._device,
                     verbose=False,
                 )
-                timings["pose_yolo_ms"] = _elapsed_ms(yolo_start)
-                timings["seg_yolo_ms"] = 0
-                timings["yolo_infer_ms"] = int(timings["pose_yolo_ms"])
+                timings["pose_model_ms"] = _elapsed_ms(yolo_start)
+                timings["seg_model_ms"] = 0
+                timings["model_infer_ms"] = int(timings["pose_model_ms"])
                 if len(pose_results) != len(source_frames):
                     raise RuntimeError(f"pose batch returned {len(pose_results)} results for {len(source_frames)} source frames")
 
@@ -1181,7 +1256,7 @@ class RealtimePoseEngine:
                 device=self._device,
                 verbose=False,
             )
-            timings["seg_yolo_ms"] = _elapsed_ms(seg_yolo_start)
+            timings["seg_model_ms"] = _elapsed_ms(seg_yolo_start)
             if len(seg_results) != len(source_frames):
                 raise RuntimeError(f"seg batch returned {len(seg_results)} results for {len(source_frames)} source frames")
             pose_yolo_start = time.perf_counter()
@@ -1193,8 +1268,8 @@ class RealtimePoseEngine:
                 device=self._device,
                 verbose=False,
             )
-            timings["pose_yolo_ms"] = _elapsed_ms(pose_yolo_start)
-            timings["yolo_infer_ms"] = _elapsed_ms(yolo_start)
+            timings["pose_model_ms"] = _elapsed_ms(pose_yolo_start)
+            timings["model_infer_ms"] = _elapsed_ms(yolo_start)
             if len(pose_results) != len(source_frames):
                 raise RuntimeError(f"pose batch returned {len(pose_results)} results for {len(source_frames)} source frames")
 

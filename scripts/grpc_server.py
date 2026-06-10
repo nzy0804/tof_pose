@@ -61,12 +61,19 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         render_workers: int = 1,
         decode_workers: int = 1,
         png_compression: int = 1,
+        output_format: str = "png",
+        jpeg_quality: int = 80,
         model_instances: int = 1,
+        warmup_models: bool = True,
+        warmup_batch_size: int = 10,
+        device_binding_ttl_sec: float = 120.0,
     ):
         self._engine_count = max(1, int(model_instances))
         self._engines: list[RealtimePoseEngine] = []
         self._dispatch_lock = threading.Lock()
         self._device_bindings: dict[str, int] = {}
+        self._device_last_seen: dict[str, float] = {}
+        self._device_binding_ttl_sec = max(0.0, float(device_binding_ttl_sec))
         self._engine_inflight = [0 for _ in range(self._engine_count)]
         self._engine_device_counts = [0 for _ in range(self._engine_count)]
         for idx in range(self._engine_count):
@@ -85,13 +92,43 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
                     render_workers=render_workers,
                     decode_workers=decode_workers,
                     png_compression=png_compression,
+                    output_format=output_format,
+                    jpeg_quality=jpeg_quality,
                     instance_name=f"model-{idx}",
                 )
+            )
+        if warmup_models:
+            warmup_batch_size = max(1, int(warmup_batch_size))
+            for idx, engine in enumerate(self._engines):
+                logging.info("Warming AI model instance %d/%d with batch_size=%d", idx + 1, self._engine_count, warmup_batch_size)
+                engine.warmup(batch_size=warmup_batch_size)
+
+    def _prune_stale_device_bindings(self, now: float) -> None:
+        if self._device_binding_ttl_sec <= 0:
+            return
+        stale_keys = [
+            key
+            for key, last_seen in self._device_last_seen.items()
+            if now - last_seen > self._device_binding_ttl_sec
+        ]
+        for key in stale_keys:
+            index = self._device_bindings.pop(key, None)
+            self._device_last_seen.pop(key, None)
+            if index is not None and 0 <= index < len(self._engine_device_counts):
+                self._engine_device_counts[index] = max(0, self._engine_device_counts[index] - 1)
+        if stale_keys:
+            logging.info(
+                "Pruned %d stale AI stream bindings (ttl_sec=%.1f, engine_device_counts=%s)",
+                len(stale_keys),
+                self._device_binding_ttl_sec,
+                self._engine_device_counts,
             )
 
     def _acquire_engine(self, device_id: str, batch_id: str) -> tuple[int, RealtimePoseEngine, str]:
         key = str(device_id or batch_id or "default")
         with self._dispatch_lock:
+            now = time.monotonic()
+            self._prune_stale_device_bindings(now)
             index = self._device_bindings.get(key)
             if index is None:
                 index = min(
@@ -106,6 +143,7 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
                     index,
                     self._engine_device_counts,
                 )
+            self._device_last_seen[key] = now
             self._engine_inflight[index] += 1
             inflight_snapshot = list(self._engine_inflight)
 
@@ -174,6 +212,8 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
                     capture_timestamp_ms=capture_timestamp_ms,
                     pseudo_color_image=result.get('pseudo_color_image', b''),
                     skeleton_contour_image=result.get('skeleton_contour_image', b''),
+                    pseudo_color_image_format=result.get('pseudo_color_image_format', 'png'),
+                    skeleton_contour_image_format=result.get('skeleton_contour_image_format', 'png'),
                     person_count=int(result.get('person_count', 0)),
                     processing_time_ms=int(result.get('processing_time_ms', 0)),
                     result_kind=kind_map.get(result.get('result_kind'), ai_pb2.RESULT_KIND_UNSPECIFIED),
@@ -220,7 +260,12 @@ def serve(
     render_workers: int = 1,
     decode_workers: int = 1,
     png_compression: int = 1,
+    output_format: str = "png",
+    jpeg_quality: int = 80,
     model_instances: int = 1,
+    warmup_models: bool = True,
+    warmup_batch_size: int = 10,
+    device_binding_ttl_sec: float = 120.0,
 ):
     model_instances = max(1, int(model_instances))
     server_opts = [
@@ -242,7 +287,12 @@ def serve(
             render_workers=render_workers,
             decode_workers=decode_workers,
             png_compression=png_compression,
+            output_format=output_format,
+            jpeg_quality=jpeg_quality,
             model_instances=model_instances,
+            warmup_models=warmup_models,
+            warmup_batch_size=warmup_batch_size,
+            device_binding_ttl_sec=device_binding_ttl_sec,
         ),
         server,
     )
@@ -314,7 +364,7 @@ def main():
     parser.add_argument('--pose-conf', default=None, type=float, help='override pose confidence threshold (pose-only)')
     parser.add_argument('--pose-kpt-conf', default=None, type=float, help='override pose keypoint conf threshold (pose-only)')
     parser.add_argument('--pose-kpt-min-points', default=4, type=int, help='min confident keypoints to count one person (pose-only)')
-    parser.add_argument('--device', default=None, help='YOLO inference device, for example cuda:0 or cpu')
+    parser.add_argument('--device', default=None, help='model inference device, for example cuda:0 or cpu')
     parser.add_argument(
         '--render-workers',
         default=1,
@@ -334,10 +384,39 @@ def main():
         help='PNG compression level for returned images, 0 is fastest and 9 is smallest',
     )
     parser.add_argument(
+        '--output-format',
+        default='png',
+        choices=('png', 'jpeg', 'jpg'),
+        help='image format for returned result images',
+    )
+    parser.add_argument(
+        '--jpeg-quality',
+        default=80,
+        type=int,
+        help='JPEG quality for returned images when --output-format=jpeg',
+    )
+    parser.add_argument(
         '--model-instances',
         default=1,
         type=int,
         help='number of AI model instances to keep in this process; device_id is routed sticky to one instance',
+    )
+    parser.add_argument(
+        '--no-warmup',
+        action='store_true',
+        help='skip startup model warmup before binding the gRPC server',
+    )
+    parser.add_argument(
+        '--warmup-batch-size',
+        default=10,
+        type=int,
+        help='synthetic image batch size used for startup model warmup',
+    )
+    parser.add_argument(
+        '--device-binding-ttl-sec',
+        default=120.0,
+        type=float,
+        help='seconds after which an inactive device_id is unbound from its sticky model instance; 0 disables pruning',
     )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
@@ -358,7 +437,12 @@ def main():
         render_workers=args.render_workers,
         decode_workers=args.decode_workers,
         png_compression=args.png_compression,
+        output_format=args.output_format,
+        jpeg_quality=args.jpeg_quality,
         model_instances=args.model_instances,
+        warmup_models=not args.no_warmup,
+        warmup_batch_size=args.warmup_batch_size,
+        device_binding_ttl_sec=args.device_binding_ttl_sec,
     )
 
 

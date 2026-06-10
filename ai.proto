@@ -29,6 +29,8 @@ message InferResult {
   ResultKind result_kind = 7;
   int32 input_index = 8;
   int32 output_index = 9;
+  string pseudo_color_image_format = 10;
+  string skeleton_contour_image_format = 11;
 }
 
 message InferRequest {

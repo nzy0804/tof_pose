@@ -6,6 +6,7 @@ Usage:
 """
 import argparse
 import logging
+import multiprocessing
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -39,6 +40,7 @@ import ai_pb2
 import ai_pb2_grpc
 
 from tof_pose.realtime_service import RealtimePoseEngine
+from tof_pose.realtime_service import CPU_WORKER_MODE_PROCESS, CPU_WORKER_MODE_THREAD
 
 
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
@@ -63,6 +65,8 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         png_compression: int = 1,
         output_format: str = "png",
         jpeg_quality: int = 80,
+        cpu_worker_mode: str = CPU_WORKER_MODE_THREAD,
+        cpu_process_start_method: str = "auto",
         model_instances: int = 1,
         warmup_models: bool = True,
         warmup_batch_size: int = 10,
@@ -94,6 +98,8 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
                     png_compression=png_compression,
                     output_format=output_format,
                     jpeg_quality=jpeg_quality,
+                    cpu_worker_mode=cpu_worker_mode,
+                    cpu_process_start_method=cpu_process_start_method,
                     instance_name=f"model-{idx}",
                 )
             )
@@ -262,6 +268,8 @@ def serve(
     png_compression: int = 1,
     output_format: str = "png",
     jpeg_quality: int = 80,
+    cpu_worker_mode: str = CPU_WORKER_MODE_THREAD,
+    cpu_process_start_method: str = "auto",
     model_instances: int = 1,
     warmup_models: bool = True,
     warmup_batch_size: int = 10,
@@ -289,6 +297,8 @@ def serve(
             png_compression=png_compression,
             output_format=output_format,
             jpeg_quality=jpeg_quality,
+            cpu_worker_mode=cpu_worker_mode,
+            cpu_process_start_method=cpu_process_start_method,
             model_instances=model_instances,
             warmup_models=warmup_models,
             warmup_batch_size=warmup_batch_size,
@@ -324,11 +334,13 @@ def serve(
             model_instances,
         )
     logging.info(
-        'Starting gRPC server on %s (max_msg_mb=%d, max_workers=%d, model_instances=%d)',
+        'Starting gRPC server on %s (max_msg_mb=%d, max_workers=%d, model_instances=%d, cpu_worker_mode=%s, cpu_process_start_method=%s)',
         bound_address,
         max_msg_mb,
         max_workers,
         model_instances,
+        cpu_worker_mode,
+        cpu_process_start_method,
     )
     server.start()
     try:
@@ -369,13 +381,25 @@ def main():
         '--render-workers',
         default=1,
         type=int,
-        help='CPU worker threads for rendering and PNG encoding returned images',
+        help='CPU workers for rendering and encoding returned images',
     )
     parser.add_argument(
         '--decode-workers',
         default=1,
         type=int,
-        help='CPU worker threads for decoding input PNG images',
+        help='CPU workers for decoding input images and preparing model inputs',
+    )
+    parser.add_argument(
+        '--cpu-worker-mode',
+        default=CPU_WORKER_MODE_THREAD,
+        choices=(CPU_WORKER_MODE_THREAD, CPU_WORKER_MODE_PROCESS),
+        help='CPU worker backend for decode, model input preparation, rendering, and encoding',
+    )
+    parser.add_argument(
+        '--cpu-process-start-method',
+        default='auto',
+        choices=('auto', 'fork', 'spawn', 'forkserver'),
+        help='multiprocessing start method used when --cpu-worker-mode=process',
     )
     parser.add_argument(
         '--png-compression',
@@ -439,6 +463,8 @@ def main():
         png_compression=args.png_compression,
         output_format=args.output_format,
         jpeg_quality=args.jpeg_quality,
+        cpu_worker_mode=args.cpu_worker_mode,
+        cpu_process_start_method=args.cpu_process_start_method,
         model_instances=args.model_instances,
         warmup_models=not args.no_warmup,
         warmup_batch_size=args.warmup_batch_size,
@@ -447,4 +473,5 @@ def main():
 
 
 if __name__ == '__main__':
+    multiprocessing.freeze_support()
     main()

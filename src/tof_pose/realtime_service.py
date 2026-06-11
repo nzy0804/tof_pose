@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import atexit
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import logging
+import multiprocessing
 import threading
 import time
 from dataclasses import dataclass
@@ -37,6 +39,9 @@ DISPLAY_MODE_CONTOUR_ONLY = "contour"
 DISPLAY_MODE_SKELETON_ONLY = "skeleton"
 DISPLAY_MODE_RAW_ONLY = "raw"
 
+CPU_WORKER_MODE_THREAD = "thread"
+CPU_WORKER_MODE_PROCESS = "process"
+
 TRACK_VOTE_WINDOW = 5
 TRACK_VOTE_MIN_POS = 2
 TRACK_TTL_FRAMES = 5
@@ -66,9 +71,133 @@ TRACK_COLORS = [
     (90, 170, 255),
 ]
 
+_CPU_PROCESS_POOLS: dict[tuple[int, str], ProcessPoolExecutor] = {}
+_CPU_PROCESS_POOLS_LOCK = threading.Lock()
+_WORKER_CLAHE = None
+
 
 def _elapsed_ms(start: float) -> int:
     return int((time.perf_counter() - start) * 1000)
+
+
+def _cpu_worker_init() -> None:
+    try:
+        cv2.setNumThreads(1)
+    except Exception:
+        pass
+
+
+def _cpu_worker_ping(_value=None) -> bool:
+    return True
+
+
+def _shutdown_cpu_process_pools() -> None:
+    with _CPU_PROCESS_POOLS_LOCK:
+        pools = list(_CPU_PROCESS_POOLS.values())
+        _CPU_PROCESS_POOLS.clear()
+    for pool in pools:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+atexit.register(_shutdown_cpu_process_pools)
+
+
+def _resolve_cpu_process_start_method(method: str | None) -> str:
+    requested = str(method or "auto").strip().lower()
+    available = set(multiprocessing.get_all_start_methods())
+    if requested == "auto":
+        if "fork" in available:
+            return "fork"
+        return "spawn"
+    if requested not in available:
+        raise ValueError(f"multiprocessing start method {requested!r} is not available")
+    return requested
+
+
+def _get_cpu_process_pool(worker_count: int, start_method: str | None) -> ProcessPoolExecutor:
+    workers = max(1, int(worker_count))
+    resolved_method = _resolve_cpu_process_start_method(start_method)
+    key = (workers, resolved_method)
+    with _CPU_PROCESS_POOLS_LOCK:
+        pool = _CPU_PROCESS_POOLS.get(key)
+        if pool is None:
+            context = multiprocessing.get_context(resolved_method)
+            pool = ProcessPoolExecutor(
+                max_workers=workers,
+                mp_context=context,
+                initializer=_cpu_worker_init,
+            )
+            _CPU_PROCESS_POOLS[key] = pool
+        return pool
+
+
+def _warm_cpu_process_pool(worker_count: int, start_method: str | None) -> None:
+    pool = _get_cpu_process_pool(worker_count, start_method)
+    warmup_count = max(1, int(worker_count))
+    list(pool.map(_cpu_worker_ping, range(warmup_count)))
+
+
+def _get_worker_clahe():
+    global _WORKER_CLAHE
+    if _WORKER_CLAHE is None:
+        _WORKER_CLAHE = cv2.createCLAHE(clipLimit=CLAHE_CLIP_LIMIT, tileGridSize=CLAHE_TILE_GRID)
+    return _WORKER_CLAHE
+
+
+def _ensure_uint8_gray_cpu(gray: np.ndarray) -> np.ndarray:
+    if gray.ndim != 2:
+        raise ValueError("expected single-channel grayscale image")
+    if gray.dtype == np.uint8:
+        return gray
+
+    gray_float = gray.astype(np.float32, copy=False)
+    min_val = float(np.min(gray_float)) if gray_float.size else 0.0
+    max_val = float(np.max(gray_float)) if gray_float.size else 0.0
+    if not gray_float.size or max_val <= min_val:
+        return np.zeros_like(gray_float, dtype=np.uint8)
+
+    normalized = cv2.normalize(gray_float, None, 0, 255, cv2.NORM_MINMAX)
+    return normalized.astype(np.uint8)
+
+
+def _decode_image_bytes_cpu(data: bytes) -> np.ndarray:
+    arr = np.frombuffer(data, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise ValueError("cannot decode image")
+    if img.ndim == 3:
+        return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return img
+
+
+def _decode_frame_cpu(frame: tuple[str, bytes]) -> tuple[str, np.ndarray]:
+    frame_id, image_bytes = frame
+    return frame_id, _decode_image_bytes_cpu(image_bytes)
+
+
+def _prepare_depth_views_cpu(depth_gray: np.ndarray) -> dict:
+    width, height = DISPLAY_SIZE
+    depth_u8 = _ensure_uint8_gray_cpu(depth_gray)
+    depth_raw = cv2.resize(depth_u8, DISPLAY_SIZE, interpolation=cv2.INTER_LINEAR)
+
+    enhanced = depth_u8
+    if MEDIAN_BLUR_K and MEDIAN_BLUR_K >= 3:
+        enhanced = cv2.medianBlur(enhanced, MEDIAN_BLUR_K)
+    enhanced = _get_worker_clahe().apply(enhanced)
+
+    depth_up = cv2.resize(enhanced, DISPLAY_SIZE, interpolation=cv2.INTER_LINEAR)
+    color_img = cv2.applyColorMap(depth_up, cv2.COLORMAP_MAGMA)
+    return {
+        "depth_up": depth_up,
+        "depth_raw": depth_raw,
+        "color_img": color_img,
+        "width": width,
+        "height": height,
+    }
+
+
+def _prepare_color_image_cpu(depth_gray: np.ndarray) -> np.ndarray:
+    return _prepare_depth_views_cpu(depth_gray)["color_img"]
 
 
 def _track_color(track_id: int) -> tuple[int, int, int]:
@@ -169,6 +298,113 @@ def _compute_pairwise_distances(
     return f"Pair Dist: {nearest[0]}-{nearest[1]} ~{nearest[2]:.1f}", pairs
 
 
+def _render_skeleton_contour_cpu(analysis: dict) -> np.ndarray:
+    records = analysis["records"]
+    kpt_xy_np = analysis["kpt_xy_np"]
+    kpt_conf_np = analysis["kpt_conf_np"]
+    pose_to_track = analysis["pose_to_track"]
+    validated_track_ids = analysis["validated_track_ids"]
+    pose_only = bool(analysis.get("pose_only", False))
+    pose_draw_indices = analysis.get("pose_draw_indices") or []
+    display = analysis["color_img"].copy()
+
+    for record in records:
+        contour = record["contour"]
+        if contour is None:
+            continue
+
+        box = record["box"]
+        anchor = record.get("anchor")
+        if anchor is not None and len(anchor) >= 2:
+            offset_x, offset_y = int(anchor[0]), int(anchor[1])
+        else:
+            offset_x, offset_y = int(round(box[0])), int(round(box[1]))
+
+        shifted_contour = contour + np.array([[[offset_x, offset_y]]])
+        cv2.drawContours(display, [shifted_contour], -1, record["track_color"], 2, cv2.LINE_AA)
+
+    if kpt_xy_np is not None and kpt_conf_np is not None:
+        if pose_only:
+            for idx in pose_draw_indices:
+                if idx < 0 or idx >= len(kpt_xy_np) or idx >= len(kpt_conf_np):
+                    continue
+                draw_stick_figure(display, kpt_xy_np[idx], kpt_conf_np[idx], color_override=_track_color(idx + 1))
+        else:
+            for idx in range(min(len(kpt_xy_np), len(kpt_conf_np))):
+                matched_track = pose_to_track.get(idx)
+                if matched_track is None or matched_track not in validated_track_ids:
+                    continue
+                draw_stick_figure(display, kpt_xy_np[idx], kpt_conf_np[idx], color_override=_track_color(matched_track))
+
+    return display
+
+
+def _render_analyzed_result_cpu(analyzed: dict) -> dict:
+    analysis = analyzed["analysis"]
+    return {
+        "frame_id": analyzed["frame_id"],
+        "pseudo_color_image": analysis["color_img"],
+        "skeleton_contour_image": _render_skeleton_contour_cpu(analysis),
+        "person_count": int(analyzed["person_count"]),
+        "processing_time_ms": int(analyzed["processing_time_ms"]),
+    }
+
+
+def _encode_png_cpu(img: np.ndarray, png_compression: int) -> bytes:
+    ok, buf = cv2.imencode(".png", img, [cv2.IMWRITE_PNG_COMPRESSION, min(9, max(0, int(png_compression)))])
+    if not ok:
+        raise RuntimeError("failed to encode PNG")
+    return buf.tobytes()
+
+
+def _encode_jpeg_cpu(img: np.ndarray, jpeg_quality: int) -> bytes:
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, min(100, max(1, int(jpeg_quality)))])
+    if not ok:
+        raise RuntimeError("failed to encode JPEG")
+    return buf.tobytes()
+
+
+def _encode_output_image_cpu(
+    img: np.ndarray,
+    output_format: str,
+    png_compression: int,
+    jpeg_quality: int,
+) -> tuple[bytes, str]:
+    if output_format == "jpeg":
+        return _encode_jpeg_cpu(img, jpeg_quality), "jpeg"
+    return _encode_png_cpu(img, png_compression), "png"
+
+
+def _encode_rendered_result_cpu(payload: tuple[dict, str, int, int]) -> dict:
+    rendered, output_format, png_compression, jpeg_quality = payload
+    person_count = int(rendered["person_count"])
+    pseudo_color_image, pseudo_color_format = _encode_output_image_cpu(
+        rendered["pseudo_color_image"],
+        output_format,
+        png_compression,
+        jpeg_quality,
+    )
+    if person_count <= 0:
+        skeleton_contour_image = pseudo_color_image
+        skeleton_contour_format = pseudo_color_format
+    else:
+        skeleton_contour_image, skeleton_contour_format = _encode_output_image_cpu(
+            rendered["skeleton_contour_image"],
+            output_format,
+            png_compression,
+            jpeg_quality,
+        )
+    return {
+        "frame_id": rendered["frame_id"],
+        "pseudo_color_image": pseudo_color_image,
+        "skeleton_contour_image": skeleton_contour_image,
+        "pseudo_color_image_format": pseudo_color_format,
+        "skeleton_contour_image_format": skeleton_contour_format,
+        "person_count": person_count,
+        "processing_time_ms": int(rendered["processing_time_ms"]),
+    }
+
+
 @dataclass
 class _FrameViewSet:
     pseudo_color_image: bytes
@@ -216,6 +452,8 @@ class RealtimePoseEngine:
         png_compression: int = 1,
         output_format: str = "png",
         jpeg_quality: int = 80,
+        cpu_worker_mode: str = CPU_WORKER_MODE_THREAD,
+        cpu_process_start_method: str = "auto",
         instance_name: str | None = None,
     ) -> None:
         model_file = Path(model_path) if model_path else DEFAULT_MODEL_PATH
@@ -226,6 +464,20 @@ class RealtimePoseEngine:
         self._device = str(device).strip() if device else None
         self._render_workers = max(1, int(render_workers))
         self._decode_workers = max(1, int(decode_workers))
+        normalized_cpu_worker_mode = str(cpu_worker_mode or CPU_WORKER_MODE_THREAD).strip().lower()
+        if normalized_cpu_worker_mode not in {CPU_WORKER_MODE_THREAD, CPU_WORKER_MODE_PROCESS}:
+            raise ValueError("cpu_worker_mode must be thread or process")
+        self._cpu_worker_mode = normalized_cpu_worker_mode
+        self._cpu_process_start_method = _resolve_cpu_process_start_method(cpu_process_start_method)
+        self._decode_executor: ThreadPoolExecutor | None = None
+        self._render_executor: ThreadPoolExecutor | None = None
+        if self._cpu_worker_mode == CPU_WORKER_MODE_THREAD:
+            if self._decode_workers > 1:
+                self._decode_executor = ThreadPoolExecutor(max_workers=self._decode_workers)
+            if self._render_workers > 1:
+                self._render_executor = ThreadPoolExecutor(max_workers=self._render_workers)
+        else:
+            _warm_cpu_process_pool(max(self._decode_workers, self._render_workers), self._cpu_process_start_method)
         self._png_compression = min(9, max(0, int(png_compression)))
         normalized_output_format = str(output_format or "png").strip().lower()
         if normalized_output_format == "jpg":
@@ -463,13 +715,7 @@ class RealtimePoseEngine:
             self._contour_track_state.pop(int(tid), None)
 
     def _decode_image(self, data: bytes) -> np.ndarray:
-        arr = np.frombuffer(data, dtype=np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
-        if img is None:
-            raise ValueError("cannot decode image")
-        if img.ndim == 3:
-            return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        return img
+        return _decode_image_bytes_cpu(data)
 
     def _ensure_uint8_gray(self, gray: np.ndarray) -> np.ndarray:
         """Ensure input is a single-channel uint8 image.
@@ -891,46 +1137,7 @@ class RealtimePoseEngine:
 
     def _render_skeleton_contour(self, analysis: dict) -> np.ndarray:
         """Return pseudo color image with only contour and skeleton overlays."""
-        records = analysis["records"]
-        kpt_xy_np = analysis["kpt_xy_np"]
-        kpt_conf_np = analysis["kpt_conf_np"]
-        pose_to_track = analysis["pose_to_track"]
-        validated_track_ids = analysis["validated_track_ids"]
-        pose_only = bool(analysis.get("pose_only", False))
-        pose_draw_indices = analysis.get("pose_draw_indices") or []
-        width = int(analysis["width"])
-        height = int(analysis["height"])
-        display = analysis["color_img"].copy()
-
-        for record in records:
-            contour = record["contour"]
-            if contour is None:
-                continue
-
-            box = record["box"]
-            anchor = record.get("anchor")
-            if anchor is not None and len(anchor) >= 2:
-                offset_x, offset_y = int(anchor[0]), int(anchor[1])
-            else:
-                offset_x, offset_y = int(round(box[0])), int(round(box[1]))
-
-            shifted_contour = contour + np.array([[[offset_x, offset_y]]])
-            cv2.drawContours(display, [shifted_contour], -1, record["track_color"], 2, cv2.LINE_AA)
-
-        if kpt_xy_np is not None and kpt_conf_np is not None:
-            if pose_only:
-                for idx in pose_draw_indices:
-                    if idx < 0 or idx >= len(kpt_xy_np) or idx >= len(kpt_conf_np):
-                        continue
-                    draw_stick_figure(display, kpt_xy_np[idx], kpt_conf_np[idx], color_override=_track_color(idx + 1))
-            else:
-                for idx in range(min(len(kpt_xy_np), len(kpt_conf_np))):
-                    matched_track = pose_to_track.get(idx)
-                    if matched_track is None or matched_track not in validated_track_ids:
-                        continue
-                    draw_stick_figure(display, kpt_xy_np[idx], kpt_conf_np[idx], color_override=_track_color(matched_track))
-
-        return display
+        return _render_skeleton_contour_cpu(analysis)
 
     def _render_gray_depth(self, analysis: dict) -> np.ndarray:
         """Return 320x320 uint8 grayscale depth image."""
@@ -951,29 +1158,42 @@ class RealtimePoseEngine:
         return color_img
 
     def _encode_png(self, img: np.ndarray) -> bytes:
-        ok, buf = cv2.imencode(".png", img, [cv2.IMWRITE_PNG_COMPRESSION, self._png_compression])
-        if not ok:
-            raise RuntimeError("failed to encode PNG")
-        return buf.tobytes()
+        return _encode_png_cpu(img, self._png_compression)
 
     def _encode_jpeg(self, img: np.ndarray) -> bytes:
-        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, self._jpeg_quality])
-        if not ok:
-            raise RuntimeError("failed to encode JPEG")
-        return buf.tobytes()
+        return _encode_jpeg_cpu(img, self._jpeg_quality)
 
     def _encode_output_image(self, img: np.ndarray) -> tuple[bytes, str]:
         if self._output_format == "jpeg":
             return self._encode_jpeg(img), "jpeg"
         return self._encode_png(img), "png"
 
-    def _map_cpu_stage(self, func, items: list):
-        if self._render_workers <= 1 or len(items) <= 1:
+    def _map_thread_stage(self, executor: ThreadPoolExecutor | None, worker_count: int, func, items: list):
+        if worker_count <= 1 or len(items) <= 1:
             return [func(item) for item in items]
 
-        worker_count = min(self._render_workers, len(items))
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        if executor is not None:
             return list(executor.map(func, items))
+
+        with ThreadPoolExecutor(max_workers=min(worker_count, len(items))) as temporary_executor:
+            return list(temporary_executor.map(func, items))
+
+    def _map_process_stage(self, func, items: list, worker_count: int):
+        if worker_count <= 1 or len(items) <= 1:
+            return [func(item) for item in items]
+
+        pool = _get_cpu_process_pool(worker_count, self._cpu_process_start_method)
+        return list(pool.map(func, items))
+
+    def _map_decode_stage(self, func, items: list):
+        if self._cpu_worker_mode == CPU_WORKER_MODE_PROCESS:
+            return self._map_process_stage(func, items, self._decode_workers)
+        return self._map_thread_stage(self._decode_executor, self._decode_workers, func, items)
+
+    def _map_render_stage(self, func, items: list):
+        if self._cpu_worker_mode == CPU_WORKER_MODE_PROCESS:
+            return self._map_process_stage(func, items, self._render_workers)
+        return self._map_thread_stage(self._render_executor, self._render_workers, func, items)
 
     def _interpolate_depth(self, previous_depth: np.ndarray | None, current_depth: np.ndarray) -> np.ndarray:
         current_u8 = self._ensure_uint8_gray(current_depth)
@@ -1063,11 +1283,21 @@ class RealtimePoseEngine:
 
     def _encode_analyzed_results(self, analyzed_results: list[dict], timings: dict[str, int] | None = None) -> list[dict]:
         render_start = time.perf_counter()
-        rendered_results = self._map_cpu_stage(self._render_analyzed_result, analyzed_results)
+        if self._cpu_worker_mode == CPU_WORKER_MODE_PROCESS:
+            rendered_results = self._map_render_stage(_render_analyzed_result_cpu, analyzed_results)
+        else:
+            rendered_results = self._map_render_stage(self._render_analyzed_result, analyzed_results)
         render_ms = _elapsed_ms(render_start)
 
         encode_start = time.perf_counter()
-        encoded_results = self._map_cpu_stage(self._encode_rendered_result, rendered_results)
+        if self._cpu_worker_mode == CPU_WORKER_MODE_PROCESS:
+            encode_payloads = [
+                (rendered, self._output_format, self._png_compression, self._jpeg_quality)
+                for rendered in rendered_results
+            ]
+            encoded_results = self._map_render_stage(_encode_rendered_result_cpu, encode_payloads)
+        else:
+            encoded_results = self._map_render_stage(self._encode_rendered_result, rendered_results)
         png_encode_ms = _elapsed_ms(encode_start)
 
         if timings is not None:
@@ -1077,17 +1307,13 @@ class RealtimePoseEngine:
         return encoded_results
 
     def _decode_frames(self, frames: list[tuple[str, bytes]]) -> list[tuple[str, np.ndarray]]:
-        if self._decode_workers <= 1 or len(frames) <= 1:
-            return [(frame_id, self._decode_image(image_bytes)) for frame_id, image_bytes in frames]
+        return self._map_decode_stage(_decode_frame_cpu, frames)
 
-        worker_count = min(self._decode_workers, len(frames))
-
-        def decode_one(frame: tuple[str, bytes]) -> tuple[str, np.ndarray]:
-            frame_id, image_bytes = frame
-            return frame_id, self._decode_image(image_bytes)
-
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            return list(executor.map(decode_one, frames))
+    def _prepare_model_color_images(self, source_frames: list[dict]) -> list[np.ndarray]:
+        depths = [item["depth"] for item in source_frames]
+        if self._cpu_worker_mode == CPU_WORKER_MODE_PROCESS:
+            return self._map_decode_stage(_prepare_color_image_cpu, depths)
+        return [self._prepare_depth_views(depth)["color_img"] for depth in depths]
 
     def _infer_one_unlocked(self, frame_id: str, image_bytes: bytes) -> dict:
         analyzed = self._analyze_predecoded_unlocked(frame_id, self._decode_image(image_bytes))
@@ -1107,7 +1333,8 @@ class RealtimePoseEngine:
                 "postprocess_inputs=%d instance=%s queue_wait_ms=%d decode_ms=%d interpolate_ms=%d model_prepare_ms=%d "
                 "model_infer_ms=%d seg_model_ms=%d pose_model_ms=%d "
                 "postprocess_ms=%d render_ms=%d png_encode_ms=%d total_ms=%d "
-                "decode_workers=%d render_workers=%d png_compression=%d output_format=%s jpeg_quality=%d device=%s"
+                "decode_workers=%d render_workers=%d cpu_worker_mode=%s cpu_process_start_method=%s "
+                "png_compression=%d output_format=%s jpeg_quality=%d device=%s"
             ),
             input_count,
             output_count,
@@ -1127,6 +1354,8 @@ class RealtimePoseEngine:
             int(timings.get("total_ms", 0)),
             self._decode_workers,
             self._render_workers,
+            self._cpu_worker_mode,
+            self._cpu_process_start_method,
             self._png_compression,
             self._output_format,
             self._jpeg_quality,
@@ -1187,9 +1416,9 @@ class RealtimePoseEngine:
             timings["model_input_count"] = len(source_frames)
             timings["postprocess_input_count"] = len(source_frames)
 
-            yolo_prepare_start = time.perf_counter()
-            color_imgs = [self._prepare_depth_views(item["depth"])["color_img"] for item in source_frames]
-            timings["model_prepare_ms"] = _elapsed_ms(yolo_prepare_start)
+            model_prepare_start = time.perf_counter()
+            color_imgs = self._prepare_model_color_images(source_frames)
+            timings["model_prepare_ms"] = _elapsed_ms(model_prepare_start)
 
             if self._pose_only:
                 yolo_start = time.perf_counter()

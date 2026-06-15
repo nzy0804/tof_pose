@@ -5,6 +5,7 @@ Usage:
   python scripts/grpc_server.py --host 0.0.0.0 --port 50052
 """
 import argparse
+import hashlib
 import logging
 import multiprocessing
 import threading
@@ -38,6 +39,30 @@ if not os.environ.get(_cfg_env):
 
 import ai_pb2
 import ai_pb2_grpc
+
+try:
+    import numpy as _np
+    import tensorrt as _trt
+
+    if not hasattr(_trt, "__version__"):
+        _trt.__version__ = "10.0.0"
+    if hasattr(_trt, "Runtime") and not hasattr(_trt.Runtime, "__enter__"):
+        _trt.Runtime.__enter__ = lambda self: self
+        _trt.Runtime.__exit__ = lambda self, exc_type, exc, tb: None
+    if not hasattr(_trt, "nptype"):
+        _trt_dtype_map = {
+            getattr(_trt, "float32", None): _np.float32,
+            getattr(_trt, "float16", None): _np.float16,
+            getattr(_trt, "int8", None): _np.int8,
+            getattr(_trt, "int32", None): _np.int32,
+            getattr(_trt, "int64", None): _np.int64,
+            getattr(_trt, "uint8", None): _np.uint8,
+            getattr(_trt, "bool", None): _np.bool_,
+        }
+        _trt_dtype_map.pop(None, None)
+        _trt.nptype = lambda dtype: _trt_dtype_map[dtype]
+except Exception:
+    pass
 
 from tof_pose.realtime_service import RealtimePoseEngine
 from tof_pose.realtime_service import CPU_WORKER_MODE_PROCESS, CPU_WORKER_MODE_THREAD
@@ -130,23 +155,38 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
                 self._engine_device_counts,
             )
 
+    def _stable_engine_index(self, key: str) -> int:
+        digest = hashlib.blake2s(key.encode("utf-8"), digest_size=8).digest()
+        return int.from_bytes(digest, "big") % self._engine_count
+
     def _acquire_engine(self, device_id: str, batch_id: str) -> tuple[int, RealtimePoseEngine, str]:
-        key = str(device_id or batch_id or "default")
+        normalized_device_id = str(device_id or "").strip()
+        if normalized_device_id:
+            key = normalized_device_id
+            route_by_device = True
+        else:
+            key = str(batch_id or "default").strip() or "default"
+            route_by_device = False
+
         with self._dispatch_lock:
             now = time.monotonic()
             self._prune_stale_device_bindings(now)
             index = self._device_bindings.get(key)
             if index is None:
-                index = min(
-                    range(self._engine_count),
-                    key=lambda idx: (self._engine_inflight[idx], self._engine_device_counts[idx], idx),
-                )
+                if route_by_device:
+                    index = self._stable_engine_index(key)
+                else:
+                    index = min(
+                        range(self._engine_count),
+                        key=lambda idx: (self._engine_inflight[idx], self._engine_device_counts[idx], idx),
+                    )
                 self._device_bindings[key] = index
                 self._engine_device_counts[index] += 1
                 logging.info(
-                    "Binding AI stream key=%s to model-%d (engine_device_counts=%s)",
+                    "Binding AI stream key=%s to model-%d (routing=%s, engine_device_counts=%s)",
                     key,
                     index,
+                    "device_id" if route_by_device else "fallback",
                     self._engine_device_counts,
                 )
             self._device_last_seen[key] = now

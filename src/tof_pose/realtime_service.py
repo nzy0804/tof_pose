@@ -405,6 +405,50 @@ def _encode_rendered_result_cpu(payload: tuple[dict, str, int, int]) -> dict:
     }
 
 
+def _render_and_encode_analyzed_result_cpu(payload: tuple[dict, str, int, int]) -> dict:
+    analyzed, output_format, png_compression, jpeg_quality = payload
+    analysis = analyzed["analysis"]
+    person_count = int(analyzed["person_count"])
+
+    render_start = time.perf_counter()
+    pseudo_color_image = analysis["color_img"]
+    skeleton_contour_image = None
+    if person_count > 0:
+        skeleton_contour_image = _render_skeleton_contour_cpu(analysis)
+    render_ms = _elapsed_ms(render_start)
+
+    encode_start = time.perf_counter()
+    pseudo_color_bytes, pseudo_color_format = _encode_output_image_cpu(
+        pseudo_color_image,
+        output_format,
+        png_compression,
+        jpeg_quality,
+    )
+    if person_count <= 0:
+        skeleton_contour_bytes = pseudo_color_bytes
+        skeleton_contour_format = pseudo_color_format
+    else:
+        skeleton_contour_bytes, skeleton_contour_format = _encode_output_image_cpu(
+            skeleton_contour_image,
+            output_format,
+            png_compression,
+            jpeg_quality,
+        )
+    encode_ms = _elapsed_ms(encode_start)
+
+    return {
+        "frame_id": analyzed["frame_id"],
+        "pseudo_color_image": pseudo_color_bytes,
+        "skeleton_contour_image": skeleton_contour_bytes,
+        "pseudo_color_image_format": pseudo_color_format,
+        "skeleton_contour_image_format": skeleton_contour_format,
+        "person_count": person_count,
+        "processing_time_ms": int(analyzed["processing_time_ms"]),
+        "_render_ms": render_ms,
+        "_encode_ms": encode_ms,
+    }
+
+
 @dataclass
 class _FrameViewSet:
     pseudo_color_image: bytes
@@ -1279,26 +1323,50 @@ class RealtimePoseEngine:
         }
 
     def _encode_analyzed_result(self, analyzed: dict) -> dict:
-        return self._encode_rendered_result(self._render_analyzed_result(analyzed))
+        result = self._render_and_encode_analyzed_result(analyzed)
+        result.pop("_render_ms", None)
+        result.pop("_encode_ms", None)
+        return result
+
+    def _render_and_encode_analyzed_result(self, analyzed: dict) -> dict:
+        return _render_and_encode_analyzed_result_cpu(
+            (analyzed, self._output_format, self._png_compression, self._jpeg_quality)
+        )
+
+    @staticmethod
+    def _split_render_encode_stage_ms(combined_ms: int, render_cpu_ms: int, encode_cpu_ms: int) -> tuple[int, int]:
+        total_cpu_ms = max(0, int(render_cpu_ms)) + max(0, int(encode_cpu_ms))
+        if combined_ms <= 0:
+            return 0, 0
+        if total_cpu_ms <= 0:
+            return 0, combined_ms
+
+        render_ms = int(round(combined_ms * max(0, int(render_cpu_ms)) / total_cpu_ms))
+        render_ms = min(max(render_ms, 0), combined_ms)
+        return render_ms, combined_ms - render_ms
 
     def _encode_analyzed_results(self, analyzed_results: list[dict], timings: dict[str, int] | None = None) -> list[dict]:
-        render_start = time.perf_counter()
+        render_encode_start = time.perf_counter()
         if self._cpu_worker_mode == CPU_WORKER_MODE_PROCESS:
-            rendered_results = self._map_render_stage(_render_analyzed_result_cpu, analyzed_results)
-        else:
-            rendered_results = self._map_render_stage(self._render_analyzed_result, analyzed_results)
-        render_ms = _elapsed_ms(render_start)
-
-        encode_start = time.perf_counter()
-        if self._cpu_worker_mode == CPU_WORKER_MODE_PROCESS:
-            encode_payloads = [
-                (rendered, self._output_format, self._png_compression, self._jpeg_quality)
-                for rendered in rendered_results
+            payloads = [
+                (analyzed, self._output_format, self._png_compression, self._jpeg_quality)
+                for analyzed in analyzed_results
             ]
-            encoded_results = self._map_render_stage(_encode_rendered_result_cpu, encode_payloads)
+            encoded_results = self._map_render_stage(_render_and_encode_analyzed_result_cpu, payloads)
         else:
-            encoded_results = self._map_render_stage(self._encode_rendered_result, rendered_results)
-        png_encode_ms = _elapsed_ms(encode_start)
+            encoded_results = self._map_render_stage(self._render_and_encode_analyzed_result, analyzed_results)
+        render_encode_ms = _elapsed_ms(render_encode_start)
+
+        render_cpu_ms = 0
+        encode_cpu_ms = 0
+        for result in encoded_results:
+            render_cpu_ms += int(result.pop("_render_ms", 0))
+            encode_cpu_ms += int(result.pop("_encode_ms", 0))
+        render_ms, png_encode_ms = self._split_render_encode_stage_ms(
+            render_encode_ms,
+            render_cpu_ms,
+            encode_cpu_ms,
+        )
 
         if timings is not None:
             timings["render_ms"] = render_ms

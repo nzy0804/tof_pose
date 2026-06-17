@@ -1398,9 +1398,9 @@ class RealtimePoseEngine:
         LOGGER.info(
             (
                 "Infer batch timing: inputs=%d outputs=%d model_inputs=%d "
-                "postprocess_inputs=%d instance=%s queue_wait_ms=%d decode_ms=%d interpolate_ms=%d model_prepare_ms=%d "
+                "postprocess_inputs=%d instance=%s queue_wait_ms=%d decode_ms=%d model_prepare_ms=%d "
                 "model_infer_ms=%d seg_model_ms=%d pose_model_ms=%d "
-                "postprocess_ms=%d render_ms=%d png_encode_ms=%d total_ms=%d "
+                "postprocess_ms=%d interpolate_ms=%d render_ms=%d png_encode_ms=%d total_ms=%d "
                 "decode_workers=%d render_workers=%d cpu_worker_mode=%s cpu_process_start_method=%s "
                 "png_compression=%d output_format=%s jpeg_quality=%d device=%s"
             ),
@@ -1411,12 +1411,12 @@ class RealtimePoseEngine:
             self._instance_name,
             int(timings.get("queue_wait_ms", 0)),
             int(timings.get("decode_ms", 0)),
-            int(timings.get("interpolate_ms", 0)),
             int(timings.get("model_prepare_ms", 0)),
             int(timings.get("model_infer_ms", 0)),
             int(timings.get("seg_model_ms", 0)),
             int(timings.get("pose_model_ms", 0)),
             int(timings.get("postprocess_ms", 0)),
+            int(timings.get("interpolate_ms", 0)),
             int(timings.get("render_ms", 0)),
             int(timings.get("png_encode_ms", 0)),
             int(timings.get("total_ms", 0)),
@@ -1446,12 +1446,8 @@ class RealtimePoseEngine:
             decoded_frames = self._decode_frames(frames)
             timings["decode_ms"] = _elapsed_ms(decode_start)
 
-            interpolate_start = time.perf_counter()
-            output_frames: list[dict] = []
             source_frames: list[dict] = []
-            previous_source = None if self._stateless else self._last_source_depth
             for input_index, (frame_id, current_depth) in enumerate(decoded_frames):
-                interpolated_depth = self._interpolate_depth(previous_source, current_depth)
                 source_frames.append(
                     {
                         "frame_id": frame_id,
@@ -1459,30 +1455,45 @@ class RealtimePoseEngine:
                         "depth": current_depth,
                     }
                 )
-                output_frames.append(
-                    {
+
+            timings["model_input_count"] = len(source_frames)
+            timings["postprocess_input_count"] = len(source_frames)
+
+            def build_output_results(current_analyzed_by_input: dict[int, dict]) -> tuple[list[dict], list[dict]]:
+                interpolate_start = time.perf_counter()
+                output_frames: list[dict] = []
+                analyzed_results: list[dict] = []
+                previous_source = None if self._stateless else self._last_source_depth
+                for input_index, (frame_id, current_depth) in enumerate(decoded_frames):
+                    current_analyzed = current_analyzed_by_input[input_index]
+                    interpolated_depth = self._interpolate_depth(previous_source, current_depth)
+                    interpolated_frame = {
                         "frame_id": f"{frame_id}_interpolated",
                         "source_frame_id": frame_id,
                         "input_index": input_index,
                         "result_kind": "interpolated",
-                        "depth": interpolated_depth,
                     }
-                )
-                output_frames.append(
-                    {
+                    current_frame = {
                         "frame_id": f"{frame_id}_current",
                         "source_frame_id": frame_id,
                         "input_index": input_index,
                         "result_kind": "current",
-                        "depth": current_depth,
                     }
-                )
-                previous_source = current_depth.copy()
+                    output_frames.append(interpolated_frame)
+                    analyzed_results.append(
+                        self._reuse_analyzed_result_with_depth(
+                            current_analyzed,
+                            interpolated_frame["frame_id"],
+                            interpolated_depth,
+                        )
+                    )
+                    output_frames.append(current_frame)
+                    analyzed_results.append(current_analyzed)
+                    previous_source = current_depth.copy()
 
-            self._last_source_depth = previous_source.copy() if previous_source is not None and not self._stateless else None
-            timings["interpolate_ms"] = _elapsed_ms(interpolate_start)
-            timings["model_input_count"] = len(source_frames)
-            timings["postprocess_input_count"] = len(source_frames)
+                self._last_source_depth = previous_source.copy() if previous_source is not None and not self._stateless else None
+                timings["interpolate_ms"] = _elapsed_ms(interpolate_start)
+                return output_frames, analyzed_results
 
             model_prepare_start = time.perf_counter()
             color_imgs = self._prepare_model_color_images(source_frames)
@@ -1506,30 +1517,15 @@ class RealtimePoseEngine:
 
                 postprocess_start = time.perf_counter()
                 current_analyzed_by_input: dict[int, dict] = {}
-                for item in output_frames:
-                    if item["result_kind"] != "current":
-                        continue
+                for item in source_frames:
                     input_index = int(item["input_index"])
                     current_analyzed_by_input[input_index] = self._analyze_predecoded_unlocked(
-                        item["frame_id"],
+                        f"{item['frame_id']}_current",
                         item["depth"],
                         pose_result=pose_results[input_index],
                     )
-                analyzed_results = []
-                for item in output_frames:
-                    input_index = int(item["input_index"])
-                    current_analyzed = current_analyzed_by_input[input_index]
-                    if item["result_kind"] == "current":
-                        analyzed_results.append(current_analyzed)
-                    else:
-                        analyzed_results.append(
-                            self._reuse_analyzed_result_with_depth(
-                                current_analyzed,
-                                item["frame_id"],
-                                item["depth"],
-                            )
-                        )
                 timings["postprocess_ms"] = _elapsed_ms(postprocess_start)
+                output_frames, analyzed_results = build_output_results(current_analyzed_by_input)
 
                 results = self._encode_analyzed_results(analyzed_results, timings)
                 for output_index, (result, item) in enumerate(zip(results, output_frames)):
@@ -1572,31 +1568,16 @@ class RealtimePoseEngine:
 
             postprocess_start = time.perf_counter()
             current_analyzed_by_input: dict[int, dict] = {}
-            for item in output_frames:
-                if item["result_kind"] != "current":
-                    continue
+            for item in source_frames:
                 input_index = int(item["input_index"])
                 current_analyzed_by_input[input_index] = self._analyze_predecoded_unlocked(
-                    item["frame_id"],
+                    f"{item['frame_id']}_current",
                     item["depth"],
                     seg_result=seg_results[input_index],
                     pose_result=pose_results[input_index],
                 )
-            analyzed_results = []
-            for item in output_frames:
-                input_index = int(item["input_index"])
-                current_analyzed = current_analyzed_by_input[input_index]
-                if item["result_kind"] == "current":
-                    analyzed_results.append(current_analyzed)
-                else:
-                    analyzed_results.append(
-                        self._reuse_analyzed_result_with_depth(
-                            current_analyzed,
-                            item["frame_id"],
-                            item["depth"],
-                        )
-                    )
             timings["postprocess_ms"] = _elapsed_ms(postprocess_start)
+            output_frames, analyzed_results = build_output_results(current_analyzed_by_input)
 
             results = self._encode_analyzed_results(analyzed_results, timings)
             for output_index, (result, item) in enumerate(zip(results, output_frames)):

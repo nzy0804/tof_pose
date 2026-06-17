@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x08\x61i.proto\x12\x02\x61i\"P\n\nInferImage\x12\x10\n\x08\x66rame_id\x18\x01 \x01(\t\x12\x1c\n\x14\x63\x61pture_timestamp_ms\x18\x02 \x01(\x03\x12\x12\n\nimage_data\x18\x03 \x01(\x0c\"\xc5\x02\n\x0bInferResult\x12\x10\n\x08\x66rame_id\x18\x01 \x01(\t\x12\x1c\n\x14\x63\x61pture_timestamp_ms\x18\x02 \x01(\x03\x12\x1a\n\x12pseudo_color_image\x18\x03 \x01(\x0c\x12\x1e\n\x16skeleton_contour_image\x18\x04 \x01(\x0c\x12\x14\n\x0cperson_count\x18\x05 \x01(\x05\x12\x1a\n\x12processing_time_ms\x18\x06 \x01(\x05\x12#\n\x0bresult_kind\x18\x07 \x01(\x0e\x32\x0e.ai.ResultKind\x12\x13\n\x0binput_index\x18\x08 \x01(\x05\x12\x14\n\x0coutput_index\x18\t \x01(\x05\x12!\n\x19pseudo_color_image_format\x18\n \x01(\t\x12%\n\x1dskeleton_contour_image_format\x18\x0b \x01(\t\"g\n\x0cInferRequest\x12\x11\n\tdevice_id\x18\x01 \x01(\t\x12\x10\n\x08\x62\x61tch_id\x18\x02 \x01(\t\x12\x1e\n\x06images\x18\x03 \x03(\x0b\x32\x0e.ai.InferImage\x12\x12\n\nbatch_size\x18\x04 \x01(\x05\"r\n\rInferResponse\x12\x11\n\tdevice_id\x18\x01 \x01(\t\x12\x10\n\x08\x62\x61tch_id\x18\x02 \x01(\t\x12 \n\x07results\x18\x03 \x03(\x0b\x32\x0f.ai.InferResult\x12\x1a\n\x12processing_time_ms\x18\x04 \x01(\x05*`\n\nResultKind\x12\x1b\n\x17RESULT_KIND_UNSPECIFIED\x10\x00\x12\x1c\n\x18RESULT_KIND_INTERPOLATED\x10\x01\x12\x17\n\x13RESULT_KIND_CURRENT\x10\x02\x32<\n\x0cModelService\x12,\n\x05Infer\x12\x10.ai.InferRequest\x1a\x11.ai.InferResponseB\x0fZ\r./proto;protob\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x08\x61i.proto\x12\x02\x61i\"h\n\nInferImage\x12\x10\n\x08\x66rame_id\x18\x01 \x01(\t\x12\x1c\n\x14\x63\x61pture_timestamp_ms\x18\x02 \x01(\x03\x12\x16\n\nimage_data\x18\x03 \x01(\x0c\x42\x02\x18\x01\x12\x12\n\nobject_key\x18\x04 \x01(\t\"\x9b\x03\n\x0bInferResult\x12\x10\n\x08\x66rame_id\x18\x01 \x01(\t\x12\x1c\n\x14\x63\x61pture_timestamp_ms\x18\x02 \x01(\x03\x12\x1e\n\x12pseudo_color_image\x18\x03 \x01(\x0c\x42\x02\x18\x01\x12\"\n\x16skeleton_contour_image\x18\x04 \x01(\x0c\x42\x02\x18\x01\x12\x14\n\x0cperson_count\x18\x05 \x01(\x05\x12\x1a\n\x12processing_time_ms\x18\x06 \x01(\x05\x12#\n\x0bresult_kind\x18\x07 \x01(\x0e\x32\x0e.ai.ResultKind\x12\x13\n\x0binput_index\x18\x08 \x01(\x05\x12\x14\n\x0coutput_index\x18\t \x01(\x05\x12%\n\x19pseudo_color_image_format\x18\n \x01(\tB\x02\x18\x01\x12)\n\x1dskeleton_contour_image_format\x18\x0b \x01(\tB\x02\x18\x01\x12\x1f\n\x17pseudo_color_object_key\x18\x0c \x01(\t\x12#\n\x1bskeleton_contour_object_key\x18\r \x01(\t\"g\n\x0cInferRequest\x12\x11\n\tdevice_id\x18\x01 \x01(\t\x12\x10\n\x08\x62\x61tch_id\x18\x02 \x01(\t\x12\x1e\n\x06images\x18\x03 \x03(\x0b\x32\x0e.ai.InferImage\x12\x12\n\nbatch_size\x18\x04 \x01(\x05\"r\n\rInferResponse\x12\x11\n\tdevice_id\x18\x01 \x01(\t\x12\x10\n\x08\x62\x61tch_id\x18\x02 \x01(\t\x12 \n\x07results\x18\x03 \x03(\x0b\x32\x0f.ai.InferResult\x12\x1a\n\x12processing_time_ms\x18\x04 \x01(\x05*`\n\nResultKind\x12\x1b\n\x17RESULT_KIND_UNSPECIFIED\x10\x00\x12\x1c\n\x18RESULT_KIND_INTERPOLATED\x10\x01\x12\x17\n\x13RESULT_KIND_CURRENT\x10\x02\x32<\n\x0cModelService\x12,\n\x05Infer\x12\x10.ai.InferRequest\x1a\x11.ai.InferResponseB\x0fZ\r./proto;protob\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -32,16 +32,26 @@ _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'ai_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   _globals['DESCRIPTOR']._loaded_options = None
   _globals['DESCRIPTOR']._serialized_options = b'Z\r./proto;proto'
-  _globals['_RESULTKIND']._serialized_start=647
-  _globals['_RESULTKIND']._serialized_end=743
+  _globals['_INFERIMAGE'].fields_by_name['image_data']._loaded_options = None
+  _globals['_INFERIMAGE'].fields_by_name['image_data']._serialized_options = b'\030\001'
+  _globals['_INFERRESULT'].fields_by_name['pseudo_color_image']._loaded_options = None
+  _globals['_INFERRESULT'].fields_by_name['pseudo_color_image']._serialized_options = b'\030\001'
+  _globals['_INFERRESULT'].fields_by_name['skeleton_contour_image']._loaded_options = None
+  _globals['_INFERRESULT'].fields_by_name['skeleton_contour_image']._serialized_options = b'\030\001'
+  _globals['_INFERRESULT'].fields_by_name['pseudo_color_image_format']._loaded_options = None
+  _globals['_INFERRESULT'].fields_by_name['pseudo_color_image_format']._serialized_options = b'\030\001'
+  _globals['_INFERRESULT'].fields_by_name['skeleton_contour_image_format']._loaded_options = None
+  _globals['_INFERRESULT'].fields_by_name['skeleton_contour_image_format']._serialized_options = b'\030\001'
+  _globals['_RESULTKIND']._serialized_start=757
+  _globals['_RESULTKIND']._serialized_end=853
   _globals['_INFERIMAGE']._serialized_start=16
-  _globals['_INFERIMAGE']._serialized_end=96
-  _globals['_INFERRESULT']._serialized_start=99
-  _globals['_INFERRESULT']._serialized_end=424
-  _globals['_INFERREQUEST']._serialized_start=426
-  _globals['_INFERREQUEST']._serialized_end=529
-  _globals['_INFERRESPONSE']._serialized_start=531
-  _globals['_INFERRESPONSE']._serialized_end=645
-  _globals['_MODELSERVICE']._serialized_start=745
-  _globals['_MODELSERVICE']._serialized_end=805
+  _globals['_INFERIMAGE']._serialized_end=120
+  _globals['_INFERRESULT']._serialized_start=123
+  _globals['_INFERRESULT']._serialized_end=534
+  _globals['_INFERREQUEST']._serialized_start=536
+  _globals['_INFERREQUEST']._serialized_end=639
+  _globals['_INFERRESPONSE']._serialized_start=641
+  _globals['_INFERRESPONSE']._serialized_end=755
+  _globals['_MODELSERVICE']._serialized_start=855
+  _globals['_MODELSERVICE']._serialized_end=915
 # @@protoc_insertion_point(module_scope)

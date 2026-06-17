@@ -16,21 +16,24 @@ enum ResultKind {
 message InferImage {
   string frame_id = 1;
   int64 capture_timestamp_ms = 2;
-  bytes image_data = 3;
+  bytes image_data = 3 [deprecated = true];
+  string object_key = 4;
 }
 
 message InferResult {
   string frame_id = 1;
   int64 capture_timestamp_ms = 2;
-  bytes pseudo_color_image = 3;
-  bytes skeleton_contour_image = 4;
+  bytes pseudo_color_image = 3 [deprecated = true];
+  bytes skeleton_contour_image = 4 [deprecated = true];
   int32 person_count = 5;
   int32 processing_time_ms = 6;
   ResultKind result_kind = 7;
   int32 input_index = 8;
   int32 output_index = 9;
-  string pseudo_color_image_format = 10;
-  string skeleton_contour_image_format = 11;
+  string pseudo_color_image_format = 10 [deprecated = true];
+  string skeleton_contour_image_format = 11 [deprecated = true];
+  string pseudo_color_object_key = 12;
+  string skeleton_contour_object_key = 13;
 }
 
 message InferRequest {

@@ -10,7 +10,7 @@ import logging
 import multiprocessing
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import grpc
@@ -66,10 +66,50 @@ except Exception:
 
 from tof_pose.realtime_service import RealtimePoseEngine
 from tof_pose.realtime_service import CPU_WORKER_MODE_PROCESS, CPU_WORKER_MODE_THREAD
+from tof_pose.object_storage import (
+    ObjectStorageConfig,
+    build_result_object_key,
+    create_object_storage_client,
+    image_content_type,
+)
 
 
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
 LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+class _ObjectStorageStageStats:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._durations_ms: list[int] = []
+        self._total_bytes = 0
+
+    def add(self, duration_ms: int, byte_count: int) -> None:
+        with self._lock:
+            self._durations_ms.append(max(0, int(duration_ms)))
+            self._total_bytes += max(0, int(byte_count))
+
+    def summary(self) -> dict[str, int]:
+        with self._lock:
+            durations = sorted(self._durations_ms)
+            total_bytes = self._total_bytes
+        if not durations:
+            return {
+                "count": 0,
+                "bytes": total_bytes,
+                "p50_ms": 0,
+                "p95_ms": 0,
+                "max_ms": 0,
+            }
+        p50_index = len(durations) // 2
+        p95_index = min(len(durations) - 1, int((len(durations) - 1) * 0.95 + 0.5))
+        return {
+            "count": len(durations),
+            "bytes": total_bytes,
+            "p50_ms": durations[p50_index],
+            "p95_ms": durations[p95_index],
+            "max_ms": durations[-1],
+        }
 
 
 class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
@@ -96,6 +136,11 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         warmup_models: bool = True,
         warmup_batch_size: int = 10,
         device_binding_ttl_sec: float = 120.0,
+        oss_config: ObjectStorageConfig | None = None,
+        oss_workers: int | None = 4,
+        oss_download_workers: int | None = None,
+        oss_upload_workers: int | None = None,
+        oss_global_workers: int = 8,
     ):
         self._engine_count = max(1, int(model_instances))
         self._engines: list[RealtimePoseEngine] = []
@@ -105,6 +150,39 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         self._device_binding_ttl_sec = max(0.0, float(device_binding_ttl_sec))
         self._engine_inflight = [0 for _ in range(self._engine_count)]
         self._engine_device_counts = [0 for _ in range(self._engine_count)]
+        self._oss_config = oss_config
+        self._oss_client = create_object_storage_client(oss_config)
+        self._oss_workers = max(0, int(oss_workers if oss_workers is not None else 4))
+        self._oss_download_workers = max(
+            0,
+            int(self._oss_workers if oss_download_workers is None else oss_download_workers),
+        )
+        self._oss_upload_workers = max(
+            0,
+            int(self._oss_workers if oss_upload_workers is None else oss_upload_workers),
+        )
+        self._oss_global_workers = max(0, int(oss_global_workers))
+        self._oss_global_semaphore = (
+            threading.BoundedSemaphore(self._oss_global_workers)
+            if self._oss_global_workers > 0
+            else None
+        )
+        if self._oss_client is not None and self._oss_config is not None:
+            logging.info(
+                (
+                    "Object storage enabled: provider=%s endpoint=%s bucket=%s output_prefix=%s "
+                    "workers=%d download_workers=%d upload_workers=%d global_workers=%d pool_connections=%d"
+                ),
+                self._oss_config.provider,
+                self._oss_config.endpoint,
+                self._oss_config.bucket,
+                self._oss_config.output_prefix,
+                self._oss_workers,
+                self._oss_download_workers,
+                self._oss_upload_workers,
+                self._oss_global_workers,
+                self._oss_config.max_pool_connections,
+            )
         for idx in range(self._engine_count):
             logging.info("Initializing AI model instance %d/%d on device=%s", idx + 1, self._engine_count, device or "auto")
             self._engines.append(
@@ -200,6 +278,119 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
             if 0 <= index < len(self._engine_inflight):
                 self._engine_inflight[index] = max(0, self._engine_inflight[index] - 1)
 
+    def _oss_concurrency(self, item_count: int, worker_limit: int) -> int:
+        count = max(1, int(item_count))
+        if worker_limit <= 0:
+            return count
+        return min(worker_limit, count)
+
+    def _run_object_storage_call(self, call):
+        if self._oss_global_semaphore is None:
+            return call()
+        self._oss_global_semaphore.acquire()
+        try:
+            return call()
+        finally:
+            self._oss_global_semaphore.release()
+
+    def _download_request_images(self, images: list) -> tuple[list[tuple[str, bytes]], int, dict[str, int]]:
+        if self._oss_client is None:
+            frames = []
+            for image in images:
+                image_data = bytes(getattr(image, "image_data", b"") or b"")
+                if not image_data:
+                    object_key = str(getattr(image, "object_key", "") or "").strip()
+                    raise ValueError(f"image {getattr(image, 'frame_id', '')!r} has object_key={object_key!r} but object storage is not configured")
+                frames.append((str(getattr(image, "frame_id", "") or ""), image_data))
+            return frames, 0, _ObjectStorageStageStats().summary()
+
+        download_start = time.perf_counter()
+        frames: list[tuple[str, bytes] | None] = [None] * len(images)
+        stage_stats = _ObjectStorageStageStats()
+
+        def download_one(index: int, image) -> tuple[int, tuple[str, bytes]]:
+            frame_id = str(getattr(image, "frame_id", "") or "")
+            object_key = str(getattr(image, "object_key", "") or "").strip()
+            if object_key:
+                object_start = time.perf_counter()
+                data = self._run_object_storage_call(lambda: self._oss_client.get_bytes(object_key))
+                stage_stats.add(int((time.perf_counter() - object_start) * 1000), len(data))
+                return index, (frame_id, data)
+            image_data = bytes(getattr(image, "image_data", b"") or b"")
+            if image_data:
+                return index, (frame_id, image_data)
+            raise ValueError(f"image {frame_id!r} missing object_key")
+
+        with ThreadPoolExecutor(max_workers=self._oss_concurrency(len(images), self._oss_download_workers)) as executor:
+            futures = [executor.submit(download_one, index, image) for index, image in enumerate(images)]
+            for future in as_completed(futures):
+                index, frame = future.result()
+                frames[index] = frame
+
+        return (
+            [frame for frame in frames if frame is not None],
+            int((time.perf_counter() - download_start) * 1000),
+            stage_stats.summary(),
+        )
+
+    def _upload_result_images(
+        self,
+        *,
+        device_id: str,
+        batch_id: str,
+        results: list[dict],
+    ) -> tuple[int, dict[str, int]]:
+        if self._oss_client is None or self._oss_config is None:
+            return 0, _ObjectStorageStageStats().summary()
+
+        upload_start = time.perf_counter()
+        stage_stats = _ObjectStorageStageStats()
+
+        def upload_one(result_index: int, image_name: str) -> tuple[int, str, str]:
+            result = results[result_index]
+            data_key = "pseudo_color_image" if image_name == "pseudo_color" else "skeleton_contour_image"
+            format_key = f"{data_key}_format"
+            object_key_field = f"{image_name}_object_key"
+            image_data = bytes(result.get(data_key, b"") or b"")
+            if not image_data:
+                raise ValueError(f"empty {image_name} image for result {result_index}")
+            image_format = str(result.get(format_key, "") or "")
+            object_key = build_result_object_key(
+                output_prefix=self._oss_config.output_prefix,
+                device_id=device_id,
+                batch_id=batch_id,
+                frame_id=str(result.get("frame_id", "") or ""),
+                output_index=int(result.get("output_index", result_index)),
+                result_kind=str(result.get("result_kind", "result") or "result"),
+                image_name=image_name,
+                image_format=image_format,
+            )
+            object_start = time.perf_counter()
+            stored_key = self._run_object_storage_call(
+                lambda: self._oss_client.put_bytes(
+                    object_key,
+                    image_data,
+                    content_type=image_content_type(image_format),
+                )
+            )
+            stage_stats.add(int((time.perf_counter() - object_start) * 1000), len(image_data))
+            return result_index, object_key_field, stored_key
+
+        tasks = []
+        with ThreadPoolExecutor(max_workers=self._oss_concurrency(len(results) * 2, self._oss_upload_workers)) as executor:
+            for result_index in range(len(results)):
+                tasks.append(executor.submit(upload_one, result_index, "pseudo_color"))
+                tasks.append(executor.submit(upload_one, result_index, "skeleton_contour"))
+            for future in as_completed(tasks):
+                result_index, object_key_field, stored_key = future.result()
+                results[result_index][object_key_field] = stored_key
+                if object_key_field == "pseudo_color_object_key":
+                    results[result_index]["pseudo_color_image"] = b""
+                else:
+                    results[result_index]["skeleton_contour_image"] = b""
+
+        return int((time.perf_counter() - upload_start) * 1000), stage_stats.summary()
+
     def Infer(self, request, context):
         device_id = getattr(request, 'device_id', '')
         batch_id = getattr(request, 'batch_id', '')
@@ -215,10 +406,19 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
             return ai_pb2.InferResponse(device_id=device_id, batch_id=batch_id)
 
         grpc_start = time.perf_counter()
+        try:
+            frames, oss_download_ms, oss_download_stats = self._download_request_images(images)
+            if len(frames) != len(images):
+                raise RuntimeError(f"expected {len(images)} downloaded frames, got {len(frames)}")
+        except Exception as e:
+            logging.exception("Infer input load failed: device_id=%s batch_id=%s", device_id, batch_id)
+            context.set_details(str(e))
+            context.set_code(grpc.StatusCode.INTERNAL)
+            return ai_pb2.InferResponse(device_id=device_id, batch_id=batch_id)
+
         engine_index, engine, engine_inflight = self._acquire_engine(device_id, batch_id)
         engine_infer_ms = 0
         try:
-            frames = [(image.frame_id, image.image_data) for image in images]
             engine_start = time.perf_counter()
             results = engine.infer_batch(frames)
             engine_infer_ms = int((time.perf_counter() - engine_start) * 1000)
@@ -234,6 +434,14 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
             )
         finally:
             self._release_engine(engine_index)
+
+        try:
+            oss_upload_ms, oss_upload_stats = self._upload_result_images(device_id=device_id, batch_id=batch_id, results=results)
+        except Exception as e:
+            logging.exception("Infer output upload failed: device_id=%s batch_id=%s instance=%d", device_id, batch_id, engine_index)
+            context.set_details(str(e))
+            context.set_code(grpc.StatusCode.INTERNAL)
+            return ai_pb2.InferResponse(device_id=device_id, batch_id=batch_id)
 
         response_build_start = time.perf_counter()
         response = ai_pb2.InferResponse(
@@ -260,6 +468,8 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
                     skeleton_contour_image=result.get('skeleton_contour_image', b''),
                     pseudo_color_image_format=result.get('pseudo_color_image_format', 'png'),
                     skeleton_contour_image_format=result.get('skeleton_contour_image_format', 'png'),
+                    pseudo_color_object_key=result.get('pseudo_color_object_key', ''),
+                    skeleton_contour_object_key=result.get('skeleton_contour_object_key', ''),
                     person_count=int(result.get('person_count', 0)),
                     processing_time_ms=int(result.get('processing_time_ms', 0)),
                     result_kind=kind_map.get(result.get('result_kind'), ai_pb2.RESULT_KIND_UNSPECIFIED),
@@ -273,14 +483,32 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         logging.info(
             (
                 "Infer request timing: device_id=%s batch_id=%s instance=model-%d "
-                "inputs=%d results=%d engine_infer_ms=%d grpc_response_build_ms=%d grpc_total_ms=%d engine_inflight=%s"
+                "inputs=%d results=%d "
+                "oss_download_ms=%d oss_download_count=%d oss_download_bytes=%d "
+                "oss_download_p50_ms=%d oss_download_p95_ms=%d oss_download_max_ms=%d "
+                "engine_infer_ms=%d "
+                "oss_upload_ms=%d oss_upload_count=%d oss_upload_bytes=%d "
+                "oss_upload_p50_ms=%d oss_upload_p95_ms=%d oss_upload_max_ms=%d "
+                "grpc_response_build_ms=%d grpc_total_ms=%d engine_inflight=%s"
             ),
             device_id,
             batch_id,
             engine_index,
             len(images),
             len(results),
+            oss_download_ms,
+            oss_download_stats["count"],
+            oss_download_stats["bytes"],
+            oss_download_stats["p50_ms"],
+            oss_download_stats["p95_ms"],
+            oss_download_stats["max_ms"],
             engine_infer_ms,
+            oss_upload_ms,
+            oss_upload_stats["count"],
+            oss_upload_stats["bytes"],
+            oss_upload_stats["p50_ms"],
+            oss_upload_stats["p95_ms"],
+            oss_upload_stats["max_ms"],
             response_build_ms,
             grpc_total_ms,
             engine_inflight,
@@ -314,6 +542,11 @@ def serve(
     warmup_models: bool = True,
     warmup_batch_size: int = 10,
     device_binding_ttl_sec: float = 120.0,
+    oss_config: ObjectStorageConfig | None = None,
+    oss_workers: int | None = 4,
+    oss_download_workers: int | None = None,
+    oss_upload_workers: int | None = None,
+    oss_global_workers: int = 8,
 ):
     model_instances = max(1, int(model_instances))
     server_opts = [
@@ -343,6 +576,11 @@ def serve(
             warmup_models=warmup_models,
             warmup_batch_size=warmup_batch_size,
             device_binding_ttl_sec=device_binding_ttl_sec,
+            oss_config=oss_config,
+            oss_workers=oss_workers,
+            oss_download_workers=oss_download_workers,
+            oss_upload_workers=oss_upload_workers,
+            oss_global_workers=oss_global_workers,
         ),
         server,
     )
@@ -482,8 +720,52 @@ def main():
         type=float,
         help='seconds after which an inactive device_id is unbound from its sticky model instance; 0 disables pruning',
     )
+    parser.add_argument('--oss-provider', default=None, choices=('aliyun', 's3'), help='object storage provider for request/result object keys')
+    parser.add_argument('--oss-endpoint', default=None, help='object storage endpoint')
+    parser.add_argument('--oss-bucket', default=None, help='object storage bucket name')
+    parser.add_argument('--oss-access-key-id', default=None, help='object storage access key id')
+    parser.add_argument('--oss-access-key-secret', default=None, help='object storage access key secret')
+    parser.add_argument('--oss-region', default=None, help='object storage region, mainly for S3-compatible providers')
+    parser.add_argument('--oss-security-token', default=None, help='optional temporary security token')
+    parser.add_argument('--oss-output-prefix', default=None, help='prefix for AI result images uploaded by this service')
+    parser.add_argument('--oss-max-pool-connections', default=128, type=int, help='max HTTP connection pool size for S3-compatible object storage')
+    parser.add_argument(
+        '--oss-workers',
+        default=4,
+        type=int,
+        help='fallback per-request concurrent workers for object storage; 0 means one worker per object, still capped by --oss-global-workers',
+    )
+    parser.add_argument(
+        '--oss-download-workers',
+        default=None,
+        type=int,
+        help='per-request concurrent workers for object storage downloads; defaults to --oss-workers',
+    )
+    parser.add_argument(
+        '--oss-upload-workers',
+        default=None,
+        type=int,
+        help='per-request concurrent workers for object storage uploads; defaults to --oss-workers',
+    )
+    parser.add_argument(
+        '--oss-global-workers',
+        default=8,
+        type=int,
+        help='global concurrent object storage operations shared by all requests; 0 disables global limiting',
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
+    oss_config = ObjectStorageConfig.from_values(
+        provider=args.oss_provider,
+        endpoint=args.oss_endpoint,
+        bucket=args.oss_bucket,
+        access_key_id=args.oss_access_key_id,
+        access_key_secret=args.oss_access_key_secret,
+        region=args.oss_region,
+        security_token=args.oss_security_token,
+        output_prefix=args.oss_output_prefix,
+        max_pool_connections=args.oss_max_pool_connections,
+    )
     serve(
         host=args.host,
         port=args.port,
@@ -509,6 +791,11 @@ def main():
         warmup_models=not args.no_warmup,
         warmup_batch_size=args.warmup_batch_size,
         device_binding_ttl_sec=args.device_binding_ttl_sec,
+        oss_config=oss_config,
+        oss_workers=args.oss_workers,
+        oss_download_workers=args.oss_download_workers,
+        oss_upload_workers=args.oss_upload_workers,
+        oss_global_workers=args.oss_global_workers,
     )
 
 

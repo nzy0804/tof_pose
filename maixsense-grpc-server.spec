@@ -4,6 +4,7 @@ from PyInstaller.utils.hooks import collect_submodules
 
 hiddenimports = [
     'tof_pose.realtime_service',
+    'tof_pose.object_storage',
     'tof_pose.paths',
     'tof_pose.person_distance',
     'tof_pose.pose_drawing',
@@ -21,6 +22,12 @@ try:
     hiddenimports += collect_submodules('lap')
 except Exception:
     pass
+
+for package in ('oss2', 'boto3', 'botocore', 's3transfer'):
+    try:
+        hiddenimports += collect_submodules(package)
+    except Exception:
+        pass
 
 
 a = Analysis(

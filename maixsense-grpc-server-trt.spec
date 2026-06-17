@@ -36,6 +36,7 @@ def _safe_collect_data_files(package: str) -> list[tuple[str, str]]:
 
 hiddenimports = [
     "tof_pose.realtime_service",
+    "tof_pose.object_storage",
     "tof_pose.paths",
     "tof_pose.person_distance",
     "tof_pose.pose_drawing",
@@ -58,6 +59,10 @@ hiddenimports = [
 for package in (
     "tof_pose",
     "lap",
+    "oss2",
+    "boto3",
+    "botocore",
+    "s3transfer",
     "tensorrt",
     "tensorrt_bindings",
     "tensorrt_libs",
@@ -69,6 +74,10 @@ for package in (
 binaries = []
 datas = []
 for package in (
+    "oss2",
+    "boto3",
+    "botocore",
+    "s3transfer",
     "tensorrt",
     "tensorrt_bindings",
     "tensorrt_libs",

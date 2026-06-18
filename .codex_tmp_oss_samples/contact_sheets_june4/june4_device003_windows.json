@@ -1,0 +1,758 @@
+[
+  {
+    "idx": 0,
+    "ts": 1780544041889,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544041889-tof-1780544041889-1.png",
+    "size": 3783,
+    "last_modified": 1780544043
+  },
+  {
+    "idx": 1,
+    "ts": 1780544041971,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544041971-tof-1780544041971-2.png",
+    "size": 3783,
+    "last_modified": 1780544043
+  },
+  {
+    "idx": 2,
+    "ts": 1780544042071,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544042071-tof-1780544042071-3.png",
+    "size": 1701,
+    "last_modified": 1780544043
+  },
+  {
+    "idx": 3,
+    "ts": 1780544042172,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544042172-tof-1780544042172-4.png",
+    "size": 1686,
+    "last_modified": 1780544043
+  },
+  {
+    "idx": 4,
+    "ts": 1780544042271,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544042271-tof-1780544042271-5.png",
+    "size": 1670,
+    "last_modified": 1780544043
+  },
+  {
+    "idx": 5,
+    "ts": 1780544042370,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544042370-tof-1780544042370-6.png",
+    "size": 1606,
+    "last_modified": 1780544043
+  },
+  {
+    "idx": 6,
+    "ts": 1780544042482,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544042482-tof-1780544042482-7.png",
+    "size": 1606,
+    "last_modified": 1780544043
+  },
+  {
+    "idx": 7,
+    "ts": 1780544042571,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544042571-tof-1780544042571-8.png",
+    "size": 1639,
+    "last_modified": 1780544043
+  },
+  {
+    "idx": 8,
+    "ts": 1780544042680,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544042680-tof-1780544042680-9.png",
+    "size": 1644,
+    "last_modified": 1780544043
+  },
+  {
+    "idx": 9,
+    "ts": 1780544042770,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544042770-tof-1780544042770-10.png",
+    "size": 1645,
+    "last_modified": 1780544043
+  },
+  {
+    "idx": 10,
+    "ts": 1780544042872,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544042872-tof-1780544042872-11.png",
+    "size": 1684,
+    "last_modified": 1780544044
+  },
+  {
+    "idx": 11,
+    "ts": 1780544042968,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544042968-tof-1780544042968-12.png",
+    "size": 1711,
+    "last_modified": 1780544044
+  },
+  {
+    "idx": 12,
+    "ts": 1780544148877,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544148877-tof-1780544148877-1001.png",
+    "size": 501,
+    "last_modified": 1780544149
+  },
+  {
+    "idx": 13,
+    "ts": 1780544148988,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544148988-tof-1780544148988-1002.png",
+    "size": 588,
+    "last_modified": 1780544149
+  },
+  {
+    "idx": 14,
+    "ts": 1780544149077,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544149077-tof-1780544149077-1003.png",
+    "size": 571,
+    "last_modified": 1780544149
+  },
+  {
+    "idx": 15,
+    "ts": 1780544149178,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544149178-tof-1780544149178-1004.png",
+    "size": 564,
+    "last_modified": 1780544149
+  },
+  {
+    "idx": 16,
+    "ts": 1780544149274,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544149274-tof-1780544149274-1005.png",
+    "size": 547,
+    "last_modified": 1780544149
+  },
+  {
+    "idx": 17,
+    "ts": 1780544149368,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544149368-tof-1780544149368-1006.png",
+    "size": 561,
+    "last_modified": 1780544149
+  },
+  {
+    "idx": 18,
+    "ts": 1780544149468,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544149468-tof-1780544149468-1007.png",
+    "size": 551,
+    "last_modified": 1780544149
+  },
+  {
+    "idx": 19,
+    "ts": 1780544149568,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544149568-tof-1780544149568-1008.png",
+    "size": 564,
+    "last_modified": 1780544149
+  },
+  {
+    "idx": 20,
+    "ts": 1780544149667,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544149667-tof-1780544149667-1009.png",
+    "size": 550,
+    "last_modified": 1780544149
+  },
+  {
+    "idx": 21,
+    "ts": 1780544149767,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544149767-tof-1780544149767-1010.png",
+    "size": 576,
+    "last_modified": 1780544149
+  },
+  {
+    "idx": 22,
+    "ts": 1780544149889,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544149889-tof-1780544149889-1011.png",
+    "size": 571,
+    "last_modified": 1780544151
+  },
+  {
+    "idx": 23,
+    "ts": 1780544150073,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544150073-tof-1780544150073-1012.png",
+    "size": 495,
+    "last_modified": 1780544151
+  },
+  {
+    "idx": 24,
+    "ts": 1780544361386,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544361386-tof-1780544361386-3006.png",
+    "size": 4816,
+    "last_modified": 1780544361
+  },
+  {
+    "idx": 25,
+    "ts": 1780544361488,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544361488-tof-1780544361488-3007.png",
+    "size": 4849,
+    "last_modified": 1780544361
+  },
+  {
+    "idx": 26,
+    "ts": 1780544361578,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544361578-tof-1780544361578-3008.png",
+    "size": 4799,
+    "last_modified": 1780544361
+  },
+  {
+    "idx": 27,
+    "ts": 1780544361677,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544361677-tof-1780544361677-3009.png",
+    "size": 4789,
+    "last_modified": 1780544362
+  },
+  {
+    "idx": 28,
+    "ts": 1780544361776,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544361776-tof-1780544361776-3010.png",
+    "size": 4773,
+    "last_modified": 1780544362
+  },
+  {
+    "idx": 29,
+    "ts": 1780544361877,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544361877-tof-1780544361877-3011.png",
+    "size": 4790,
+    "last_modified": 1780544362
+  },
+  {
+    "idx": 30,
+    "ts": 1780544361989,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544361989-tof-1780544361989-3012.png",
+    "size": 4783,
+    "last_modified": 1780544362
+  },
+  {
+    "idx": 31,
+    "ts": 1780544362088,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544362088-tof-1780544362088-3013.png",
+    "size": 4779,
+    "last_modified": 1780544362
+  },
+  {
+    "idx": 32,
+    "ts": 1780544362192,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544362192-tof-1780544362192-3014.png",
+    "size": 4801,
+    "last_modified": 1780544362
+  },
+  {
+    "idx": 33,
+    "ts": 1780544362309,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544362309-tof-1780544362309-3015.png",
+    "size": 4781,
+    "last_modified": 1780544362
+  },
+  {
+    "idx": 34,
+    "ts": 1780544362375,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544362375-tof-1780544362375-3016.png",
+    "size": 4750,
+    "last_modified": 1780544362
+  },
+  {
+    "idx": 35,
+    "ts": 1780544362477,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544362477-tof-1780544362477-3017.png",
+    "size": 4816,
+    "last_modified": 1780544363
+  },
+  {
+    "idx": 36,
+    "ts": 1780544679981,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544679981-tof-1780544679981-6006.png",
+    "size": 2954,
+    "last_modified": 1780544680
+  },
+  {
+    "idx": 37,
+    "ts": 1780544680092,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544680092-tof-1780544680092-6007.png",
+    "size": 2991,
+    "last_modified": 1780544680
+  },
+  {
+    "idx": 38,
+    "ts": 1780544680182,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544680182-tof-1780544680182-6008.png",
+    "size": 2967,
+    "last_modified": 1780544680
+  },
+  {
+    "idx": 39,
+    "ts": 1780544680281,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544680281-tof-1780544680281-6009.png",
+    "size": 2936,
+    "last_modified": 1780544680
+  },
+  {
+    "idx": 40,
+    "ts": 1780544680382,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544680382-tof-1780544680382-6010.png",
+    "size": 2943,
+    "last_modified": 1780544680
+  },
+  {
+    "idx": 41,
+    "ts": 1780544680481,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544680481-tof-1780544680481-6011.png",
+    "size": 2956,
+    "last_modified": 1780544681
+  },
+  {
+    "idx": 42,
+    "ts": 1780544680590,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544680590-tof-1780544680590-6012.png",
+    "size": 2995,
+    "last_modified": 1780544681
+  },
+  {
+    "idx": 43,
+    "ts": 1780544680682,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544680682-tof-1780544680682-6013.png",
+    "size": 2961,
+    "last_modified": 1780544681
+  },
+  {
+    "idx": 44,
+    "ts": 1780544680797,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544680797-tof-1780544680797-6014.png",
+    "size": 2968,
+    "last_modified": 1780544681
+  },
+  {
+    "idx": 45,
+    "ts": 1780544680881,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544680881-tof-1780544680881-6015.png",
+    "size": 2957,
+    "last_modified": 1780544681
+  },
+  {
+    "idx": 46,
+    "ts": 1780544680981,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544680981-tof-1780544680981-6016.png",
+    "size": 2996,
+    "last_modified": 1780544681
+  },
+  {
+    "idx": 47,
+    "ts": 1780544681109,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780544681109-tof-1780544681109-6017.png",
+    "size": 2965,
+    "last_modified": 1780544681
+  },
+  {
+    "idx": 48,
+    "ts": 1780560189185,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780560189185-tof-1780560189185-1500.png",
+    "size": 3954,
+    "last_modified": 1780560189
+  },
+  {
+    "idx": 49,
+    "ts": 1780560189271,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780560189271-tof-1780560189271-1501.png",
+    "size": 3921,
+    "last_modified": 1780560190
+  },
+  {
+    "idx": 50,
+    "ts": 1780560189373,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780560189373-tof-1780560189373-1502.png",
+    "size": 3949,
+    "last_modified": 1780560190
+  },
+  {
+    "idx": 51,
+    "ts": 1780560189491,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780560189491-tof-1780560189491-1503.png",
+    "size": 3909,
+    "last_modified": 1780560190
+  },
+  {
+    "idx": 52,
+    "ts": 1780560189569,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780560189569-tof-1780560189569-1504.png",
+    "size": 3919,
+    "last_modified": 1780560190
+  },
+  {
+    "idx": 53,
+    "ts": 1780560189682,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780560189682-tof-1780560189682-1505.png",
+    "size": 3947,
+    "last_modified": 1780560190
+  },
+  {
+    "idx": 54,
+    "ts": 1780560189790,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780560189790-tof-1780560189790-1506.png",
+    "size": 3938,
+    "last_modified": 1780560190
+  },
+  {
+    "idx": 55,
+    "ts": 1780560189865,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780560189865-tof-1780560189865-1507.png",
+    "size": 3935,
+    "last_modified": 1780560190
+  },
+  {
+    "idx": 56,
+    "ts": 1780560190059,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780560190059-tof-1780560190059-1508.png",
+    "size": 3963,
+    "last_modified": 1780560190
+  },
+  {
+    "idx": 57,
+    "ts": 1780560190169,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780560190169-tof-1780560190169-1509.png",
+    "size": 3944,
+    "last_modified": 1780560190
+  },
+  {
+    "idx": 58,
+    "ts": 1780560190269,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780560190269-tof-1780560190269-1510.png",
+    "size": 3936,
+    "last_modified": 1780560190
+  },
+  {
+    "idx": 59,
+    "ts": 1780560190490,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780560190490-tof-1780560190490-1511.png",
+    "size": 3937,
+    "last_modified": 1780560191
+  },
+  {
+    "idx": 60,
+    "ts": 1780561268157,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780561268157-tof-1780561268157-2817.png",
+    "size": 4485,
+    "last_modified": 1780561268
+  },
+  {
+    "idx": 61,
+    "ts": 1780561268243,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780561268243-tof-1780561268243-2818.png",
+    "size": 4494,
+    "last_modified": 1780561268
+  },
+  {
+    "idx": 62,
+    "ts": 1780561268353,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780561268353-tof-1780561268353-2819.png",
+    "size": 4473,
+    "last_modified": 1780561268
+  },
+  {
+    "idx": 63,
+    "ts": 1780561268455,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780561268455-tof-1780561268455-2820.png",
+    "size": 4465,
+    "last_modified": 1780561268
+  },
+  {
+    "idx": 64,
+    "ts": 1780561268542,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780561268542-tof-1780561268542-2821.png",
+    "size": 4490,
+    "last_modified": 1780561269
+  },
+  {
+    "idx": 65,
+    "ts": 1780561268747,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780561268747-tof-1780561268747-2822.png",
+    "size": 4498,
+    "last_modified": 1780561269
+  },
+  {
+    "idx": 66,
+    "ts": 1780561268869,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780561268869-tof-1780561268869-2823.png",
+    "size": 4474,
+    "last_modified": 1780561269
+  },
+  {
+    "idx": 67,
+    "ts": 1780561268965,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780561268965-tof-1780561268965-2824.png",
+    "size": 4479,
+    "last_modified": 1780561269
+  },
+  {
+    "idx": 68,
+    "ts": 1780561269156,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780561269156-tof-1780561269156-2825.png",
+    "size": 4475,
+    "last_modified": 1780561269
+  },
+  {
+    "idx": 69,
+    "ts": 1780561269253,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780561269253-tof-1780561269253-2826.png",
+    "size": 4485,
+    "last_modified": 1780561269
+  },
+  {
+    "idx": 70,
+    "ts": 1780561269356,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780561269356-tof-1780561269356-2827.png",
+    "size": 4499,
+    "last_modified": 1780561269
+  },
+  {
+    "idx": 71,
+    "ts": 1780561269549,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780561269549-tof-1780561269549-2828.png",
+    "size": 4487,
+    "last_modified": 1780561269
+  },
+  {
+    "idx": 72,
+    "ts": 1780566703050,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780566703050-tof-1780566703050-379.png",
+    "size": 2726,
+    "last_modified": 1780566703
+  },
+  {
+    "idx": 73,
+    "ts": 1780566703153,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780566703153-tof-1780566703153-380.png",
+    "size": 2722,
+    "last_modified": 1780566703
+  },
+  {
+    "idx": 74,
+    "ts": 1780566703255,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780566703255-tof-1780566703255-381.png",
+    "size": 2662,
+    "last_modified": 1780566704
+  },
+  {
+    "idx": 75,
+    "ts": 1780566703350,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780566703350-tof-1780566703350-382.png",
+    "size": 2689,
+    "last_modified": 1780566704
+  },
+  {
+    "idx": 76,
+    "ts": 1780566703451,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780566703451-tof-1780566703451-383.png",
+    "size": 3082,
+    "last_modified": 1780566704
+  },
+  {
+    "idx": 77,
+    "ts": 1780566703541,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780566703541-tof-1780566703541-384.png",
+    "size": 3013,
+    "last_modified": 1780566704
+  },
+  {
+    "idx": 78,
+    "ts": 1780566703643,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780566703643-tof-1780566703643-385.png",
+    "size": 2748,
+    "last_modified": 1780566704
+  },
+  {
+    "idx": 79,
+    "ts": 1780566703738,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780566703738-tof-1780566703738-386.png",
+    "size": 2706,
+    "last_modified": 1780566704
+  },
+  {
+    "idx": 80,
+    "ts": 1780566703846,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780566703846-tof-1780566703846-387.png",
+    "size": 2713,
+    "last_modified": 1780566704
+  },
+  {
+    "idx": 81,
+    "ts": 1780566703946,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780566703946-tof-1780566703946-388.png",
+    "size": 2846,
+    "last_modified": 1780566704
+  },
+  {
+    "idx": 82,
+    "ts": 1780566704032,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780566704032-tof-1780566704032-389.png",
+    "size": 2861,
+    "last_modified": 1780566704
+  },
+  {
+    "idx": 83,
+    "ts": 1780566704154,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780566704154-tof-1780566704154-390.png",
+    "size": 3018,
+    "last_modified": 1780566704
+  },
+  {
+    "idx": 84,
+    "ts": 1780574451396,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780574451396-tof-1780574451396-667.png",
+    "size": 2664,
+    "last_modified": 1780574451
+  },
+  {
+    "idx": 85,
+    "ts": 1780574451611,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780574451611-tof-1780574451611-668.png",
+    "size": 2638,
+    "last_modified": 1780574451
+  },
+  {
+    "idx": 86,
+    "ts": 1780574451699,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780574451699-tof-1780574451699-669.png",
+    "size": 2633,
+    "last_modified": 1780574451
+  },
+  {
+    "idx": 87,
+    "ts": 1780574451800,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780574451800-tof-1780574451800-670.png",
+    "size": 2742,
+    "last_modified": 1780574452
+  },
+  {
+    "idx": 88,
+    "ts": 1780574451903,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780574451903-tof-1780574451903-671.png",
+    "size": 2655,
+    "last_modified": 1780574452
+  },
+  {
+    "idx": 89,
+    "ts": 1780574452100,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780574452100-tof-1780574452100-672.png",
+    "size": 2656,
+    "last_modified": 1780574452
+  },
+  {
+    "idx": 90,
+    "ts": 1780574452221,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780574452221-tof-1780574452221-673.png",
+    "size": 2704,
+    "last_modified": 1780574452
+  },
+  {
+    "idx": 91,
+    "ts": 1780574452300,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780574452300-tof-1780574452300-674.png",
+    "size": 2707,
+    "last_modified": 1780574452
+  },
+  {
+    "idx": 92,
+    "ts": 1780574452400,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780574452400-tof-1780574452400-675.png",
+    "size": 2658,
+    "last_modified": 1780574452
+  },
+  {
+    "idx": 93,
+    "ts": 1780574452509,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780574452509-tof-1780574452509-676.png",
+    "size": 2689,
+    "last_modified": 1780574453
+  },
+  {
+    "idx": 94,
+    "ts": 1780574452613,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780574452613-tof-1780574452613-677.png",
+    "size": 2619,
+    "last_modified": 1780574453
+  },
+  {
+    "idx": 95,
+    "ts": 1780574452702,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780574452702-tof-1780574452702-678.png",
+    "size": 2606,
+    "last_modified": 1780574453
+  },
+  {
+    "idx": 96,
+    "ts": 1780574916486,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780574916486-tof-1780574916486-4667.png",
+    "size": 2720,
+    "last_modified": 1780574917
+  },
+  {
+    "idx": 97,
+    "ts": 1780574916674,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780574916674-tof-1780574916674-4668.png",
+    "size": 2732,
+    "last_modified": 1780574917
+  },
+  {
+    "idx": 98,
+    "ts": 1780574916811,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780574916811-tof-1780574916811-4669.png",
+    "size": 2765,
+    "last_modified": 1780574917
+  },
+  {
+    "idx": 99,
+    "ts": 1780574916900,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780574916900-tof-1780574916900-4670.png",
+    "size": 2751,
+    "last_modified": 1780574917
+  },
+  {
+    "idx": 100,
+    "ts": 1780574916981,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780574916981-tof-1780574916981-4671.png",
+    "size": 2721,
+    "last_modified": 1780574918
+  },
+  {
+    "idx": 101,
+    "ts": 1780574917094,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780574917094-tof-1780574917094-4672.png",
+    "size": 2728,
+    "last_modified": 1780574918
+  },
+  {
+    "idx": 102,
+    "ts": 1780574917184,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780574917184-tof-1780574917184-4673.png",
+    "size": 2690,
+    "last_modified": 1780574918
+  },
+  {
+    "idx": 103,
+    "ts": 1780574917284,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780574917284-tof-1780574917284-4674.png",
+    "size": 2814,
+    "last_modified": 1780574918
+  },
+  {
+    "idx": 104,
+    "ts": 1780574917376,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780574917376-tof-1780574917376-4675.png",
+    "size": 2742,
+    "last_modified": 1780574918
+  },
+  {
+    "idx": 105,
+    "ts": 1780574917462,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780574917462-tof-1780574917462-4676.png",
+    "size": 2740,
+    "last_modified": 1780574918
+  },
+  {
+    "idx": 106,
+    "ts": 1780574917588,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780574917588-tof-1780574917588-4677.png",
+    "size": 2705,
+    "last_modified": 1780574918
+  },
+  {
+    "idx": 107,
+    "ts": 1780574917700,
+    "key": "care-sense-device/frames/device-003/2026/06/04/1780574917700-tof-1780574917700-4678.png",
+    "size": 2720,
+    "last_modified": 1780574918
+  }
+]

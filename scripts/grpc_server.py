@@ -119,11 +119,17 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         stateless: bool = False,
         pose_only: bool = False,
         pose_validate_seg: bool = True,
+        pose_fallback: bool = True,
         model_path: str | None = None,
         pose_model_path: str | None = None,
+        seg_conf: float | None = None,
         pose_conf: float | None = None,
         pose_kpt_conf: float | None = None,
+        pose_gate_kpt_conf: float | None = None,
         pose_kpt_min_points: int = 4,
+        mask_threshold: float = 0.5,
+        contour_new_conf: float | None = None,
+        contour_existing_conf: float | None = None,
         device: str | None = None,
         render_workers: int = 1,
         decode_workers: int = 1,
@@ -190,11 +196,17 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
                     stateless=bool(stateless),
                     pose_only=bool(pose_only),
                     pose_validate_seg=bool(pose_validate_seg),
+                    pose_fallback=bool(pose_fallback),
                     model_path=Path(model_path) if model_path else None,
                     pose_model_path=Path(pose_model_path) if pose_model_path else None,
+                    seg_conf_threshold=seg_conf,
                     pose_conf_threshold=pose_conf,
                     pose_kpt_conf_threshold=pose_kpt_conf,
+                    pose_gate_kpt_conf_threshold=pose_gate_kpt_conf,
                     pose_kpt_min_points=pose_kpt_min_points,
+                    mask_threshold=mask_threshold,
+                    contour_new_track_conf_threshold=contour_new_conf,
+                    contour_existing_track_conf_threshold=contour_existing_conf,
                     device=device,
                     render_workers=render_workers,
                     decode_workers=decode_workers,
@@ -525,11 +537,17 @@ def serve(
     stateless: bool = False,
     pose_only: bool = False,
     pose_validate_seg: bool = True,
+    pose_fallback: bool = True,
     model_path: str | None = None,
     pose_model_path: str | None = None,
+    seg_conf: float | None = None,
     pose_conf: float | None = None,
     pose_kpt_conf: float | None = None,
+    pose_gate_kpt_conf: float | None = None,
     pose_kpt_min_points: int = 4,
+    mask_threshold: float = 0.5,
+    contour_new_conf: float | None = None,
+    contour_existing_conf: float | None = None,
     device: str | None = None,
     render_workers: int = 1,
     decode_workers: int = 1,
@@ -559,11 +577,17 @@ def serve(
             stateless=stateless,
             pose_only=pose_only,
             pose_validate_seg=pose_validate_seg,
+            pose_fallback=pose_fallback,
             model_path=model_path,
             pose_model_path=pose_model_path,
+            seg_conf=seg_conf,
             pose_conf=pose_conf,
             pose_kpt_conf=pose_kpt_conf,
+            pose_gate_kpt_conf=pose_gate_kpt_conf,
             pose_kpt_min_points=pose_kpt_min_points,
+            mask_threshold=mask_threshold,
+            contour_new_conf=contour_new_conf,
+            contour_existing_conf=contour_existing_conf,
             device=device,
             render_workers=render_workers,
             decode_workers=decode_workers,
@@ -649,11 +673,21 @@ def main():
         action='store_true',
         help='disable pose-based gating for skeleton drawing (contours use segmentation plus shape rules)',
     )
+    parser.add_argument(
+        '--no-pose-fallback',
+        action='store_true',
+        help='disable pose fallback when segmentation misses but pose keypoints are confident',
+    )
     parser.add_argument('--model-path', default=None, help='override seg model path')
     parser.add_argument('--pose-model-path', default=None, help='override pose model path')
-    parser.add_argument('--pose-conf', default=None, type=float, help='override pose confidence threshold (pose-only)')
-    parser.add_argument('--pose-kpt-conf', default=None, type=float, help='override pose keypoint conf threshold (pose-only)')
-    parser.add_argument('--pose-kpt-min-points', default=4, type=int, help='min confident keypoints to count one person (pose-only)')
+    parser.add_argument('--seg-conf', default=None, type=float, help='override segmentation confidence threshold')
+    parser.add_argument('--pose-conf', default=None, type=float, help='override pose confidence threshold')
+    parser.add_argument('--pose-kpt-conf', default=None, type=float, help='override pose keypoint conf threshold for pose-only person counting')
+    parser.add_argument('--pose-gate-kpt-conf', default=None, type=float, help='override pose keypoint threshold used to validate segmentation tracks')
+    parser.add_argument('--pose-kpt-min-points', default=4, type=int, help='min confident keypoints to count one person in pose-only mode')
+    parser.add_argument('--mask-threshold', default=0.5, type=float, help='mask binarization threshold for contours')
+    parser.add_argument('--contour-new-conf', default=None, type=float, help='confidence threshold for accepting a new contour track')
+    parser.add_argument('--contour-existing-conf', default=None, type=float, help='confidence threshold for keeping a consistent existing contour track')
     parser.add_argument('--device', default=None, help='model inference device, for example cuda:0 or cpu')
     parser.add_argument(
         '--render-workers',
@@ -774,11 +808,17 @@ def main():
         stateless=args.stateless,
         pose_only=args.pose_only,
         pose_validate_seg=not args.no_pose_validate,
+        pose_fallback=not args.no_pose_fallback,
         model_path=args.model_path,
         pose_model_path=args.pose_model_path,
+        seg_conf=args.seg_conf,
         pose_conf=args.pose_conf,
         pose_kpt_conf=args.pose_kpt_conf,
+        pose_gate_kpt_conf=args.pose_gate_kpt_conf,
         pose_kpt_min_points=args.pose_kpt_min_points,
+        mask_threshold=args.mask_threshold,
+        contour_new_conf=args.contour_new_conf,
+        contour_existing_conf=args.contour_existing_conf,
         device=args.device,
         render_workers=args.render_workers,
         decode_workers=args.decode_workers,

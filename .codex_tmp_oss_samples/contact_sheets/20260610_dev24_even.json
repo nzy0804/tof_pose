@@ -1,0 +1,362 @@
+[
+  {
+    "idx": 0,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094434707-tof-1781094434707-2.png",
+    "size": 1009,
+    "last_modified": 1781094436
+  },
+  {
+    "idx": 1,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094437108-tof-1781094437108-26.png",
+    "size": 2067,
+    "last_modified": 1781094437
+  },
+  {
+    "idx": 2,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094439700-tof-1781094439700-50.png",
+    "size": 2248,
+    "last_modified": 1781094439
+  },
+  {
+    "idx": 3,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094442200-tof-1781094442200-74.png",
+    "size": 1658,
+    "last_modified": 1781094442
+  },
+  {
+    "idx": 4,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094445111-tof-1781094445111-98.png",
+    "size": 1671,
+    "last_modified": 1781094445
+  },
+  {
+    "idx": 5,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094447699-tof-1781094447699-122.png",
+    "size": 1590,
+    "last_modified": 1781094448
+  },
+  {
+    "idx": 6,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094450400-tof-1781094450400-145.png",
+    "size": 1513,
+    "last_modified": 1781094451
+  },
+  {
+    "idx": 7,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094453012-tof-1781094453012-169.png",
+    "size": 1604,
+    "last_modified": 1781094453
+  },
+  {
+    "idx": 8,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094455496-tof-1781094455496-193.png",
+    "size": 2458,
+    "last_modified": 1781094456
+  },
+  {
+    "idx": 9,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094457897-tof-1781094457897-217.png",
+    "size": 2493,
+    "last_modified": 1781094458
+  },
+  {
+    "idx": 10,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094460699-tof-1781094460699-241.png",
+    "size": 2471,
+    "last_modified": 1781094461
+  },
+  {
+    "idx": 11,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094463198-tof-1781094463198-265.png",
+    "size": 2463,
+    "last_modified": 1781094463
+  },
+  {
+    "idx": 12,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094465898-tof-1781094465898-289.png",
+    "size": 2616,
+    "last_modified": 1781094466
+  },
+  {
+    "idx": 13,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094468318-tof-1781094468318-313.png",
+    "size": 2470,
+    "last_modified": 1781094469
+  },
+  {
+    "idx": 14,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094470798-tof-1781094470798-337.png",
+    "size": 2580,
+    "last_modified": 1781094471
+  },
+  {
+    "idx": 15,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094473407-tof-1781094473407-361.png",
+    "size": 2456,
+    "last_modified": 1781094474
+  },
+  {
+    "idx": 16,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094475998-tof-1781094475998-385.png",
+    "size": 2422,
+    "last_modified": 1781094476
+  },
+  {
+    "idx": 17,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094478804-tof-1781094478804-409.png",
+    "size": 2545,
+    "last_modified": 1781094479
+  },
+  {
+    "idx": 18,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094481397-tof-1781094481397-432.png",
+    "size": 2513,
+    "last_modified": 1781094482
+  },
+  {
+    "idx": 19,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094483894-tof-1781094483894-456.png",
+    "size": 2335,
+    "last_modified": 1781094484
+  },
+  {
+    "idx": 20,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094486503-tof-1781094486503-480.png",
+    "size": 2238,
+    "last_modified": 1781094486
+  },
+  {
+    "idx": 21,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094489294-tof-1781094489294-504.png",
+    "size": 1481,
+    "last_modified": 1781094489
+  },
+  {
+    "idx": 22,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094491896-tof-1781094491896-528.png",
+    "size": 1666,
+    "last_modified": 1781094492
+  },
+  {
+    "idx": 23,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094494715-tof-1781094494715-552.png",
+    "size": 1561,
+    "last_modified": 1781094495
+  },
+  {
+    "idx": 24,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094497294-tof-1781094497294-576.png",
+    "size": 1521,
+    "last_modified": 1781094497
+  },
+  {
+    "idx": 25,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094499903-tof-1781094499903-600.png",
+    "size": 1783,
+    "last_modified": 1781094500
+  },
+  {
+    "idx": 26,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094502494-tof-1781094502494-624.png",
+    "size": 1206,
+    "last_modified": 1781094503
+  },
+  {
+    "idx": 27,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094505095-tof-1781094505095-648.png",
+    "size": 1894,
+    "last_modified": 1781094505
+  },
+  {
+    "idx": 28,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094507704-tof-1781094507704-672.png",
+    "size": 2008,
+    "last_modified": 1781094508
+  },
+  {
+    "idx": 29,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094510295-tof-1781094510295-696.png",
+    "size": 2164,
+    "last_modified": 1781094510
+  },
+  {
+    "idx": 30,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094512819-tof-1781094512819-719.png",
+    "size": 2488,
+    "last_modified": 1781094513
+  },
+  {
+    "idx": 31,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094515813-tof-1781094515813-743.png",
+    "size": 2577,
+    "last_modified": 1781094516
+  },
+  {
+    "idx": 32,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094518295-tof-1781094518295-767.png",
+    "size": 2427,
+    "last_modified": 1781094518
+  },
+  {
+    "idx": 33,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094520997-tof-1781094520997-791.png",
+    "size": 1945,
+    "last_modified": 1781094522
+  },
+  {
+    "idx": 34,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094523599-tof-1781094523599-815.png",
+    "size": 1794,
+    "last_modified": 1781094524
+  },
+  {
+    "idx": 35,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094526308-tof-1781094526308-839.png",
+    "size": 1982,
+    "last_modified": 1781094526
+  },
+  {
+    "idx": 36,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094528913-tof-1781094528913-863.png",
+    "size": 2027,
+    "last_modified": 1781094529
+  },
+  {
+    "idx": 37,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094531503-tof-1781094531503-887.png",
+    "size": 2057,
+    "last_modified": 1781094531
+  },
+  {
+    "idx": 38,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094534139-tof-1781094534139-911.png",
+    "size": 1026,
+    "last_modified": 1781094535
+  },
+  {
+    "idx": 39,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094536905-tof-1781094536905-935.png",
+    "size": 1070,
+    "last_modified": 1781094537
+  },
+  {
+    "idx": 40,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094539506-tof-1781094539506-959.png",
+    "size": 1157,
+    "last_modified": 1781094539
+  },
+  {
+    "idx": 41,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094542107-tof-1781094542107-983.png",
+    "size": 1135,
+    "last_modified": 1781094542
+  },
+  {
+    "idx": 42,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094544508-tof-1781094544508-1006.png",
+    "size": 1081,
+    "last_modified": 1781094545
+  },
+  {
+    "idx": 43,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094546909-tof-1781094546909-1030.png",
+    "size": 2103,
+    "last_modified": 1781094547
+  },
+  {
+    "idx": 44,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094549431-tof-1781094549431-1054.png",
+    "size": 1824,
+    "last_modified": 1781094550
+  },
+  {
+    "idx": 45,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094552028-tof-1781094552028-1078.png",
+    "size": 2088,
+    "last_modified": 1781094552
+  },
+  {
+    "idx": 46,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094554827-tof-1781094554827-1102.png",
+    "size": 1970,
+    "last_modified": 1781094555
+  },
+  {
+    "idx": 47,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094557313-tof-1781094557313-1126.png",
+    "size": 1899,
+    "last_modified": 1781094557
+  },
+  {
+    "idx": 48,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094559814-tof-1781094559814-1150.png",
+    "size": 2097,
+    "last_modified": 1781094560
+  },
+  {
+    "idx": 49,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094562714-tof-1781094562714-1174.png",
+    "size": 2009,
+    "last_modified": 1781094563
+  },
+  {
+    "idx": 50,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094565616-tof-1781094565616-1198.png",
+    "size": 2117,
+    "last_modified": 1781094565
+  },
+  {
+    "idx": 51,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094568214-tof-1781094568214-1222.png",
+    "size": 2196,
+    "last_modified": 1781094569
+  },
+  {
+    "idx": 52,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094570636-tof-1781094570636-1246.png",
+    "size": 2106,
+    "last_modified": 1781094571
+  },
+  {
+    "idx": 53,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094573015-tof-1781094573015-1270.png",
+    "size": 1805,
+    "last_modified": 1781094573
+  },
+  {
+    "idx": 54,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094575318-tof-1781094575318-1293.png",
+    "size": 2313,
+    "last_modified": 1781094576
+  },
+  {
+    "idx": 55,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094577917-tof-1781094577917-1317.png",
+    "size": 2152,
+    "last_modified": 1781094578
+  },
+  {
+    "idx": 56,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094580317-tof-1781094580317-1341.png",
+    "size": 2075,
+    "last_modified": 1781094581
+  },
+  {
+    "idx": 57,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094582727-tof-1781094582727-1365.png",
+    "size": 2149,
+    "last_modified": 1781094583
+  },
+  {
+    "idx": 58,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094585419-tof-1781094585419-1389.png",
+    "size": 1779,
+    "last_modified": 1781094585
+  },
+  {
+    "idx": 59,
+    "key": "care-sense-device/frames/dev-24bf425e-fef8-428b-b462-cd8c975aa791/2026/06/10/1781094588034-tof-1781094588034-1413.png",
+    "size": 2157,
+    "last_modified": 1781094588
+  }
+]

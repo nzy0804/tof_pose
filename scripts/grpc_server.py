@@ -128,6 +128,8 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         pose_gate_kpt_conf: float | None = None,
         pose_kpt_min_points: int = 4,
         mask_threshold: float = 0.5,
+        mask_min_area_ratio: float | None = None,
+        mask_max_area_ratio: float | None = None,
         contour_new_conf: float | None = None,
         contour_existing_conf: float | None = None,
         device: str | None = None,
@@ -205,6 +207,8 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
                     pose_gate_kpt_conf_threshold=pose_gate_kpt_conf,
                     pose_kpt_min_points=pose_kpt_min_points,
                     mask_threshold=mask_threshold,
+                    mask_min_area_ratio=mask_min_area_ratio,
+                    mask_max_area_ratio=mask_max_area_ratio,
                     contour_new_track_conf_threshold=contour_new_conf,
                     contour_existing_track_conf_threshold=contour_existing_conf,
                     device=device,
@@ -546,6 +550,8 @@ def serve(
     pose_gate_kpt_conf: float | None = None,
     pose_kpt_min_points: int = 4,
     mask_threshold: float = 0.5,
+    mask_min_area_ratio: float | None = None,
+    mask_max_area_ratio: float | None = None,
     contour_new_conf: float | None = None,
     contour_existing_conf: float | None = None,
     device: str | None = None,
@@ -586,6 +592,8 @@ def serve(
             pose_gate_kpt_conf=pose_gate_kpt_conf,
             pose_kpt_min_points=pose_kpt_min_points,
             mask_threshold=mask_threshold,
+            mask_min_area_ratio=mask_min_area_ratio,
+            mask_max_area_ratio=mask_max_area_ratio,
             contour_new_conf=contour_new_conf,
             contour_existing_conf=contour_existing_conf,
             device=device,
@@ -686,6 +694,8 @@ def main():
     parser.add_argument('--pose-gate-kpt-conf', default=None, type=float, help='override pose keypoint threshold used to validate segmentation tracks')
     parser.add_argument('--pose-kpt-min-points', default=4, type=int, help='min confident keypoints to count one person in pose-only mode')
     parser.add_argument('--mask-threshold', default=0.5, type=float, help='mask binarization threshold for contours')
+    parser.add_argument('--mask-min-area-ratio', default=None, type=float, help='minimum mask area ratio accepted for contours')
+    parser.add_argument('--mask-max-area-ratio', default=None, type=float, help='maximum mask area ratio accepted for contours')
     parser.add_argument('--contour-new-conf', default=None, type=float, help='confidence threshold for accepting a new contour track')
     parser.add_argument('--contour-existing-conf', default=None, type=float, help='confidence threshold for keeping a consistent existing contour track')
     parser.add_argument('--device', default=None, help='model inference device, for example cuda:0 or cpu')
@@ -817,6 +827,8 @@ def main():
         pose_gate_kpt_conf=args.pose_gate_kpt_conf,
         pose_kpt_min_points=args.pose_kpt_min_points,
         mask_threshold=args.mask_threshold,
+        mask_min_area_ratio=args.mask_min_area_ratio,
+        mask_max_area_ratio=args.mask_max_area_ratio,
         contour_new_conf=args.contour_new_conf,
         contour_existing_conf=args.contour_existing_conf,
         device=args.device,

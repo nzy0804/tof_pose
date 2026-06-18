@@ -141,6 +141,13 @@ def _mean_or_zero(values: list[float]) -> float:
     return float(sum(values) / len(values))
 
 
+def _analysis_payload(analyzed: dict) -> dict:
+    analysis = analyzed.get("analysis") if isinstance(analyzed, dict) else None
+    if isinstance(analysis, dict):
+        return analysis
+    return analyzed if isinstance(analyzed, dict) else {}
+
+
 def _cpu_worker_init() -> None:
     try:
         cv2.setNumThreads(1)
@@ -562,6 +569,8 @@ class RealtimePoseEngine:
         pose_gate_kpt_conf_threshold: float | None = None,
         pose_kpt_min_points: int = 4,
         mask_threshold: float = 0.5,
+        mask_min_area_ratio: float | None = None,
+        mask_max_area_ratio: float | None = None,
         contour_new_track_conf_threshold: float | None = None,
         contour_existing_track_conf_threshold: float | None = None,
         device: str | None = None,
@@ -628,6 +637,20 @@ class RealtimePoseEngine:
         )
         self._pose_kpt_min_points = int(pose_kpt_min_points)
         self._mask_threshold = min(1.0, max(0.0, float(mask_threshold)))
+        self._mask_min_area_ratio = min(
+            1.0,
+            max(
+                0.0,
+                float(mask_min_area_ratio) if mask_min_area_ratio is not None else float(MASK_MIN_AREA_RATIO),
+            ),
+        )
+        self._mask_max_area_ratio = min(
+            1.0,
+            max(
+                self._mask_min_area_ratio,
+                float(mask_max_area_ratio) if mask_max_area_ratio is not None else float(MASK_MAX_AREA_RATIO),
+            ),
+        )
         self._contour_new_track_conf_threshold = (
             float(contour_new_track_conf_threshold)
             if contour_new_track_conf_threshold is not None
@@ -718,7 +741,7 @@ class RealtimePoseEngine:
             raise ValueError("mask must be single-channel")
         current = (mask > 0).astype(np.uint8)
         current_area = int(np.count_nonzero(current))
-        max_area = int(current.size * float(MASK_MAX_AREA_RATIO))
+        max_area = int(current.size * float(self._mask_max_area_ratio))
         state = self._mask_jump_state.get(int(track_id))
 
         if state is None:
@@ -779,9 +802,9 @@ class RealtimePoseEngine:
 
         mask_area = int(np.count_nonzero(mask > 0))
         image_area = max(1, int(width) * int(height))
-        if mask_area < int(image_area * float(MASK_MIN_AREA_RATIO)):
+        if mask_area < int(image_area * float(self._mask_min_area_ratio)):
             return "mask_area_small"
-        if mask_area > int(image_area * float(MASK_MAX_AREA_RATIO)):
+        if mask_area > int(image_area * float(self._mask_max_area_ratio)):
             return "mask_area_large"
 
         x1, y1, x2, y2 = [float(v) for v in box[:4]]
@@ -1031,6 +1054,20 @@ class RealtimePoseEngine:
         pose_to_track: dict[int, int] = {}
         validated_track_ids: set[int] = set()
         contour_reject_reasons: list[str] = []
+        contour_debug_summary: list[str] = []
+
+        def add_contour_debug(*parts: object) -> None:
+            if len(contour_debug_summary) >= 8:
+                return
+            tokens = []
+            for part in parts:
+                if part is None:
+                    continue
+                text = str(part).strip().replace(" ", "_")
+                if text:
+                    tokens.append(text)
+            if tokens:
+                contour_debug_summary.append("/".join(tokens))
 
         if result.boxes is not None and len(result.boxes) > 0 and result.masks is not None:
             boxes_xyxy = result.boxes.xyxy.cpu().numpy()
@@ -1047,6 +1084,13 @@ class RealtimePoseEngine:
             masks_data = result.masks.data.cpu().numpy()
 
             match_count = min(len(boxes_xyxy), len(masks_data), len(track_ids), len(conf_scores))
+            add_contour_debug(
+                f"counts:b{len(boxes_xyxy)}",
+                f"m{len(masks_data)}",
+                f"t{len(track_ids)}",
+                f"c{len(conf_scores)}",
+                f"match{match_count}",
+            )
             if match_count <= 0:
                 contour_reject_reasons.append("candidate_mismatch")
             seg_boxes_for_match = [boxes_xyxy[idx].copy() for idx in range(match_count)]
@@ -1135,23 +1179,43 @@ class RealtimePoseEngine:
                 track_id = int(track_ids[idx])
                 track_color = _track_color(track_id)
                 person_conf = float(conf_scores[idx])
+                candidate_debug = [f"i{idx}", f"tid{track_id}", f"conf{person_conf:.3f}"]
                 conf_reject_reason = self._contour_conf_reject_reason(track_id, box, person_conf)
                 if conf_reject_reason is not None:
                     contour_reject_reasons.append(conf_reject_reason)
+                    add_contour_debug(*candidate_debug, f"reject:{conf_reject_reason}")
                     continue
                 mask = (masks_data[idx] > self._mask_threshold).astype(np.uint8)
                 if mask.shape[:2] != (height, width):
                     mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+                mask_area = int(np.count_nonzero(mask > 0))
+                candidate_debug.append(f"mask{mask_area}")
                 mask, mask_reject_reason = self._guard_mask_jump_with_reason(track_id, mask)
                 if mask is None:
                     contour_reject_reasons.append(mask_reject_reason or "mask_rejected")
+                    add_contour_debug(*candidate_debug, f"guard:{mask_reject_reason or 'mask_rejected'}")
                     continue
+                guarded_area = int(np.count_nonzero(mask > 0))
+                if guarded_area != mask_area:
+                    candidate_debug.append(f"guarded{guarded_area}")
                 shape_reject_reason = self._contour_shape_reject_reason(box, mask, person_conf, width, height)
                 if shape_reject_reason is not None:
                     contour_reject_reasons.append(shape_reject_reason)
+                    add_contour_debug(*candidate_debug, f"shape:{shape_reject_reason}")
                     continue
                 # Use non-equalized depth values for distance estimation.
                 estimate = estimate_person_distance_from_mask(depth_raw, box, mask)
+                contour_area = 0.0
+                if estimate.contour is not None:
+                    contour_area = float(cv2.contourArea(estimate.contour))
+                estimate_reason = getattr(estimate, "reason", None) or "ok"
+                add_contour_debug(
+                    *candidate_debug,
+                    f"estimate:{estimate_reason}",
+                    f"contour{contour_area:.1f}",
+                    f"depthpx{int(estimate.valid_pixels)}",
+                    "kept",
+                )
                 person_count += 1
 
                 if estimate.distance is None:
@@ -1185,6 +1249,7 @@ class RealtimePoseEngine:
                 self._mask_jump_state.pop(int(tid), None)
         elif result.boxes is not None and len(result.boxes) > 0 and result.masks is None:
             contour_reject_reasons.append("no_mask")
+            add_contour_debug(f"counts:b{len(result.boxes)}", "m0", "no_mask")
 
         self._prune_contour_track_state()
 
@@ -1223,6 +1288,7 @@ class RealtimePoseEngine:
             "pose_draw_indices": [],
             "pose_fallback_indices": pose_fallback_indices,
             "contour_reject_reasons": contour_reject_reasons,
+            "contour_debug_summary": contour_debug_summary,
             "width": width,
             "height": height,
         }
@@ -1621,9 +1687,11 @@ class RealtimePoseEngine:
         final_person_counts: list[int] = []
         post_contour_counts: list[int] = []
         post_contour_reject_reasons: list[str] = []
+        post_contour_debug: list[str] = []
         pose_fallback_counts: list[int] = []
         for input_index in range(input_count):
-            analyzed = current_analyzed_by_input.get(input_index) or {}
+            analyzed_wrapper = current_analyzed_by_input.get(input_index) or {}
+            analyzed = _analysis_payload(analyzed_wrapper)
             post_contour_count = len(analyzed.get("records") or [])
             reject_reasons = [str(reason) for reason in (analyzed.get("contour_reject_reasons") or [])]
             raw_hint = contour_raw_hints[input_index] if input_index < len(contour_raw_hints) else ""
@@ -1640,23 +1708,29 @@ class RealtimePoseEngine:
                 post_contour_reject_reasons.append("raw_candidate_unhandled")
             else:
                 post_contour_reject_reasons.append("no_candidate")
-            final_person_counts.append(int(analyzed.get("person_count", 0)))
+            debug_summary = [str(item) for item in (analyzed.get("contour_debug_summary") or [])]
+            post_contour_debug.append("|".join(debug_summary) if debug_summary else "-")
+            final_person_counts.append(int(analyzed_wrapper.get("person_count", analyzed.get("person_count", 0))))
             pose_fallback_counts.append(len(analyzed.get("pose_fallback_indices") or []))
 
         LOGGER.info(
             (
                 "Infer model confidence: instance=%s inputs=%d "
-                "contour_threshold=%.3f contour_counts=%s contour_conf_max=%s "
+                "contour_threshold=%.3f mask_threshold=%.3f mask_area_ratio=[%.3f,%.3f] "
+                "contour_counts=%s contour_conf_max=%s "
                 "contour_conf_avg=%.3f contour_conf_peak=%.3f "
                 "pose_threshold=%.3f pose_counts=%s pose_conf_max=%s "
                 "pose_conf_avg=%.3f pose_conf_peak=%.3f "
                 "pose_gate_kpt_threshold=%.3f pose_kpt_gate_points_max=%s "
                 "post_contour_counts=%s post_contour_reject_reasons=%s "
-                "final_person_counts=%s pose_fallback_counts=%s"
+                "post_contour_debug=%s final_person_counts=%s pose_fallback_counts=%s"
             ),
             self._instance_name,
             input_count,
             self._seg_conf_threshold,
+            self._mask_threshold,
+            self._mask_min_area_ratio,
+            self._mask_max_area_ratio,
             _format_number_list(contour_counts),
             _format_number_list(contour_conf_max),
             _mean_or_zero(contour_conf_values),
@@ -1670,6 +1744,7 @@ class RealtimePoseEngine:
             _format_number_list(pose_kpt_gate_points_max),
             _format_number_list(post_contour_counts),
             _format_text_list(post_contour_reject_reasons),
+            _format_text_list(post_contour_debug),
             _format_number_list(final_person_counts),
             _format_number_list(pose_fallback_counts),
         )

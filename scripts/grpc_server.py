@@ -5,7 +5,6 @@ Usage:
   python scripts/grpc_server.py --host 0.0.0.0 --port 50052
 """
 import argparse
-import hashlib
 import logging
 import multiprocessing
 import threading
@@ -141,6 +140,7 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         cpu_worker_mode: str = CPU_WORKER_MODE_THREAD,
         cpu_process_start_method: str = "auto",
         model_instances: int = 1,
+        parallel_models: bool = True,
         warmup_models: bool = True,
         warmup_batch_size: int = 10,
         device_binding_ttl_sec: float = 120.0,
@@ -220,6 +220,7 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
                     cpu_worker_mode=cpu_worker_mode,
                     cpu_process_start_method=cpu_process_start_method,
                     instance_name=f"model-{idx}",
+                    parallel_models=parallel_models,
                 )
             )
         if warmup_models:
@@ -249,9 +250,11 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
                 self._engine_device_counts,
             )
 
-    def _stable_engine_index(self, key: str) -> int:
-        digest = hashlib.blake2s(key.encode("utf-8"), digest_size=8).digest()
-        return int.from_bytes(digest, "big") % self._engine_count
+    def _least_bound_engine_index(self) -> int:
+        return min(
+            range(self._engine_count),
+            key=lambda idx: (self._engine_device_counts[idx], self._engine_inflight[idx], idx),
+        )
 
     def _acquire_engine(self, device_id: str, batch_id: str) -> tuple[int, RealtimePoseEngine, str]:
         normalized_device_id = str(device_id or "").strip()
@@ -268,7 +271,7 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
             index = self._device_bindings.get(key)
             if index is None:
                 if route_by_device:
-                    index = self._stable_engine_index(key)
+                    index = self._least_bound_engine_index()
                 else:
                     index = min(
                         range(self._engine_count),
@@ -280,7 +283,7 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
                     "Binding AI stream key=%s to model-%d (routing=%s, engine_device_counts=%s)",
                     key,
                     index,
-                    "device_id" if route_by_device else "fallback",
+                    "device_id_balanced" if route_by_device else "fallback",
                     self._engine_device_counts,
                 )
             self._device_last_seen[key] = now
@@ -566,6 +569,7 @@ def serve(
     cpu_worker_mode: str = CPU_WORKER_MODE_THREAD,
     cpu_process_start_method: str = "auto",
     model_instances: int = 1,
+    parallel_models: bool = True,
     warmup_models: bool = True,
     warmup_batch_size: int = 10,
     device_binding_ttl_sec: float = 120.0,
@@ -608,6 +612,7 @@ def serve(
             cpu_worker_mode=cpu_worker_mode,
             cpu_process_start_method=cpu_process_start_method,
             model_instances=model_instances,
+            parallel_models=parallel_models,
             warmup_models=warmup_models,
             warmup_batch_size=warmup_batch_size,
             device_binding_ttl_sec=device_binding_ttl_sec,
@@ -647,11 +652,12 @@ def serve(
             model_instances,
         )
     logging.info(
-        'Starting gRPC server on %s (max_msg_mb=%d, max_workers=%d, model_instances=%d, cpu_worker_mode=%s, cpu_process_start_method=%s)',
+        'Starting gRPC server on %s (max_msg_mb=%d, max_workers=%d, model_instances=%d, parallel_models=%s, cpu_worker_mode=%s, cpu_process_start_method=%s)',
         bound_address,
         max_msg_mb,
         max_workers,
         model_instances,
+        "true" if parallel_models else "false",
         cpu_worker_mode,
         cpu_process_start_method,
     )
@@ -751,6 +757,11 @@ def main():
         help='number of AI model instances to keep in this process; device_id is routed sticky to one instance',
     )
     parser.add_argument(
+        '--serial-models',
+        action='store_true',
+        help='run seg and pose model calls serially instead of in parallel',
+    )
+    parser.add_argument(
         '--no-warmup',
         action='store_true',
         help='skip startup model warmup before binding the gRPC server',
@@ -843,6 +854,7 @@ def main():
         cpu_worker_mode=args.cpu_worker_mode,
         cpu_process_start_method=args.cpu_process_start_method,
         model_instances=args.model_instances,
+        parallel_models=not args.serial_models,
         warmup_models=not args.no_warmup,
         warmup_batch_size=args.warmup_batch_size,
         device_binding_ttl_sec=args.device_binding_ttl_sec,

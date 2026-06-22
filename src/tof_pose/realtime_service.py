@@ -25,13 +25,13 @@ CONF_THRESHOLD = 0.2
 TRACKER_CONFIG = "botsort.yaml"
 SEG_INFER_IMGSZ = 320
 POSE_INFER_IMGSZ = 320
-POSE_INFER_INTERVAL = 2
+POSE_INFER_INTERVAL = 1
 MASK_BLEND_ALPHA = 0.25
 DISPLAY_SIZE = (320, 320)
 DISPLAY_SCALE = 3
 
 MEDIAN_BLUR_K = 5
-CLAHE_CLIP_LIMIT = 2.0
+CLAHE_CLIP_LIMIT = 3.0
 CLAHE_TILE_GRID = (8, 8)
 
 DISPLAY_MODE_BOTH = "both"
@@ -46,13 +46,13 @@ TRACK_VOTE_WINDOW = 5
 TRACK_VOTE_MIN_POS = 2
 TRACK_TTL_FRAMES = 5
 TRACK_STATE_STALE_AFTER = 30
-CONTOUR_NEW_TRACK_CONF_THRESHOLD = 0.35
-CONTOUR_EXISTING_TRACK_CONF_THRESHOLD = 0.20
+CONTOUR_NEW_TRACK_CONF_THRESHOLD = 0.25
+CONTOUR_EXISTING_TRACK_CONF_THRESHOLD = 0.10
 CONTOUR_TRACK_STALE_AFTER = 30
-CONTOUR_EXISTING_MAX_CENTER_JUMP_PX = 80.0
+CONTOUR_EXISTING_MAX_CENTER_JUMP_PX = 100.0
 CONTOUR_EXISTING_MAX_AREA_CHANGE_RATIO = 2.5
 MASK_MIN_AREA_RATIO = 0.003
-MASK_MAX_AREA_RATIO = 0.5
+MASK_MAX_AREA_RATIO = 0.9
 MASK_AREA_JUMP_RATIO = 1.5
 MASK_JUMP_HOLD_FRAMES = 2
 PERSON_DISTANCE_CLOSE_GAP_RATIO = 0.15
@@ -891,6 +891,7 @@ class RealtimePoseEngine:
         cpu_worker_mode: str = CPU_WORKER_MODE_THREAD,
         cpu_process_start_method: str = "auto",
         instance_name: str | None = None,
+        parallel_models: bool = True,
     ) -> None:
         model_file = Path(model_path) if model_path else DEFAULT_MODEL_PATH
         pose_model_file = Path(pose_model_path) if pose_model_path else DEFAULT_POSE_MODEL_PATH
@@ -927,6 +928,12 @@ class RealtimePoseEngine:
         self._stateless = bool(stateless)
         self._persist_tracks = (not self._stateless) if persist_tracks is None else bool(persist_tracks)
         self._pose_only = bool(pose_only)
+        self._parallel_models = bool(parallel_models) and not self._pose_only
+        self._model_executor: ThreadPoolExecutor | None = (
+            ThreadPoolExecutor(max_workers=2, thread_name_prefix=f"{self._instance_name}-model")
+            if self._parallel_models
+            else None
+        )
         self._pose_validate_seg = bool(pose_validate_seg)
         self._pose_fallback = bool(pose_fallback)
         self._seg_conf_threshold = (
@@ -1938,7 +1945,7 @@ class RealtimePoseEngine:
             (
                 "Infer batch timing: inputs=%d outputs=%d model_inputs=%d "
                 "postprocess_inputs=%d instance=%s queue_wait_ms=%d decode_ms=%d model_prepare_ms=%d "
-                "model_infer_ms=%d seg_model_ms=%d pose_model_ms=%d "
+                "model_infer_ms=%d seg_model_ms=%d pose_model_ms=%d parallel_models=%s "
                 "postprocess_ms=%d interpolate_ms=%d render_ms=%d png_encode_ms=%d total_ms=%d "
                 "decode_workers=%d render_workers=%d cpu_worker_mode=%s cpu_process_start_method=%s "
                 "png_compression=%d output_format=%s jpeg_quality=%d device=%s"
@@ -1954,6 +1961,7 @@ class RealtimePoseEngine:
             int(timings.get("model_infer_ms", 0)),
             int(timings.get("seg_model_ms", 0)),
             int(timings.get("pose_model_ms", 0)),
+            "true" if timings.get("parallel_models", 0) else "false",
             int(timings.get("postprocess_ms", 0)),
             int(timings.get("interpolate_ms", 0)),
             int(timings.get("render_ms", 0)),
@@ -2159,7 +2167,7 @@ class RealtimePoseEngine:
             timings["model_prepare_ms"] = _elapsed_ms(model_prepare_start)
 
             if self._pose_only:
-                yolo_start = time.perf_counter()
+                model_start = time.perf_counter()
                 pose_results = self.pose_model.predict(
                     color_imgs,
                     conf=self._pose_conf_threshold,
@@ -2168,9 +2176,10 @@ class RealtimePoseEngine:
                     device=self._device,
                     verbose=False,
                 )
-                timings["pose_model_ms"] = _elapsed_ms(yolo_start)
+                timings["pose_model_ms"] = _elapsed_ms(model_start)
                 timings["seg_model_ms"] = 0
                 timings["model_infer_ms"] = int(timings["pose_model_ms"])
+                timings["parallel_models"] = 0
                 if len(pose_results) != len(source_frames):
                     raise RuntimeError(f"pose batch returned {len(pose_results)} results for {len(source_frames)} source frames")
 
@@ -2201,32 +2210,60 @@ class RealtimePoseEngine:
                 self._log_batch_timings(len(frames), len(output_frames), timings)
                 return results
 
-            yolo_start = time.perf_counter()
-            seg_yolo_start = time.perf_counter()
-            seg_results = self.seg_model.track(
-                color_imgs,
-                conf=self._seg_conf_threshold,
-                persist=self._persist_tracks,
-                tracker=TRACKER_CONFIG,
-                classes=[0],
-                imgsz=SEG_INFER_IMGSZ,
-                device=self._device,
-                verbose=False,
-            )
-            timings["seg_model_ms"] = _elapsed_ms(seg_yolo_start)
+            model_start = time.perf_counter()
+
+            def run_seg_model():
+                seg_model_start = time.perf_counter()
+                results = self.seg_model.track(
+                    color_imgs,
+                    conf=self._seg_conf_threshold,
+                    persist=self._persist_tracks,
+                    tracker=TRACKER_CONFIG,
+                    classes=[0],
+                    imgsz=SEG_INFER_IMGSZ,
+                    device=self._device,
+                    verbose=False,
+                )
+                return results, _elapsed_ms(seg_model_start)
+
+            def run_pose_model():
+                pose_model_start = time.perf_counter()
+                results = self.pose_model.predict(
+                    color_imgs,
+                    conf=self._pose_conf_threshold,
+                    classes=[0],
+                    imgsz=POSE_INFER_IMGSZ,
+                    device=self._device,
+                    verbose=False,
+                )
+                return results, _elapsed_ms(pose_model_start)
+
+            if self._parallel_models and self._model_executor is not None:
+                seg_future = self._model_executor.submit(run_seg_model)
+                pose_future = self._model_executor.submit(run_pose_model)
+                try:
+                    seg_results, timings["seg_model_ms"] = seg_future.result()
+                    pose_results, timings["pose_model_ms"] = pose_future.result()
+                except Exception:
+                    for future in (seg_future, pose_future):
+                        future.cancel()
+                    for future in (seg_future, pose_future):
+                        if future.cancelled():
+                            continue
+                        try:
+                            future.result()
+                        except Exception:
+                            pass
+                    raise
+                timings["parallel_models"] = 1
+            else:
+                seg_results, timings["seg_model_ms"] = run_seg_model()
+                pose_results, timings["pose_model_ms"] = run_pose_model()
+                timings["parallel_models"] = 0
+
+            timings["model_infer_ms"] = _elapsed_ms(model_start)
             if len(seg_results) != len(source_frames):
                 raise RuntimeError(f"seg batch returned {len(seg_results)} results for {len(source_frames)} source frames")
-            pose_yolo_start = time.perf_counter()
-            pose_results = self.pose_model.predict(
-                color_imgs,
-                conf=self._pose_conf_threshold,
-                classes=[0],
-                imgsz=POSE_INFER_IMGSZ,
-                device=self._device,
-                verbose=False,
-            )
-            timings["pose_model_ms"] = _elapsed_ms(pose_yolo_start)
-            timings["model_infer_ms"] = _elapsed_ms(yolo_start)
             if len(pose_results) != len(source_frames):
                 raise RuntimeError(f"pose batch returned {len(pose_results)} results for {len(source_frames)} source frames")
 

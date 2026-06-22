@@ -1,4 +1,4 @@
-syntax = "proto3";
+﻿syntax = "proto3";
 
 package ai;
 option go_package = "./proto;proto";
@@ -34,6 +34,9 @@ message InferResult {
   string skeleton_contour_image_format = 11 [deprecated = true];
   string pseudo_color_object_key = 12;
   string skeleton_contour_object_key = 13;
+  string person_status = 14;
+  string person_distance = 15;
+  string action_level = 16;
 }
 
 message InferRequest {

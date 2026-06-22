@@ -55,6 +55,16 @@ MASK_MIN_AREA_RATIO = 0.003
 MASK_MAX_AREA_RATIO = 0.5
 MASK_AREA_JUMP_RATIO = 1.5
 MASK_JUMP_HOLD_FRAMES = 2
+PERSON_DISTANCE_CLOSE_GAP_RATIO = 0.15
+PERSON_DISTANCE_CLOSE_CENTER_RATIO = 0.90
+QUALITATIVE_KPT_CONF_THRESHOLD = 0.35
+ACTION_KEYPOINT_SHIFT_HIGH_PX = 18.0
+ACTION_KEYPOINT_SHIFT_PEAK_HIGH_PX = 28.0
+ACTION_BOX_CENTER_SHIFT_HIGH_RATIO = 0.18
+ACTION_BOX_SCALE_SHIFT_HIGH_RATIO = 0.25
+ACTION_IR_MEAN_DIFF_HIGH = 10.0
+ACTION_IR_P95_DIFF_HIGH = 32.0
+QUALITATIVE_RESULT_KEYS = ("person_status", "person_distance", "action_level")
 
 TRACK_COLORS = [
     (40, 210, 255),
@@ -366,6 +376,302 @@ def _compute_pairwise_distances(
     return f"Pair Dist: {nearest[0]}-{nearest[1]} ~{nearest[2]:.1f}", pairs
 
 
+def _mean_keypoint_y(
+    kpt_xy: np.ndarray,
+    kpt_conf: np.ndarray,
+    indices: tuple[int, ...],
+    threshold: float,
+) -> float | None:
+    values: list[float] = []
+    for idx in indices:
+        if idx >= len(kpt_xy) or idx >= len(kpt_conf):
+            continue
+        if float(kpt_conf[idx]) < threshold:
+            continue
+        values.append(float(kpt_xy[idx][1]))
+    if not values:
+        return None
+    return float(np.mean(values))
+
+
+def _classify_person_pose_status(
+    kpt_xy: np.ndarray | None,
+    kpt_conf: np.ndarray | None,
+    threshold: float = QUALITATIVE_KPT_CONF_THRESHOLD,
+) -> str | None:
+    if kpt_xy is None or kpt_conf is None or len(kpt_xy) <= 0 or len(kpt_conf) <= 0:
+        return None
+
+    shoulder_y = _mean_keypoint_y(kpt_xy, kpt_conf, (5, 6), threshold)
+    hip_y = _mean_keypoint_y(kpt_xy, kpt_conf, (11, 12), threshold)
+    knee_y = _mean_keypoint_y(kpt_xy, kpt_conf, (13, 14), threshold)
+    ankle_y = _mean_keypoint_y(kpt_xy, kpt_conf, (15, 16), threshold)
+
+    if hip_y is not None and knee_y is not None and ankle_y is not None:
+        upper_leg = abs(knee_y - hip_y)
+        lower_leg = abs(ankle_y - knee_y)
+        leg_span = abs(ankle_y - hip_y)
+        if leg_span < 45.0 or min(upper_leg, lower_leg) < 18.0:
+            return "坐"
+        if upper_leg < max(12.0, lower_leg * 0.55):
+            return "坐"
+        return "站"
+
+    if shoulder_y is not None and hip_y is not None and knee_y is not None:
+        torso = abs(hip_y - shoulder_y)
+        upper_leg = abs(knee_y - hip_y)
+        if upper_leg < max(14.0, torso * 0.45):
+            return "坐"
+        return "站"
+
+    if shoulder_y is not None and hip_y is not None and abs(hip_y - shoulder_y) > 35.0:
+        return "站"
+    return None
+
+
+def _select_pose_indices_for_status(analysis: dict) -> list[int]:
+    kpt_conf_np = analysis.get("kpt_conf_np")
+    if kpt_conf_np is None:
+        return []
+
+    selected: list[int] = []
+
+    def add_index(value: object) -> None:
+        try:
+            idx = int(value)
+        except (TypeError, ValueError):
+            return
+        if idx < 0 or idx >= len(kpt_conf_np) or idx in selected:
+            return
+        selected.append(idx)
+
+    if bool(analysis.get("pose_only", False)):
+        for idx in analysis.get("pose_draw_indices") or []:
+            add_index(idx)
+    else:
+        validated_track_ids = {int(tid) for tid in (analysis.get("validated_track_ids") or set())}
+        pose_to_track = analysis.get("pose_to_track") or {}
+        for idx in sorted(pose_to_track):
+            if int(pose_to_track[idx]) in validated_track_ids:
+                add_index(idx)
+        for idx in analysis.get("pose_fallback_indices") or []:
+            add_index(idx)
+
+    if not selected:
+        for idx in range(len(kpt_conf_np)):
+            confident_points = int(np.sum(kpt_conf_np[idx] >= QUALITATIVE_KPT_CONF_THRESHOLD))
+            if confident_points >= 4:
+                add_index(idx)
+            if len(selected) >= 2:
+                break
+
+    return selected[:2]
+
+
+def _format_person_status(statuses: list[str], person_count: int) -> str:
+    if person_count <= 0:
+        return ""
+    normalized = [status for status in statuses[:2] if status in {"坐", "站"}]
+    if not normalized:
+        normalized = ["站"] * min(2, max(1, int(person_count)))
+    has_sit = "坐" in normalized
+    has_stand = "站" in normalized
+    if has_sit and has_stand:
+        return "1坐1站"
+    if has_sit:
+        return "1坐"
+    return "1站"
+
+
+def _compute_person_status(analysis: dict) -> str:
+    person_count = int(analysis.get("person_count", 0) or 0)
+    kpt_xy_np = analysis.get("kpt_xy_np")
+    kpt_conf_np = analysis.get("kpt_conf_np")
+    statuses: list[str] = []
+    if kpt_xy_np is not None and kpt_conf_np is not None:
+        for idx in _select_pose_indices_for_status(analysis):
+            if idx >= len(kpt_xy_np) or idx >= len(kpt_conf_np):
+                continue
+            status = _classify_person_pose_status(kpt_xy_np[idx], kpt_conf_np[idx])
+            if status is not None:
+                statuses.append(status)
+    return _format_person_status(statuses, person_count)
+
+
+def _normalize_box(box: object, width: int, height: int) -> np.ndarray | None:
+    if box is None:
+        return None
+    try:
+        arr = np.asarray(box, dtype=np.float32).reshape(-1)
+    except Exception:
+        return None
+    if arr.size < 4:
+        return None
+    x1, y1, x2, y2 = [float(v) for v in arr[:4]]
+    x1 = max(0.0, min(x1, float(width - 1)))
+    y1 = max(0.0, min(y1, float(height - 1)))
+    x2 = max(0.0, min(x2, float(width)))
+    y2 = max(0.0, min(y2, float(height)))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return np.array([x1, y1, x2, y2], dtype=np.float32)
+
+
+def _box_extent(box: np.ndarray) -> float:
+    return max(1.0, float(max(0.0, box[2] - box[0])), float(max(0.0, box[3] - box[1])))
+
+
+def _box_area(box: np.ndarray) -> float:
+    return max(1.0, float(max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])))
+
+
+def _append_unique_box(boxes: list[np.ndarray], box: np.ndarray) -> None:
+    for existing in boxes:
+        if _box_iou(existing, box) >= 0.80:
+            return
+    boxes.append(box)
+
+
+def _extract_person_boxes(analysis: dict, max_people: int = 2) -> list[np.ndarray]:
+    width = int(analysis.get("width", DISPLAY_SIZE[0]) or DISPLAY_SIZE[0])
+    height = int(analysis.get("height", DISPLAY_SIZE[1]) or DISPLAY_SIZE[1])
+    boxes: list[np.ndarray] = []
+
+    for record in analysis.get("records") or []:
+        box = _normalize_box(record.get("box"), width, height)
+        if box is not None:
+            _append_unique_box(boxes, box)
+        if len(boxes) >= max_people:
+            return boxes[:max_people]
+
+    pose_boxes = analysis.get("pose_boxes") or []
+    pose_indices = _select_pose_indices_for_status(analysis)
+    for idx in pose_indices:
+        if idx < 0 or idx >= len(pose_boxes):
+            continue
+        box = _normalize_box(pose_boxes[idx], width, height)
+        if box is not None:
+            _append_unique_box(boxes, box)
+        if len(boxes) >= max_people:
+            return boxes[:max_people]
+
+    for pose_box in pose_boxes:
+        box = _normalize_box(pose_box, width, height)
+        if box is not None:
+            _append_unique_box(boxes, box)
+        if len(boxes) >= max_people:
+            break
+    return boxes[:max_people]
+
+
+def _compute_person_distance(analysis: dict) -> str:
+    boxes = _extract_person_boxes(analysis, max_people=2)
+    if len(boxes) < 2:
+        return "far"
+
+    width = int(analysis.get("width", DISPLAY_SIZE[0]) or DISPLAY_SIZE[0])
+    for idx in range(len(boxes)):
+        box_a = boxes[idx]
+        for jdx in range(idx + 1, len(boxes)):
+            box_b = boxes[jdx]
+            horizontal_gap = max(0.0, max(float(box_a[0]), float(box_b[0])) - min(float(box_a[2]), float(box_b[2])))
+            vertical_gap = max(0.0, max(float(box_a[1]), float(box_b[1])) - min(float(box_a[3]), float(box_b[3])))
+            separated_gap = float(np.hypot(horizontal_gap, vertical_gap))
+            center_distance = _box_center_distance(box_a, box_b)
+            avg_extent = (_box_extent(box_a) + _box_extent(box_b)) * 0.5
+            close_gap_px = max(float(width) * PERSON_DISTANCE_CLOSE_GAP_RATIO, avg_extent * 0.35)
+            if separated_gap <= close_gap_px or center_distance <= avg_extent * PERSON_DISTANCE_CLOSE_CENTER_RATIO:
+                return "close"
+    return "far"
+
+
+def _build_action_signature(analysis: dict) -> dict:
+    kpt_xy_np = analysis.get("kpt_xy_np")
+    kpt_conf_np = analysis.get("kpt_conf_np")
+    poses: list[dict] = []
+    if kpt_xy_np is not None and kpt_conf_np is not None:
+        for idx in _select_pose_indices_for_status(analysis):
+            if idx < 0 or idx >= len(kpt_xy_np) or idx >= len(kpt_conf_np):
+                continue
+            valid = np.asarray(kpt_conf_np[idx] >= QUALITATIVE_KPT_CONF_THRESHOLD, dtype=bool)
+            if int(np.sum(valid)) < 3:
+                continue
+            poses.append(
+                {
+                    "points": np.asarray(kpt_xy_np[idx], dtype=np.float32).copy(),
+                    "valid": valid.copy(),
+                }
+            )
+
+    return {
+        "person_count": int(analysis.get("person_count", 0) or 0),
+        "boxes": [box.copy() for box in _extract_person_boxes(analysis, max_people=2)],
+        "poses": poses[:2],
+    }
+
+
+def _action_signature_has_sources(signature: dict | None) -> bool:
+    if not signature:
+        return False
+    return bool(signature.get("boxes") or signature.get("poses"))
+
+
+def _action_signature_is_high(previous: dict | None, current: dict | None) -> bool:
+    if not previous or not current:
+        return False
+
+    previous_count = int(previous.get("person_count", 0) or 0)
+    current_count = int(current.get("person_count", 0) or 0)
+    if previous_count != current_count and max(previous_count, current_count) > 0:
+        return True
+
+    previous_poses = previous.get("poses") or []
+    current_poses = current.get("poses") or []
+    for idx in range(min(len(previous_poses), len(current_poses))):
+        prev_pose = previous_poses[idx]
+        curr_pose = current_poses[idx]
+        prev_valid = np.asarray(prev_pose.get("valid"), dtype=bool)
+        curr_valid = np.asarray(curr_pose.get("valid"), dtype=bool)
+        valid = prev_valid & curr_valid
+        if int(np.sum(valid)) < 3:
+            continue
+        prev_points = np.asarray(prev_pose.get("points"), dtype=np.float32)
+        curr_points = np.asarray(curr_pose.get("points"), dtype=np.float32)
+        shifts = np.linalg.norm(curr_points[valid] - prev_points[valid], axis=1)
+        if float(np.mean(shifts)) >= ACTION_KEYPOINT_SHIFT_HIGH_PX:
+            return True
+        if float(np.percentile(shifts, 75)) >= ACTION_KEYPOINT_SHIFT_PEAK_HIGH_PX:
+            return True
+
+    previous_boxes = previous.get("boxes") or []
+    current_boxes = current.get("boxes") or []
+    for idx in range(min(len(previous_boxes), len(current_boxes))):
+        prev_box = previous_boxes[idx]
+        curr_box = current_boxes[idx]
+        avg_extent = (_box_extent(prev_box) + _box_extent(curr_box)) * 0.5
+        center_shift_ratio = _box_center_distance(prev_box, curr_box) / max(1.0, avg_extent)
+        area_shift_ratio = abs(_box_area(curr_box) - _box_area(prev_box)) / max(_box_area(curr_box), _box_area(prev_box), 1.0)
+        if center_shift_ratio >= ACTION_BOX_CENTER_SHIFT_HIGH_RATIO:
+            return True
+        if area_shift_ratio >= ACTION_BOX_SCALE_SHIFT_HIGH_RATIO:
+            return True
+    return False
+
+
+def _ir_frame_motion_is_high(previous_frame: np.ndarray | None, current_frame: np.ndarray) -> bool:
+    if previous_frame is None:
+        return False
+    if previous_frame.shape != current_frame.shape:
+        previous_frame = cv2.resize(previous_frame, (current_frame.shape[1], current_frame.shape[0]), interpolation=cv2.INTER_LINEAR)
+    diff = cv2.absdiff(current_frame, previous_frame)
+    mean_diff = float(np.mean(diff)) if diff.size else 0.0
+    p95_diff = float(np.percentile(diff, 95)) if diff.size else 0.0
+    return mean_diff >= ACTION_IR_MEAN_DIFF_HIGH or p95_diff >= ACTION_IR_P95_DIFF_HIGH
+
+def _copy_qualitative_result_fields(source: dict) -> dict:
+    return {key: str(source.get(key, "") or "") for key in QUALITATIVE_RESULT_KEYS}
+
+
 def _render_skeleton_contour_cpu(analysis: dict) -> np.ndarray:
     records = analysis["records"]
     kpt_xy_np = analysis["kpt_xy_np"]
@@ -422,6 +728,7 @@ def _render_analyzed_result_cpu(analyzed: dict) -> dict:
         "skeleton_contour_image": _render_skeleton_contour_cpu(analysis),
         "person_count": int(analyzed["person_count"]),
         "processing_time_ms": int(analyzed["processing_time_ms"]),
+        **_copy_qualitative_result_fields(analyzed),
     }
 
 
@@ -477,6 +784,7 @@ def _encode_rendered_result_cpu(payload: tuple[dict, str, int, int]) -> dict:
         "skeleton_contour_image_format": skeleton_contour_format,
         "person_count": person_count,
         "processing_time_ms": int(rendered["processing_time_ms"]),
+        **_copy_qualitative_result_fields(rendered),
     }
 
 
@@ -519,6 +827,7 @@ def _render_and_encode_analyzed_result_cpu(payload: tuple[dict, str, int, int]) 
         "skeleton_contour_image_format": skeleton_contour_format,
         "person_count": person_count,
         "processing_time_ms": int(analyzed["processing_time_ms"]),
+        **_copy_qualitative_result_fields(analyzed),
         "_render_ms": render_ms,
         "_encode_ms": encode_ms,
     }
@@ -669,6 +978,8 @@ class RealtimePoseEngine:
         self._warned_no_keypoints = False
         self._warned_pose_gate_fallback = False
         self._last_source_depth: np.ndarray | None = None
+        self._last_action_frame: np.ndarray | None = None
+        self._last_action_signature: dict | None = None
         self._clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP_LIMIT, tileGridSize=CLAHE_TILE_GRID)
         self._track_gate: dict[int, _TrackGateState] = {}
         self._mask_jump_state: dict[int, _MaskJumpState] = {}
@@ -681,6 +992,8 @@ class RealtimePoseEngine:
         self._cached_kpt_xy = None
         self._cached_kpt_conf = None
         self._last_source_depth = None
+        self._last_action_frame = None
+        self._last_action_signature = None
         self._track_gate.clear()
         self._mask_jump_state.clear()
         self._contour_track_state.clear()
@@ -958,12 +1271,16 @@ class RealtimePoseEngine:
                 pose_result = pose_results[0] if pose_results else None
             kpt_xy_np = None
             kpt_conf_np = None
-            if pose_result is not None and pose_result.keypoints is not None:
-                keypoints_xy = pose_result.keypoints.xy
-                keypoints_conf = pose_result.keypoints.conf
-                if keypoints_xy is not None and keypoints_conf is not None:
-                    kpt_xy_np = keypoints_xy.cpu().numpy()
-                    kpt_conf_np = keypoints_conf.cpu().numpy()
+            pose_boxes_np: list[np.ndarray] = []
+            if pose_result is not None:
+                if pose_result.boxes is not None and len(pose_result.boxes) > 0:
+                    pose_boxes_np = [box.copy() for box in pose_result.boxes.xyxy.cpu().numpy()]
+                if pose_result.keypoints is not None:
+                    keypoints_xy = pose_result.keypoints.xy
+                    keypoints_conf = pose_result.keypoints.conf
+                    if keypoints_xy is not None and keypoints_conf is not None:
+                        kpt_xy_np = keypoints_xy.cpu().numpy()
+                        kpt_conf_np = keypoints_conf.cpu().numpy()
 
             pose_draw_indices: list[int] = []
             if kpt_conf_np is not None:
@@ -974,6 +1291,7 @@ class RealtimePoseEngine:
 
             return {
                 "depth_up": depth_up,
+                "depth_raw": depth_raw,
                 "color_img": color_img,
                 "records": [],
                 "person_count": int(len(pose_draw_indices)),
@@ -982,6 +1300,7 @@ class RealtimePoseEngine:
                 "tracked_labels": [],
                 "kpt_xy_np": kpt_xy_np,
                 "kpt_conf_np": kpt_conf_np,
+                "pose_boxes": pose_boxes_np,
                 "pose_to_track": {},
                 "validated_track_ids": set(),
                 "pose_only": True,
@@ -1282,6 +1601,7 @@ class RealtimePoseEngine:
             "tracked_labels": tracked_labels,
             "kpt_xy_np": kpt_xy_np,
             "kpt_conf_np": kpt_conf_np,
+            "pose_boxes": pose_boxes_np,
             "pose_to_track": pose_to_track,
             "validated_track_ids": validated_track_ids,
             "pose_only": False,
@@ -1457,6 +1777,20 @@ class RealtimePoseEngine:
         )
         return np.clip(midpoint, 0, 255).astype(np.uint8)
 
+    def _classify_action_level_from_ir(self, analysis: dict) -> str:
+        current_frame = self._ensure_uint8_gray(analysis["depth_raw"])
+        current_signature = _build_action_signature(analysis)
+        high_motion = _action_signature_is_high(self._last_action_signature, current_signature)
+        if (
+            not high_motion
+            and int(current_signature.get("person_count", 0) or 0) > 0
+            and not _action_signature_has_sources(current_signature)
+        ):
+            high_motion = _ir_frame_motion_is_high(self._last_action_frame, current_frame)
+
+        self._last_action_signature = current_signature
+        self._last_action_frame = current_frame.copy()
+        return "high" if high_motion else "low"
     def _analyze_predecoded_unlocked(
         self,
         frame_id: str,
@@ -1476,6 +1810,9 @@ class RealtimePoseEngine:
             "analysis": analysis,
             "person_count": int(analysis["person_count"]),
             "processing_time_ms": elapsed,
+            "person_status": _compute_person_status(analysis),
+            "person_distance": _compute_person_distance(analysis),
+            "action_level": self._classify_action_level_from_ir(analysis),
         }
 
     def _reuse_analyzed_result_with_depth(self, analyzed: dict, frame_id: str, depth: np.ndarray) -> dict:
@@ -1491,6 +1828,7 @@ class RealtimePoseEngine:
             "analysis": analysis,
             "person_count": int(analyzed["person_count"]),
             "processing_time_ms": 0,
+            **_copy_qualitative_result_fields(analyzed),
         }
 
     def _render_analyzed_result(self, analyzed: dict) -> dict:
@@ -1501,6 +1839,7 @@ class RealtimePoseEngine:
             "skeleton_contour_image": self._render_skeleton_contour(analysis),
             "person_count": int(analyzed["person_count"]),
             "processing_time_ms": int(analyzed["processing_time_ms"]),
+            **_copy_qualitative_result_fields(analyzed),
         }
 
     def _encode_rendered_result(self, rendered: dict) -> dict:
@@ -1519,6 +1858,7 @@ class RealtimePoseEngine:
             "skeleton_contour_image_format": skeleton_contour_format,
             "person_count": person_count,
             "processing_time_ms": int(rendered["processing_time_ms"]),
+            **_copy_qualitative_result_fields(rendered),
         }
 
     def _encode_analyzed_result(self, analyzed: dict) -> dict:

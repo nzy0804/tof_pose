@@ -9,7 +9,7 @@ import logging
 import multiprocessing
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from pathlib import Path
 
 import grpc
@@ -149,6 +149,8 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         oss_download_workers: int | None = None,
         oss_upload_workers: int | None = None,
         oss_global_workers: int = 8,
+        oss_upload_wait_timeout_ms: int = 0,
+        null_qualitative_results: bool = False,
     ):
         self._engine_count = max(1, int(model_instances))
         self._engines: list[RealtimePoseEngine] = []
@@ -158,6 +160,8 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         self._device_binding_ttl_sec = max(0.0, float(device_binding_ttl_sec))
         self._engine_inflight = [0 for _ in range(self._engine_count)]
         self._engine_device_counts = [0 for _ in range(self._engine_count)]
+        self._capture_timestamp_lock = threading.Lock()
+        self._last_capture_timestamp_by_device: dict[str, int] = {}
         self._oss_config = oss_config
         self._oss_client = create_object_storage_client(oss_config)
         self._oss_workers = max(0, int(oss_workers if oss_workers is not None else 4))
@@ -170,16 +174,22 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
             int(self._oss_workers if oss_upload_workers is None else oss_upload_workers),
         )
         self._oss_global_workers = max(0, int(oss_global_workers))
+        self._oss_upload_wait_timeout_ms = max(0, int(oss_upload_wait_timeout_ms))
+        self._null_qualitative_results = bool(null_qualitative_results)
         self._oss_global_semaphore = (
             threading.BoundedSemaphore(self._oss_global_workers)
             if self._oss_global_workers > 0
             else None
         )
+        if self._null_qualitative_results:
+            logging.info("Qualitative result fields disabled: person_status/person_distance/action_level omitted")
         if self._oss_client is not None and self._oss_config is not None:
             logging.info(
                 (
                     "Object storage enabled: provider=%s endpoint=%s bucket=%s output_prefix=%s "
-                    "workers=%d download_workers=%d upload_workers=%d global_workers=%d pool_connections=%d"
+                    "workers=%d download_workers=%d upload_workers=%d global_workers=%d pool_connections=%d "
+                    "connect_timeout_sec=%s read_timeout_sec=%s request_retries=%d request_deadline_sec=%s "
+                    "retry_backoff_ms=%d upload_wait_timeout_ms=%d"
                 ),
                 self._oss_config.provider,
                 self._oss_config.endpoint,
@@ -190,6 +200,12 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
                 self._oss_upload_workers,
                 self._oss_global_workers,
                 self._oss_config.max_pool_connections,
+                self._oss_config.connect_timeout_sec,
+                self._oss_config.read_timeout_sec,
+                self._oss_config.request_retries,
+                self._oss_config.request_deadline_sec,
+                self._oss_config.retry_backoff_ms,
+                self._oss_upload_wait_timeout_ms,
             )
         for idx in range(self._engine_count):
             logging.info("Initializing AI model instance %d/%d on device=%s", idx + 1, self._engine_count, device or "auto")
@@ -240,6 +256,7 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         for key in stale_keys:
             index = self._device_bindings.pop(key, None)
             self._device_last_seen.pop(key, None)
+            self._last_capture_timestamp_by_device.pop(key, None)
             if index is not None and 0 <= index < len(self._engine_device_counts):
                 self._engine_device_counts[index] = max(0, self._engine_device_counts[index] - 1)
         if stale_keys:
@@ -312,6 +329,43 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         finally:
             self._oss_global_semaphore.release()
 
+    @staticmethod
+    def _image_capture_timestamp_ms(images: list, index: int) -> int:
+        if not (0 <= index < len(images)):
+            return 0
+        try:
+            return max(0, int(getattr(images[index], "capture_timestamp_ms", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _annotate_result_capture_timestamps(self, device_id: str, images: list, results: list[dict]) -> None:
+        input_timestamps = [self._image_capture_timestamp_ms(images, index) for index in range(len(images))]
+        previous_batch_ts = 0
+        last_input_ts = next((value for value in reversed(input_timestamps) if value > 0), 0)
+        normalized_device_id = str(device_id or "").strip()
+        if normalized_device_id:
+            with self._capture_timestamp_lock:
+                previous_batch_ts = self._last_capture_timestamp_by_device.get(normalized_device_id, 0)
+                if last_input_ts:
+                    self._last_capture_timestamp_by_device[normalized_device_id] = last_input_ts
+
+        for result in results:
+            try:
+                input_index = int(result.get("input_index", -1))
+            except (TypeError, ValueError):
+                input_index = -1
+            current_ts = input_timestamps[input_index] if 0 <= input_index < len(input_timestamps) else 0
+            capture_timestamp_ms = current_ts
+            if result.get("result_kind") == "interpolated":
+                prev_ts = 0
+                if input_index > 0:
+                    prev_ts = input_timestamps[input_index - 1]
+                elif input_index == 0:
+                    prev_ts = previous_batch_ts
+                if prev_ts and current_ts:
+                    capture_timestamp_ms = int((prev_ts + current_ts) // 2)
+            result["capture_timestamp_ms"] = int(capture_timestamp_ms or 0)
+
     def _download_request_images(self, images: list) -> tuple[list[tuple[str, bytes]], int, dict[str, int]]:
         if self._oss_client is None:
             frames = []
@@ -364,8 +418,9 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
 
         upload_start = time.perf_counter()
         stage_stats = _ObjectStorageStageStats()
+        used_object_keys: set[str] = set()
 
-        def upload_one(result_index: int, image_name: str) -> tuple[int, str, str]:
+        def build_upload_task(result_index: int, image_name: str) -> dict:
             result = results[result_index]
             data_key = "pseudo_color_image" if image_name == "pseudo_color" else "skeleton_contour_image"
             format_key = f"{data_key}_format"
@@ -374,41 +429,125 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
             if not image_data:
                 raise ValueError(f"empty {image_name} image for result {result_index}")
             image_format = str(result.get(format_key, "") or "")
+            try:
+                capture_timestamp_ms = max(0, int(result.get("capture_timestamp_ms", 0) or 0))
+            except (TypeError, ValueError):
+                capture_timestamp_ms = 0
+
+            image_identifier = image_name
             object_key = build_result_object_key(
                 output_prefix=self._oss_config.output_prefix,
                 device_id=device_id,
-                batch_id=batch_id,
-                frame_id=str(result.get("frame_id", "") or ""),
-                output_index=int(result.get("output_index", result_index)),
-                result_kind=str(result.get("result_kind", "result") or "result"),
-                image_name=image_name,
+                timestamp_ms=capture_timestamp_ms,
+                image_name=image_identifier,
                 image_format=image_format,
             )
+            if object_key in used_object_keys:
+                try:
+                    output_index = max(0, int(result.get("output_index", result_index)))
+                except (TypeError, ValueError):
+                    output_index = max(0, int(result_index))
+                suffix = 0
+                while object_key in used_object_keys:
+                    suffix_text = f"{output_index:04d}" if suffix == 0 else f"{output_index:04d}_{suffix}"
+                    image_identifier = f"{image_name}_{suffix_text}"
+                    object_key = build_result_object_key(
+                        output_prefix=self._oss_config.output_prefix,
+                        device_id=device_id,
+                        timestamp_ms=capture_timestamp_ms,
+                        image_name=image_identifier,
+                        image_format=image_format,
+                    )
+                    suffix += 1
+            used_object_keys.add(object_key)
+            return {
+                "result_index": result_index,
+                "image_name": image_name,
+                "data_key": data_key,
+                "object_key_field": object_key_field,
+                "image_data": image_data,
+                "image_format": image_format,
+                "object_key": object_key,
+            }
+
+        def upload_one(task: dict) -> str:
             object_start = time.perf_counter()
             stored_key = self._run_object_storage_call(
                 lambda: self._oss_client.put_bytes(
-                    object_key,
-                    image_data,
-                    content_type=image_content_type(image_format),
+                    task["object_key"],
+                    task["image_data"],
+                    content_type=image_content_type(task["image_format"]),
                 )
             )
-            stage_stats.add(int((time.perf_counter() - object_start) * 1000), len(image_data))
-            return result_index, object_key_field, stored_key
+            stage_stats.add(int((time.perf_counter() - object_start) * 1000), len(task["image_data"]))
+            return stored_key
 
-        tasks = []
-        with ThreadPoolExecutor(max_workers=self._oss_concurrency(len(results) * 2, self._oss_upload_workers)) as executor:
+        def log_background_upload_failure(future, task: dict) -> None:
+            if future.cancelled():
+                logging.warning(
+                    "Object storage upload skipped after response: key=%s",
+                    task["object_key"],
+                )
+                return
+            try:
+                future.result()
+            except Exception:
+                logging.exception(
+                    "Object storage upload failed after response: key=%s",
+                    task["object_key"],
+                )
+
+        futures = []
+        future_tasks = {}
+        executor = ThreadPoolExecutor(max_workers=self._oss_concurrency(len(results) * 2, self._oss_upload_workers))
+        try:
             for result_index in range(len(results)):
-                tasks.append(executor.submit(upload_one, result_index, "pseudo_color"))
-                tasks.append(executor.submit(upload_one, result_index, "skeleton_contour"))
-            for future in as_completed(tasks):
-                result_index, object_key_field, stored_key = future.result()
-                results[result_index][object_key_field] = stored_key
-                if object_key_field == "pseudo_color_object_key":
-                    results[result_index]["pseudo_color_image"] = b""
-                else:
-                    results[result_index]["skeleton_contour_image"] = b""
+                for image_name in ("pseudo_color", "skeleton_contour"):
+                    task = build_upload_task(result_index, image_name)
+                    results[result_index][task["object_key_field"]] = task["object_key"]
+                    results[result_index][task["data_key"]] = b""
+                    future = executor.submit(upload_one, task)
+                    futures.append(future)
+                    future_tasks[future] = task
 
-        return int((time.perf_counter() - upload_start) * 1000), stage_stats.summary()
+            timeout_sec = (
+                self._oss_upload_wait_timeout_ms / 1000.0
+                if self._oss_upload_wait_timeout_ms > 0
+                else None
+            )
+            if timeout_sec is None:
+                done = set()
+                for future in as_completed(futures):
+                    done.add(future)
+            else:
+                done, pending = wait(futures, timeout=timeout_sec)
+                for future in pending:
+                    future.add_done_callback(
+                        lambda completed, task=future_tasks[future]: log_background_upload_failure(completed, task)
+                    )
+                if pending:
+                    logging.warning(
+                        (
+                            "Object storage upload wait timeout: device_id=%s batch_id=%s waited_ms=%d "
+                            "completed=%d pending=%d"
+                        ),
+                        device_id,
+                        batch_id,
+                        self._oss_upload_wait_timeout_ms,
+                        len(done),
+                        len(pending),
+                    )
+
+            for future in done:
+                task = future_tasks[future]
+                results[task["result_index"]][task["object_key_field"]] = future.result()
+
+            summary = stage_stats.summary()
+            summary["wait_timeout_ms"] = self._oss_upload_wait_timeout_ms
+            summary["pending"] = len(futures) - len(done)
+            return int((time.perf_counter() - upload_start) * 1000), summary
+        finally:
+            executor.shutdown(wait=self._oss_upload_wait_timeout_ms <= 0, cancel_futures=False)
 
     def Infer(self, request, context):
         device_id = getattr(request, 'device_id', '')
@@ -443,6 +582,7 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
             engine_infer_ms = int((time.perf_counter() - engine_start) * 1000)
             if len(results) != len(images) * 2:
                 raise RuntimeError(f"expected {len(images) * 2} results for {len(images)} inputs, got {len(results)}")
+            self._annotate_result_capture_timestamps(device_id, images, results)
         except Exception as e:
             logging.exception("Infer failed: device_id=%s batch_id=%s instance=%d", device_id, batch_id, engine_index)
             context.set_details(str(e))
@@ -455,7 +595,11 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
             self._release_engine(engine_index)
 
         try:
-            oss_upload_ms, oss_upload_stats = self._upload_result_images(device_id=device_id, batch_id=batch_id, results=results)
+            oss_upload_ms, oss_upload_stats = self._upload_result_images(
+                device_id=device_id,
+                batch_id=batch_id,
+                results=results,
+            )
         except Exception as e:
             logging.exception("Infer output upload failed: device_id=%s batch_id=%s instance=%d", device_id, batch_id, engine_index)
             context.set_details(str(e))
@@ -473,32 +617,30 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         }
         for result in results:
             input_index = int(result.get('input_index', -1))
-            image = images[input_index] if 0 <= input_index < len(images) else None
-            capture_timestamp_ms = int(getattr(image, 'capture_timestamp_ms', 0) or 0) if image is not None else 0
-            if result.get('result_kind') == 'interpolated' and input_index > 0:
-                prev_ts = int(getattr(images[input_index - 1], 'capture_timestamp_ms', 0) or 0)
-                if prev_ts and capture_timestamp_ms:
-                    capture_timestamp_ms = int((prev_ts + capture_timestamp_ms) // 2)
-            response.results.append(
-                ai_pb2.InferResult(
-                    frame_id=result.get('frame_id', ''),
-                    capture_timestamp_ms=capture_timestamp_ms,
-                    pseudo_color_image=result.get('pseudo_color_image', b''),
-                    skeleton_contour_image=result.get('skeleton_contour_image', b''),
-                    pseudo_color_image_format=result.get('pseudo_color_image_format', 'png'),
-                    skeleton_contour_image_format=result.get('skeleton_contour_image_format', 'png'),
-                    pseudo_color_object_key=result.get('pseudo_color_object_key', ''),
-                    skeleton_contour_object_key=result.get('skeleton_contour_object_key', ''),
-                    person_count=int(result.get('person_count', 0)),
-                    person_status=str(result.get('person_status', '') or ''),
-                    person_distance=str(result.get('person_distance', '') or ''),
-                    action_level=str(result.get('action_level', '') or ''),
-                    processing_time_ms=int(result.get('processing_time_ms', 0)),
-                    result_kind=kind_map.get(result.get('result_kind'), ai_pb2.RESULT_KIND_UNSPECIFIED),
-                    input_index=input_index,
-                    output_index=int(result.get('output_index', len(response.results))),
-                )
+            try:
+                capture_timestamp_ms = max(0, int(result.get('capture_timestamp_ms', 0) or 0))
+            except (TypeError, ValueError):
+                capture_timestamp_ms = 0
+            result_message = ai_pb2.InferResult(
+                frame_id=result.get('frame_id', ''),
+                capture_timestamp_ms=capture_timestamp_ms,
+                pseudo_color_image=result.get('pseudo_color_image', b''),
+                skeleton_contour_image=result.get('skeleton_contour_image', b''),
+                pseudo_color_image_format=result.get('pseudo_color_image_format', 'png'),
+                skeleton_contour_image_format=result.get('skeleton_contour_image_format', 'png'),
+                pseudo_color_object_key=result.get('pseudo_color_object_key', ''),
+                skeleton_contour_object_key=result.get('skeleton_contour_object_key', ''),
+                person_count=int(result.get('person_count', 0)),
+                processing_time_ms=int(result.get('processing_time_ms', 0)),
+                result_kind=kind_map.get(result.get('result_kind'), ai_pb2.RESULT_KIND_UNSPECIFIED),
+                input_index=input_index,
+                output_index=int(result.get('output_index', len(response.results))),
             )
+            if not self._null_qualitative_results:
+                result_message.person_status = str(result.get('person_status', '') or '')
+                result_message.person_distance = str(result.get('person_distance', '') or '')
+                result_message.action_level = str(result.get('action_level', '') or '')
+            response.results.append(result_message)
         response_build_ms = int((time.perf_counter() - response_build_start) * 1000)
         grpc_total_ms = int((time.perf_counter() - grpc_start) * 1000)
         response.processing_time_ms = grpc_total_ms
@@ -511,6 +653,7 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
                 "engine_infer_ms=%d "
                 "oss_upload_ms=%d oss_upload_count=%d oss_upload_bytes=%d "
                 "oss_upload_p50_ms=%d oss_upload_p95_ms=%d oss_upload_max_ms=%d "
+                "oss_upload_wait_timeout_ms=%d oss_upload_pending_count=%d "
                 "grpc_response_build_ms=%d grpc_total_ms=%d engine_inflight=%s"
             ),
             device_id,
@@ -531,6 +674,8 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
             oss_upload_stats["p50_ms"],
             oss_upload_stats["p95_ms"],
             oss_upload_stats["max_ms"],
+            oss_upload_stats.get("wait_timeout_ms", 0),
+            oss_upload_stats.get("pending", 0),
             response_build_ms,
             grpc_total_ms,
             engine_inflight,
@@ -578,6 +723,8 @@ def serve(
     oss_download_workers: int | None = None,
     oss_upload_workers: int | None = None,
     oss_global_workers: int = 8,
+    oss_upload_wait_timeout_ms: int = 0,
+    null_qualitative_results: bool = False,
 ):
     model_instances = max(1, int(model_instances))
     server_opts = [
@@ -621,6 +768,8 @@ def serve(
             oss_download_workers=oss_download_workers,
             oss_upload_workers=oss_upload_workers,
             oss_global_workers=oss_global_workers,
+            oss_upload_wait_timeout_ms=oss_upload_wait_timeout_ms,
+            null_qualitative_results=null_qualitative_results,
         ),
         server,
     )
@@ -778,6 +927,11 @@ def main():
         type=float,
         help='seconds after which an inactive device_id is unbound from its sticky model instance; 0 disables pruning',
     )
+    parser.add_argument(
+        '--null-qualitative-results',
+        action='store_true',
+        help='omit unvalidated qualitative fields: person_status, person_distance, and action_level',
+    )
     parser.add_argument('--oss-provider', default=None, choices=('aliyun', 's3'), help='object storage provider for request/result object keys')
     parser.add_argument('--oss-endpoint', default=None, help='object storage endpoint')
     parser.add_argument('--oss-bucket', default=None, help='object storage bucket name')
@@ -787,6 +941,11 @@ def main():
     parser.add_argument('--oss-security-token', default=None, help='optional temporary security token')
     parser.add_argument('--oss-output-prefix', default=None, help='prefix for AI result images uploaded by this service')
     parser.add_argument('--oss-max-pool-connections', default=128, type=int, help='max HTTP connection pool size for S3-compatible object storage')
+    parser.add_argument('--oss-connect-timeout-sec', default=1.0, type=float, help='object storage connect timeout seconds; <=0 disables')
+    parser.add_argument('--oss-read-timeout-sec', default=2.0, type=float, help='object storage read timeout seconds; <=0 disables')
+    parser.add_argument('--oss-request-retries', default=2, type=int, help='object storage retry count after the first failed attempt')
+    parser.add_argument('--oss-request-deadline-sec', default=3.0, type=float, help='best-effort per-object total deadline seconds; <=0 disables')
+    parser.add_argument('--oss-retry-backoff-ms', default=100, type=int, help='initial object storage retry backoff in milliseconds')
     parser.add_argument(
         '--oss-workers',
         default=4,
@@ -811,6 +970,12 @@ def main():
         type=int,
         help='global concurrent object storage operations shared by all requests; 0 disables global limiting',
     )
+    parser.add_argument(
+        '--oss-upload-wait-timeout-ms',
+        default=0,
+        type=int,
+        help='maximum milliseconds to wait for result uploads before returning object keys; 0 waits for all uploads',
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
     oss_config = ObjectStorageConfig.from_values(
@@ -823,6 +988,11 @@ def main():
         security_token=args.oss_security_token,
         output_prefix=args.oss_output_prefix,
         max_pool_connections=args.oss_max_pool_connections,
+        connect_timeout_sec=args.oss_connect_timeout_sec,
+        read_timeout_sec=args.oss_read_timeout_sec,
+        request_retries=args.oss_request_retries,
+        request_deadline_sec=args.oss_request_deadline_sec,
+        retry_backoff_ms=args.oss_retry_backoff_ms,
     )
     serve(
         host=args.host,
@@ -863,6 +1033,8 @@ def main():
         oss_download_workers=args.oss_download_workers,
         oss_upload_workers=args.oss_upload_workers,
         oss_global_workers=args.oss_global_workers,
+        oss_upload_wait_timeout_ms=args.oss_upload_wait_timeout_ms,
+        null_qualitative_results=args.null_qualitative_results,
     )
 
 

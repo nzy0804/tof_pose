@@ -3,11 +3,16 @@ from __future__ import annotations
 import os
 import posixpath
 import re
+import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+import logging
 from typing import Protocol
 
 
+LOGGER = logging.getLogger(__name__)
 _SAFE_PART_RE = re.compile(r"[^A-Za-z0-9._=-]+")
+_OBJECT_KEY_TIMEZONE = timezone(timedelta(hours=8))
 
 
 def _first_value(*values: str | None) -> str:
@@ -16,6 +21,31 @@ def _first_value(*values: str | None) -> str:
         if text:
             return text
     return ""
+
+
+def _optional_float(value: str | float | int | None, default: float | None) -> float | None:
+    text = str(value if value is not None else "").strip()
+    if not text:
+        return default
+    try:
+        parsed = float(text)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else None
+
+
+def _optional_int(value: str | int | None, default: int) -> int:
+    text = str(value if value is not None else "").strip()
+    if not text:
+        return default
+    try:
+        return max(0, int(text))
+    except ValueError:
+        return default
+
+
+class ObjectStorageOperationError(RuntimeError):
+    pass
 
 
 class ObjectStorageClient(Protocol):
@@ -37,6 +67,11 @@ class ObjectStorageConfig:
     security_token: str | None = None
     output_prefix: str = "ai-results"
     max_pool_connections: int = 128
+    connect_timeout_sec: float | None = 1.0
+    read_timeout_sec: float | None = 2.0
+    request_retries: int = 2
+    request_deadline_sec: float | None = 3.0
+    retry_backoff_ms: int = 100
 
     @classmethod
     def from_values(
@@ -51,6 +86,11 @@ class ObjectStorageConfig:
         security_token: str | None = None,
         output_prefix: str | None = None,
         max_pool_connections: int | None = None,
+        connect_timeout_sec: float | None = None,
+        read_timeout_sec: float | None = None,
+        request_retries: int | None = None,
+        request_deadline_sec: float | None = None,
+        retry_backoff_ms: int | None = None,
     ) -> "ObjectStorageConfig | None":
         provider_value = _first_value(provider, os.environ.get("OSS_PROVIDER")).lower()
         endpoint_value = _first_value(endpoint, os.environ.get("OSS_ENDPOINT"), os.environ.get("S3_ENDPOINT_URL"))
@@ -76,6 +116,26 @@ class ObjectStorageConfig:
                 max_pool_connections_value = int(os.environ.get("OSS_MAX_POOL_CONNECTIONS") or "128")
             except ValueError:
                 max_pool_connections_value = 128
+        connect_timeout_value = _optional_float(
+            connect_timeout_sec,
+            _optional_float(os.environ.get("OSS_CONNECT_TIMEOUT_SEC"), 1.0),
+        )
+        read_timeout_value = _optional_float(
+            read_timeout_sec,
+            _optional_float(os.environ.get("OSS_READ_TIMEOUT_SEC"), 2.0),
+        )
+        request_deadline_value = _optional_float(
+            request_deadline_sec,
+            _optional_float(os.environ.get("OSS_REQUEST_DEADLINE_SEC"), 3.0),
+        )
+        request_retries_value = _optional_int(
+            request_retries,
+            _optional_int(os.environ.get("OSS_REQUEST_RETRIES"), 2),
+        )
+        retry_backoff_value = _optional_int(
+            retry_backoff_ms,
+            _optional_int(os.environ.get("OSS_RETRY_BACKOFF_MS"), 100),
+        )
 
         if not any((provider_value, endpoint_value, bucket_value, access_key_id_value, access_key_secret_value)):
             return None
@@ -106,11 +166,73 @@ class ObjectStorageConfig:
             security_token=security_token_value,
             output_prefix=output_prefix_value.strip("/"),
             max_pool_connections=max(1, int(max_pool_connections_value)),
+            connect_timeout_sec=connect_timeout_value,
+            read_timeout_sec=read_timeout_value,
+            request_retries=request_retries_value,
+            request_deadline_sec=request_deadline_value,
+            retry_backoff_ms=retry_backoff_value,
         )
 
 
-class AliyunOSSClient:
+def _timeout_value(config: ObjectStorageConfig):
+    if config.connect_timeout_sec is not None and config.read_timeout_sec is not None:
+        return (float(config.connect_timeout_sec), float(config.read_timeout_sec))
+    if config.connect_timeout_sec is not None:
+        return float(config.connect_timeout_sec)
+    if config.read_timeout_sec is not None:
+        return float(config.read_timeout_sec)
+    return None
+
+
+class _RetryingObjectStorageClient:
     def __init__(self, config: ObjectStorageConfig) -> None:
+        self._request_retries = max(0, int(config.request_retries))
+        self._request_deadline_sec = (
+            float(config.request_deadline_sec)
+            if config.request_deadline_sec is not None and float(config.request_deadline_sec) > 0
+            else None
+        )
+        self._retry_backoff_sec = max(0.0, float(config.retry_backoff_ms) / 1000.0)
+
+    def _run_with_retries(self, operation: str, object_key: str, call):
+        attempts = max(1, self._request_retries + 1)
+        started = time.monotonic()
+        deadline_at = started + self._request_deadline_sec if self._request_deadline_sec is not None else None
+        last_exc: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            if deadline_at is not None and time.monotonic() >= deadline_at:
+                break
+            try:
+                return call()
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= attempts:
+                    break
+                if deadline_at is not None and time.monotonic() >= deadline_at:
+                    break
+                sleep_sec = self._retry_backoff_sec * (2 ** (attempt - 1))
+                if deadline_at is not None:
+                    remaining = max(0.0, deadline_at - time.monotonic())
+                    sleep_sec = min(sleep_sec, remaining)
+                LOGGER.warning(
+                    "Object storage %s retry: attempt=%d/%d key=%s error=%s",
+                    operation,
+                    attempt,
+                    attempts,
+                    object_key,
+                    type(exc).__name__,
+                )
+                if sleep_sec > 0:
+                    time.sleep(sleep_sec)
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        raise ObjectStorageOperationError(
+            f"object storage {operation} failed after {attempts} attempts in {elapsed_ms}ms for key={object_key}"
+        ) from last_exc
+
+
+class AliyunOSSClient(_RetryingObjectStorageClient):
+    def __init__(self, config: ObjectStorageConfig) -> None:
+        super().__init__(config)
         try:
             import oss2
         except ImportError as exc:
@@ -126,24 +248,29 @@ class AliyunOSSClient:
                 session = oss2.Session(pool_size=config.max_pool_connections)
             except TypeError:
                 session = oss2.Session()
+        timeout = _timeout_value(config)
+        kwargs = {}
+        if timeout is not None:
+            kwargs["connect_timeout"] = timeout
         if session is not None:
-            self._bucket = oss2.Bucket(auth, config.endpoint, config.bucket, session=session)
+            self._bucket = oss2.Bucket(auth, config.endpoint, config.bucket, session=session, **kwargs)
         else:
-            self._bucket = oss2.Bucket(auth, config.endpoint, config.bucket)
+            self._bucket = oss2.Bucket(auth, config.endpoint, config.bucket, **kwargs)
 
     def get_bytes(self, object_key: str) -> bytes:
-        return self._bucket.get_object(object_key).read()
+        return self._run_with_retries("download", object_key, lambda: self._bucket.get_object(object_key).read())
 
     def put_bytes(self, object_key: str, data: bytes, content_type: str | None = None) -> str:
         headers = {}
         if content_type:
             headers["Content-Type"] = content_type
-        self._bucket.put_object(object_key, data, headers=headers or None)
+        self._run_with_retries("upload", object_key, lambda: self._bucket.put_object(object_key, data, headers=headers or None))
         return object_key
 
 
-class S3ObjectStorageClient:
+class S3ObjectStorageClient(_RetryingObjectStorageClient):
     def __init__(self, config: ObjectStorageConfig) -> None:
+        super().__init__(config)
         try:
             import boto3
             from botocore.config import Config
@@ -151,12 +278,19 @@ class S3ObjectStorageClient:
             raise RuntimeError("S3-compatible object storage support requires the boto3 package") from exc
 
         self._bucket = config.bucket
+        client_config_kwargs = {
+            "max_pool_connections": config.max_pool_connections,
+        }
+        if config.connect_timeout_sec is not None:
+            client_config_kwargs["connect_timeout"] = float(config.connect_timeout_sec)
+        if config.read_timeout_sec is not None:
+            client_config_kwargs["read_timeout"] = float(config.read_timeout_sec)
         kwargs = {
             "service_name": "s3",
             "endpoint_url": config.endpoint,
             "aws_access_key_id": config.access_key_id,
             "aws_secret_access_key": config.access_key_secret,
-            "config": Config(max_pool_connections=config.max_pool_connections),
+            "config": Config(**client_config_kwargs),
         }
         if config.region:
             kwargs["region_name"] = config.region
@@ -165,8 +299,11 @@ class S3ObjectStorageClient:
         self._client = boto3.client(**kwargs)
 
     def get_bytes(self, object_key: str) -> bytes:
-        obj = self._client.get_object(Bucket=self._bucket, Key=object_key)
-        return obj["Body"].read()
+        def call():
+            obj = self._client.get_object(Bucket=self._bucket, Key=object_key)
+            return obj["Body"].read()
+
+        return self._run_with_retries("download", object_key, call)
 
     def put_bytes(self, object_key: str, data: bytes, content_type: str | None = None) -> str:
         kwargs = {
@@ -176,7 +313,7 @@ class S3ObjectStorageClient:
         }
         if content_type:
             kwargs["ContentType"] = content_type
-        self._client.put_object(**kwargs)
+        self._run_with_retries("upload", object_key, lambda: self._client.put_object(**kwargs))
         return object_key
 
 
@@ -216,26 +353,32 @@ def image_extension(image_format: str | None) -> str:
     return "bin"
 
 
+def object_key_date(timestamp_ms: int | None) -> str:
+    try:
+        timestamp = max(0, int(timestamp_ms or 0))
+    except (TypeError, ValueError):
+        timestamp = 0
+    return datetime.fromtimestamp(timestamp / 1000.0, _OBJECT_KEY_TIMEZONE).strftime("%Y%m%d")
+
+
 def build_result_object_key(
     *,
     output_prefix: str,
     device_id: str,
-    batch_id: str,
-    frame_id: str,
-    output_index: int,
-    result_kind: str,
+    timestamp_ms: int,
     image_name: str,
     image_format: str,
 ) -> str:
-    prefix = str(output_prefix or "ai-results").strip("/")
+    _ = output_prefix
+    try:
+        timestamp = max(0, int(timestamp_ms or 0))
+    except (TypeError, ValueError):
+        timestamp = 0
     parts = [
-        prefix,
         sanitize_object_key_part(device_id, "device"),
-        sanitize_object_key_part(batch_id, "batch"),
+        object_key_date(timestamp),
         (
-            f"{max(0, int(output_index)):04d}_"
-            f"{sanitize_object_key_part(result_kind, 'result')}_"
-            f"{sanitize_object_key_part(frame_id, 'frame')}_"
+            f"{timestamp}_"
             f"{sanitize_object_key_part(image_name, 'image')}."
             f"{image_extension(image_format)}"
         ),

@@ -31,7 +31,7 @@ DISPLAY_SIZE = (320, 320)
 DISPLAY_SCALE = 3
 
 MEDIAN_BLUR_K = 5
-CLAHE_CLIP_LIMIT = 3.0
+CLAHE_CLIP_LIMIT = 2.0
 CLAHE_TILE_GRID = (8, 8)
 
 DISPLAY_MODE_BOTH = "both"
@@ -46,8 +46,8 @@ TRACK_VOTE_WINDOW = 5
 TRACK_VOTE_MIN_POS = 2
 TRACK_TTL_FRAMES = 5
 TRACK_STATE_STALE_AFTER = 30
-CONTOUR_NEW_TRACK_CONF_THRESHOLD = 0.25
-CONTOUR_EXISTING_TRACK_CONF_THRESHOLD = 0.10
+CONTOUR_NEW_TRACK_CONF_THRESHOLD = 0.35
+CONTOUR_EXISTING_TRACK_CONF_THRESHOLD = 0.20
 CONTOUR_TRACK_STALE_AFTER = 30
 CONTOUR_EXISTING_MAX_CENTER_JUMP_PX = 100.0
 CONTOUR_EXISTING_MAX_AREA_CHANGE_RATIO = 2.5
@@ -64,6 +64,9 @@ ACTION_BOX_CENTER_SHIFT_HIGH_RATIO = 0.18
 ACTION_BOX_SCALE_SHIFT_HIGH_RATIO = 0.25
 ACTION_IR_MEAN_DIFF_HIGH = 10.0
 ACTION_IR_P95_DIFF_HIGH = 32.0
+ACTION_HIGH_CONFIRM_FRAMES = 2
+POSE_FALLBACK_KPT_CONF_THRESHOLD = 0.45
+POSE_FALLBACK_MIN_POINTS = 7
 QUALITATIVE_RESULT_KEYS = ("person_status", "person_distance", "action_level")
 
 TRACK_COLORS = [
@@ -415,18 +418,71 @@ def _classify_person_pose_status(
             return "坐"
         if upper_leg < max(12.0, lower_leg * 0.55):
             return "坐"
-        return "站"
+        if leg_span >= 65.0 and min(upper_leg, lower_leg) >= 18.0:
+            return "站"
+        return None
 
     if shoulder_y is not None and hip_y is not None and knee_y is not None:
         torso = abs(hip_y - shoulder_y)
         upper_leg = abs(knee_y - hip_y)
         if upper_leg < max(14.0, torso * 0.45):
             return "坐"
-        return "站"
+        return None
 
-    if shoulder_y is not None and hip_y is not None and abs(hip_y - shoulder_y) > 35.0:
-        return "站"
     return None
+
+
+def _count_confident_keypoints(kpt_conf: np.ndarray, indices: tuple[int, ...], threshold: float) -> int:
+    count = 0
+    for idx in indices:
+        if idx < len(kpt_conf) and float(kpt_conf[idx]) >= threshold:
+            count += 1
+    return count
+
+
+def _pose_fallback_is_human_candidate(
+    kpt_xy: np.ndarray | None,
+    kpt_conf: np.ndarray | None,
+    *,
+    threshold: float,
+    min_points: int,
+    width: int,
+    height: int,
+) -> bool:
+    if kpt_xy is None or kpt_conf is None or len(kpt_xy) <= 0 or len(kpt_conf) <= 0:
+        return False
+
+    effective_min_points = max(int(min_points), int(POSE_FALLBACK_MIN_POINTS))
+    valid = np.asarray(kpt_conf >= threshold, dtype=bool)
+    if int(np.sum(valid)) < effective_min_points:
+        return False
+
+    shoulder_count = _count_confident_keypoints(kpt_conf, (5, 6), threshold)
+    hip_count = _count_confident_keypoints(kpt_conf, (11, 12), threshold)
+    lower_count = _count_confident_keypoints(kpt_conf, (13, 14, 15, 16), threshold)
+    if shoulder_count <= 0 or hip_count <= 0 or lower_count <= 0:
+        return False
+
+    shoulder_y = _mean_keypoint_y(kpt_xy, kpt_conf, (5, 6), threshold)
+    hip_y = _mean_keypoint_y(kpt_xy, kpt_conf, (11, 12), threshold)
+    if shoulder_y is None or hip_y is None or (hip_y - shoulder_y) < 12.0:
+        return False
+
+    points = np.asarray(kpt_xy, dtype=np.float32)[valid]
+    if points.size <= 0:
+        return False
+    x1, y1 = np.min(points, axis=0)
+    x2, y2 = np.max(points, axis=0)
+    box_w = max(1.0, float(x2 - x1))
+    box_h = max(1.0, float(y2 - y1))
+    frame_area = max(1.0, float(width) * float(height))
+    if box_h < max(35.0, float(height) * 0.10):
+        return False
+    if (box_w * box_h) / frame_area < 0.004:
+        return False
+    if box_h < box_w * 0.45:
+        return False
+    return True
 
 
 def _select_pose_indices_for_status(analysis: dict) -> list[int]:
@@ -473,7 +529,7 @@ def _format_person_status(statuses: list[str], person_count: int) -> str:
         return ""
     normalized = [status for status in statuses[:2] if status in {"坐", "站"}]
     if not normalized:
-        normalized = ["站"] * min(2, max(1, int(person_count)))
+        return ""
     has_sit = "坐" in normalized
     has_stand = "站" in normalized
     if has_sit and has_stand:
@@ -565,9 +621,13 @@ def _extract_person_boxes(analysis: dict, max_people: int = 2) -> list[np.ndarra
 
 
 def _compute_person_distance(analysis: dict) -> str:
+    person_count = int(analysis.get("person_count", 0) or 0)
+    if person_count < 2:
+        return ""
+
     boxes = _extract_person_boxes(analysis, max_people=2)
     if len(boxes) < 2:
-        return "far"
+        return ""
 
     width = int(analysis.get("width", DISPLAY_SIZE[0]) or DISPLAY_SIZE[0])
     for idx in range(len(boxes)):
@@ -586,6 +646,14 @@ def _compute_person_distance(analysis: dict) -> str:
 
 
 def _build_action_signature(analysis: dict) -> dict:
+    person_count = int(analysis.get("person_count", 0) or 0)
+    if person_count <= 0:
+        return {
+            "person_count": 0,
+            "boxes": [],
+            "poses": [],
+        }
+
     kpt_xy_np = analysis.get("kpt_xy_np")
     kpt_conf_np = analysis.get("kpt_conf_np")
     poses: list[dict] = []
@@ -604,7 +672,7 @@ def _build_action_signature(analysis: dict) -> dict:
             )
 
     return {
-        "person_count": int(analysis.get("person_count", 0) or 0),
+        "person_count": person_count,
         "boxes": [box.copy() for box in _extract_person_boxes(analysis, max_people=2)],
         "poses": poses[:2],
     }
@@ -987,6 +1055,7 @@ class RealtimePoseEngine:
         self._last_source_depth: np.ndarray | None = None
         self._last_action_frame: np.ndarray | None = None
         self._last_action_signature: dict | None = None
+        self._action_high_streak = 0
         self._clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP_LIMIT, tileGridSize=CLAHE_TILE_GRID)
         self._track_gate: dict[int, _TrackGateState] = {}
         self._mask_jump_state: dict[int, _MaskJumpState] = {}
@@ -1001,6 +1070,7 @@ class RealtimePoseEngine:
         self._last_source_depth = None
         self._last_action_frame = None
         self._last_action_signature = None
+        self._action_high_streak = 0
         self._track_gate.clear()
         self._mask_jump_state.clear()
         self._contour_track_state.clear()
@@ -1581,13 +1651,23 @@ class RealtimePoseEngine:
 
         pose_fallback_indices: list[int] = []
         if kpt_xy_np is not None and kpt_conf_np is not None:
+            fallback_kpt_threshold = max(
+                float(self._pose_gate_kpt_conf_threshold),
+                float(POSE_FALLBACK_KPT_CONF_THRESHOLD),
+            )
             for idx in range(min(len(kpt_xy_np), len(kpt_conf_np))):
                 matched_track = pose_to_track.get(idx)
-                confident_points = int(np.sum(kpt_conf_np[idx] >= self._pose_gate_kpt_conf_threshold))
                 if (
                     self._pose_fallback
                     and person_count <= 0
-                    and confident_points >= self._pose_kpt_min_points
+                    and _pose_fallback_is_human_candidate(
+                        kpt_xy_np[idx],
+                        kpt_conf_np[idx],
+                        threshold=fallback_kpt_threshold,
+                        min_points=self._pose_kpt_min_points,
+                        width=width,
+                        height=height,
+                    )
                 ):
                     pose_fallback_indices.append(int(idx))
                 if matched_track is None or matched_track not in validated_track_ids:
@@ -1787,17 +1867,21 @@ class RealtimePoseEngine:
     def _classify_action_level_from_ir(self, analysis: dict) -> str:
         current_frame = self._ensure_uint8_gray(analysis["depth_raw"])
         current_signature = _build_action_signature(analysis)
-        high_motion = _action_signature_is_high(self._last_action_signature, current_signature)
+        raw_high_motion = _action_signature_is_high(self._last_action_signature, current_signature)
         if (
-            not high_motion
+            not raw_high_motion
             and int(current_signature.get("person_count", 0) or 0) > 0
             and not _action_signature_has_sources(current_signature)
         ):
-            high_motion = _ir_frame_motion_is_high(self._last_action_frame, current_frame)
+            raw_high_motion = _ir_frame_motion_is_high(self._last_action_frame, current_frame)
 
         self._last_action_signature = current_signature
         self._last_action_frame = current_frame.copy()
-        return "high" if high_motion else "low"
+        if raw_high_motion:
+            self._action_high_streak += 1
+        else:
+            self._action_high_streak = 0
+        return "high" if self._action_high_streak >= ACTION_HIGH_CONFIRM_FRAMES else "low"
     def _analyze_predecoded_unlocked(
         self,
         frame_id: str,

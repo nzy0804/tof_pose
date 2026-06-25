@@ -64,7 +64,7 @@ except Exception:
     pass
 
 from tof_pose.realtime_service import RealtimePoseEngine
-from tof_pose.realtime_service import CPU_WORKER_MODE_PROCESS, CPU_WORKER_MODE_THREAD
+from tof_pose.realtime_service import CPU_WORKER_MODE_PROCESS, CPU_WORKER_MODE_THREAD, INPUT_MODALITIES, INPUT_MODALITY_DEPTH
 from tof_pose.object_storage import (
     ObjectStorageConfig,
     build_result_object_key,
@@ -137,6 +137,7 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         png_compression: int = 1,
         output_format: str = "png",
         jpeg_quality: int = 80,
+        input_modality: str = INPUT_MODALITY_DEPTH,
         cpu_worker_mode: str = CPU_WORKER_MODE_THREAD,
         cpu_process_start_method: str = "auto",
         model_instances: int = 1,
@@ -236,6 +237,7 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
                     png_compression=png_compression,
                     output_format=output_format,
                     jpeg_quality=jpeg_quality,
+                    input_modality=input_modality,
                     cpu_worker_mode=cpu_worker_mode,
                     cpu_process_start_method=cpu_process_start_method,
                     instance_name=f"model-{idx}",
@@ -762,6 +764,7 @@ def serve(
     png_compression: int = 1,
     output_format: str = "png",
     jpeg_quality: int = 80,
+    input_modality: str = INPUT_MODALITY_DEPTH,
     cpu_worker_mode: str = CPU_WORKER_MODE_THREAD,
     cpu_process_start_method: str = "auto",
     model_instances: int = 1,
@@ -808,6 +811,7 @@ def serve(
             png_compression=png_compression,
             output_format=output_format,
             jpeg_quality=jpeg_quality,
+            input_modality=input_modality,
             cpu_worker_mode=cpu_worker_mode,
             cpu_process_start_method=cpu_process_start_method,
             model_instances=model_instances,
@@ -854,7 +858,7 @@ def serve(
             model_instances,
         )
     logging.info(
-        'Starting gRPC server on %s (max_msg_mb=%d, max_workers=%d, model_instances=%d, parallel_models=%s, cpu_worker_mode=%s, cpu_process_start_method=%s)',
+        'Starting gRPC server on %s (max_msg_mb=%d, max_workers=%d, model_instances=%d, parallel_models=%s, cpu_worker_mode=%s, cpu_process_start_method=%s, input_modality=%s)',
         bound_address,
         max_msg_mb,
         max_workers,
@@ -862,6 +866,7 @@ def serve(
         "true" if parallel_models else "false",
         cpu_worker_mode,
         cpu_process_start_method,
+        input_modality,
     )
     server.start()
     try:
@@ -951,6 +956,12 @@ def main():
         default=80,
         type=int,
         help='JPEG quality for returned images when --output-format=jpeg',
+    )
+    parser.add_argument(
+        '--input-modality',
+        default=INPUT_MODALITY_DEPTH,
+        choices=INPUT_MODALITIES,
+        help='input image modality: ir applies grayscale median filtering plus CLAHE; depth directly applies pseudo color',
     )
     parser.add_argument(
         '--model-instances',
@@ -1080,6 +1091,7 @@ def main():
         png_compression=args.png_compression,
         output_format=args.output_format,
         jpeg_quality=args.jpeg_quality,
+        input_modality=args.input_modality,
         cpu_worker_mode=args.cpu_worker_mode,
         cpu_process_start_method=args.cpu_process_start_method,
         model_instances=args.model_instances,

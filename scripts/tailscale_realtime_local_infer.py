@@ -46,7 +46,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from tof_pose.realtime_service import CPU_WORKER_MODE_PROCESS, CPU_WORKER_MODE_THREAD, RealtimePoseEngine
+from tof_pose.realtime_service import CPU_WORKER_MODE_PROCESS, CPU_WORKER_MODE_THREAD, INPUT_MODALITIES, INPUT_MODALITY_DEPTH, RealtimePoseEngine
 
 
 @dataclass(frozen=True)
@@ -180,6 +180,7 @@ def build_engine(args: argparse.Namespace) -> RealtimePoseEngine:
         png_compression=args.png_compression,
         output_format=args.output_format,
         jpeg_quality=args.jpeg_quality,
+        input_modality=args.input_modality,
         cpu_worker_mode=args.cpu_worker_mode,
         cpu_process_start_method=args.cpu_process_start_method,
         instance_name="tailscale-local",
@@ -445,6 +446,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--png-compression", default=1, type=int)
     parser.add_argument("--output-format", default="jpeg", choices=("png", "jpeg", "jpg"))
     parser.add_argument("--jpeg-quality", default=60, type=int)
+    parser.add_argument("--input-modality", default=INPUT_MODALITY_DEPTH, choices=INPUT_MODALITIES)
     parser.add_argument("--stateless", action="store_true")
     parser.add_argument("--pose-only", action="store_true")
     parser.add_argument("--no-pose-validate", action="store_true")

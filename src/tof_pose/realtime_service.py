@@ -34,6 +34,10 @@ MEDIAN_BLUR_K = 5
 CLAHE_CLIP_LIMIT = 2.0
 CLAHE_TILE_GRID = (8, 8)
 
+INPUT_MODALITY_DEPTH = "depth"
+INPUT_MODALITY_IR = "ir"
+INPUT_MODALITIES = (INPUT_MODALITY_DEPTH, INPUT_MODALITY_IR)
+
 DISPLAY_MODE_BOTH = "both"
 DISPLAY_MODE_CONTOUR_ONLY = "contour"
 DISPLAY_MODE_SKELETON_ONLY = "skeleton"
@@ -55,6 +59,7 @@ MASK_MIN_AREA_RATIO = 0.003
 MASK_MAX_AREA_RATIO = 0.9
 MASK_AREA_JUMP_RATIO = 1.5
 MASK_JUMP_HOLD_FRAMES = 2
+DEPTH_PERSON_DISTANCE_CLOSE_THRESHOLD = 150.0
 PERSON_DISTANCE_CLOSE_GAP_RATIO = 0.15
 PERSON_DISTANCE_CLOSE_CENTER_RATIO = 0.90
 QUALITATIVE_KPT_CONF_THRESHOLD = 0.35
@@ -62,6 +67,8 @@ ACTION_KEYPOINT_SHIFT_HIGH_PX = 18.0
 ACTION_KEYPOINT_SHIFT_PEAK_HIGH_PX = 28.0
 ACTION_BOX_CENTER_SHIFT_HIGH_RATIO = 0.18
 ACTION_BOX_SCALE_SHIFT_HIGH_RATIO = 0.25
+ACTION_DEPTH_MEAN_DIFF_HIGH = 6.0
+ACTION_DEPTH_P95_DIFF_HIGH = 24.0
 ACTION_IR_MEAN_DIFF_HIGH = 10.0
 ACTION_IR_P95_DIFF_HIGH = 32.0
 ACTION_HIGH_CONFIRM_FRAMES = 2
@@ -256,15 +263,24 @@ def _decode_frame_cpu(frame: tuple[str, bytes]) -> tuple[str, np.ndarray]:
     return frame_id, _decode_image_bytes_cpu(image_bytes)
 
 
-def _prepare_depth_views_cpu(depth_gray: np.ndarray) -> dict:
+def _normalize_input_modality(input_modality: str | None) -> str:
+    normalized = str(input_modality or INPUT_MODALITY_DEPTH).strip().lower()
+    if normalized not in INPUT_MODALITIES:
+        raise ValueError(f"input_modality must be one of: {', '.join(INPUT_MODALITIES)}")
+    return normalized
+
+
+def _prepare_depth_views_cpu(depth_gray: np.ndarray, input_modality: str = INPUT_MODALITY_DEPTH) -> dict:
     width, height = DISPLAY_SIZE
+    modality = _normalize_input_modality(input_modality)
     depth_u8 = _ensure_uint8_gray_cpu(depth_gray)
     depth_raw = cv2.resize(depth_u8, DISPLAY_SIZE, interpolation=cv2.INTER_LINEAR)
 
     enhanced = depth_u8
-    if MEDIAN_BLUR_K and MEDIAN_BLUR_K >= 3:
-        enhanced = cv2.medianBlur(enhanced, MEDIAN_BLUR_K)
-    enhanced = _get_worker_clahe().apply(enhanced)
+    if modality == INPUT_MODALITY_IR:
+        if MEDIAN_BLUR_K and MEDIAN_BLUR_K >= 3:
+            enhanced = cv2.medianBlur(enhanced, MEDIAN_BLUR_K)
+        enhanced = _get_worker_clahe().apply(enhanced)
 
     depth_up = cv2.resize(enhanced, DISPLAY_SIZE, interpolation=cv2.INTER_LINEAR)
     color_img = cv2.applyColorMap(depth_up, cv2.COLORMAP_MAGMA)
@@ -277,8 +293,16 @@ def _prepare_depth_views_cpu(depth_gray: np.ndarray) -> dict:
     }
 
 
-def _prepare_color_image_cpu(depth_gray: np.ndarray) -> np.ndarray:
-    return _prepare_depth_views_cpu(depth_gray)["color_img"]
+def _prepare_color_image_cpu(payload) -> np.ndarray:
+    if isinstance(payload, tuple):
+        depth_gray, input_modality = payload
+    else:
+        depth_gray = payload
+        input_modality = INPUT_MODALITY_DEPTH
+    return _prepare_depth_views_cpu(
+        depth_gray,
+        input_modality=input_modality,
+    )["color_img"]
 
 
 def _track_color(track_id: int) -> tuple[int, int, int]:
@@ -620,7 +644,7 @@ def _extract_person_boxes(analysis: dict, max_people: int = 2) -> list[np.ndarra
     return boxes[:max_people]
 
 
-def _compute_person_distance(analysis: dict) -> str:
+def _compute_person_distance_ir(analysis: dict) -> str:
     person_count = int(analysis.get("person_count", 0) or 0)
     if person_count < 2:
         return ""
@@ -643,6 +667,20 @@ def _compute_person_distance(analysis: dict) -> str:
             if separated_gap <= close_gap_px or center_distance <= avg_extent * PERSON_DISTANCE_CLOSE_CENTER_RATIO:
                 return "close"
     return "far"
+
+
+def _compute_person_distance_depth(analysis: dict) -> str:
+    person_count = int(analysis.get("person_count", 0) or 0)
+    if person_count < 2:
+        return ""
+    pairs = analysis.get("pair_stats") or []
+    if not pairs:
+        return ""
+    spacings = [float(item[2]) for item in pairs if len(item) >= 3]
+    if not spacings:
+        return ""
+    nearest = min(spacings)
+    return "close" if nearest <= DEPTH_PERSON_DISTANCE_CLOSE_THRESHOLD else "far"
 
 
 def _build_action_signature(analysis: dict) -> dict:
@@ -735,6 +773,18 @@ def _ir_frame_motion_is_high(previous_frame: np.ndarray | None, current_frame: n
     mean_diff = float(np.mean(diff)) if diff.size else 0.0
     p95_diff = float(np.percentile(diff, 95)) if diff.size else 0.0
     return mean_diff >= ACTION_IR_MEAN_DIFF_HIGH or p95_diff >= ACTION_IR_P95_DIFF_HIGH
+
+
+def _depth_frame_motion_is_high(previous_frame: np.ndarray | None, current_frame: np.ndarray) -> bool:
+    if previous_frame is None:
+        return False
+    if previous_frame.shape != current_frame.shape:
+        previous_frame = cv2.resize(previous_frame, (current_frame.shape[1], current_frame.shape[0]), interpolation=cv2.INTER_LINEAR)
+    diff = cv2.absdiff(current_frame, previous_frame)
+    mean_diff = float(np.mean(diff)) if diff.size else 0.0
+    p95_diff = float(np.percentile(diff, 95)) if diff.size else 0.0
+    return mean_diff >= ACTION_DEPTH_MEAN_DIFF_HIGH or p95_diff >= ACTION_DEPTH_P95_DIFF_HIGH
+
 
 def _copy_qualitative_result_fields(source: dict) -> dict:
     return {key: str(source.get(key, "") or "") for key in QUALITATIVE_RESULT_KEYS}
@@ -960,6 +1010,7 @@ class RealtimePoseEngine:
         cpu_process_start_method: str = "auto",
         instance_name: str | None = None,
         parallel_models: bool = True,
+        input_modality: str = INPUT_MODALITY_DEPTH,
     ) -> None:
         model_file = Path(model_path) if model_path else DEFAULT_MODEL_PATH
         pose_model_file = Path(pose_model_path) if pose_model_path else DEFAULT_POSE_MODEL_PATH
@@ -991,6 +1042,7 @@ class RealtimePoseEngine:
             raise ValueError("output_format must be png or jpeg")
         self._output_format = normalized_output_format
         self._jpeg_quality = min(100, max(1, int(jpeg_quality)))
+        self._input_modality = _normalize_input_modality(input_modality)
         self._instance_name = str(instance_name).strip() if instance_name else "model-0"
         self._lock = threading.Lock()
         self._stateless = bool(stateless)
@@ -1056,7 +1108,6 @@ class RealtimePoseEngine:
         self._last_action_frame: np.ndarray | None = None
         self._last_action_signature: dict | None = None
         self._action_high_streak = 0
-        self._clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP_LIMIT, tileGridSize=CLAHE_TILE_GRID)
         self._track_gate: dict[int, _TrackGateState] = {}
         self._mask_jump_state: dict[int, _MaskJumpState] = {}
         self._contour_track_state: dict[int, _ContourTrackState] = {}
@@ -1296,28 +1347,7 @@ class RealtimePoseEngine:
         return normalized.astype(np.uint8)
 
     def _prepare_depth_views(self, depth_gray: np.ndarray) -> dict:
-        width, height = DISPLAY_SIZE
-        depth_u8 = self._ensure_uint8_gray(depth_gray)
-
-        # Keep a non-equalized copy (resized only) for distance estimation.
-        depth_raw = cv2.resize(depth_u8, DISPLAY_SIZE, interpolation=cv2.INTER_LINEAR)
-
-        # Match the previous offline video inference pipeline:
-        # grayscale -> median blur -> CLAHE -> (then) resize to 320x320.
-        enhanced = depth_u8
-        if MEDIAN_BLUR_K and MEDIAN_BLUR_K >= 3:
-            enhanced = cv2.medianBlur(enhanced, MEDIAN_BLUR_K)
-        enhanced = self._clahe.apply(enhanced)
-
-        depth_up = cv2.resize(enhanced, DISPLAY_SIZE, interpolation=cv2.INTER_LINEAR)
-        color_img = cv2.applyColorMap(depth_up, cv2.COLORMAP_MAGMA)
-        return {
-            "depth_up": depth_up,
-            "depth_raw": depth_raw,
-            "color_img": color_img,
-            "width": width,
-            "height": height,
-        }
+        return _prepare_depth_views_cpu(depth_gray, input_modality=self._input_modality)
 
     def _analyze_frame(
         self,
@@ -1882,6 +1912,32 @@ class RealtimePoseEngine:
         else:
             self._action_high_streak = 0
         return "high" if self._action_high_streak >= ACTION_HIGH_CONFIRM_FRAMES else "low"
+
+    def _classify_action_level_from_depth(self, analysis: dict) -> str:
+        current_frame = self._ensure_uint8_gray(analysis["depth_raw"])
+        current_signature = _build_action_signature(analysis)
+        raw_high_motion = _action_signature_is_high(self._last_action_signature, current_signature)
+        if not raw_high_motion:
+            raw_high_motion = _depth_frame_motion_is_high(self._last_action_frame, current_frame)
+
+        self._last_action_signature = current_signature
+        self._last_action_frame = current_frame.copy()
+        if raw_high_motion:
+            self._action_high_streak += 1
+        else:
+            self._action_high_streak = 0
+        return "high" if self._action_high_streak >= ACTION_HIGH_CONFIRM_FRAMES else "low"
+
+    def _compute_person_distance(self, analysis: dict) -> str:
+        if self._input_modality == INPUT_MODALITY_IR:
+            return _compute_person_distance_ir(analysis)
+        return _compute_person_distance_depth(analysis)
+
+    def _classify_action_level(self, analysis: dict) -> str:
+        if self._input_modality == INPUT_MODALITY_IR:
+            return self._classify_action_level_from_ir(analysis)
+        return self._classify_action_level_from_depth(analysis)
+
     def _analyze_predecoded_unlocked(
         self,
         frame_id: str,
@@ -1902,8 +1958,8 @@ class RealtimePoseEngine:
             "person_count": int(analysis["person_count"]),
             "processing_time_ms": elapsed,
             "person_status": _compute_person_status(analysis),
-            "person_distance": _compute_person_distance(analysis),
-            "action_level": self._classify_action_level_from_ir(analysis),
+            "person_distance": self._compute_person_distance(analysis),
+            "action_level": self._classify_action_level(analysis),
         }
 
     def _reuse_analyzed_result_with_depth(self, analyzed: dict, frame_id: str, depth: np.ndarray) -> dict:
@@ -2010,7 +2066,8 @@ class RealtimePoseEngine:
     def _prepare_model_color_images(self, source_frames: list[dict]) -> list[np.ndarray]:
         depths = [item["depth"] for item in source_frames]
         if self._cpu_worker_mode == CPU_WORKER_MODE_PROCESS:
-            return self._map_decode_stage(_prepare_color_image_cpu, depths)
+            payloads = [(depth, self._input_modality) for depth in depths]
+            return self._map_decode_stage(_prepare_color_image_cpu, payloads)
         return [self._prepare_depth_views(depth)["color_img"] for depth in depths]
 
     def _infer_one_unlocked(self, frame_id: str, image_bytes: bytes) -> dict:
@@ -2032,7 +2089,7 @@ class RealtimePoseEngine:
                 "model_infer_ms=%d seg_model_ms=%d pose_model_ms=%d parallel_models=%s "
                 "postprocess_ms=%d interpolate_ms=%d render_ms=%d png_encode_ms=%d total_ms=%d "
                 "decode_workers=%d render_workers=%d cpu_worker_mode=%s cpu_process_start_method=%s "
-                "png_compression=%d output_format=%s jpeg_quality=%d device=%s"
+                "png_compression=%d output_format=%s jpeg_quality=%d input_modality=%s device=%s"
             ),
             input_count,
             output_count,
@@ -2058,6 +2115,7 @@ class RealtimePoseEngine:
             self._png_compression,
             self._output_format,
             self._jpeg_quality,
+            self._input_modality,
             self._device or "auto",
         )
 

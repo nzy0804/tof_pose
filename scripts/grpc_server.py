@@ -149,6 +149,7 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         oss_download_workers: int | None = None,
         oss_upload_workers: int | None = None,
         oss_global_workers: int = 8,
+        oss_download_wait_timeout_ms: int = 150,
         oss_upload_wait_timeout_ms: int = 0,
         null_qualitative_results: bool = False,
     ):
@@ -174,6 +175,7 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
             int(self._oss_workers if oss_upload_workers is None else oss_upload_workers),
         )
         self._oss_global_workers = max(0, int(oss_global_workers))
+        self._oss_download_wait_timeout_ms = max(0, int(oss_download_wait_timeout_ms))
         self._oss_upload_wait_timeout_ms = max(0, int(oss_upload_wait_timeout_ms))
         self._null_qualitative_results = bool(null_qualitative_results)
         self._oss_global_semaphore = (
@@ -189,7 +191,7 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
                     "Object storage enabled: provider=%s endpoint=%s bucket=%s output_prefix=%s "
                     "workers=%d download_workers=%d upload_workers=%d global_workers=%d pool_connections=%d "
                     "connect_timeout_sec=%s read_timeout_sec=%s request_retries=%d request_deadline_sec=%s "
-                    "retry_backoff_ms=%d upload_wait_timeout_ms=%d"
+                    "retry_backoff_ms=%d download_wait_timeout_ms=%d upload_wait_timeout_ms=%d"
                 ),
                 self._oss_config.provider,
                 self._oss_config.endpoint,
@@ -205,6 +207,7 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
                 self._oss_config.request_retries,
                 self._oss_config.request_deadline_sec,
                 self._oss_config.retry_backoff_ms,
+                self._oss_download_wait_timeout_ms,
                 self._oss_upload_wait_timeout_ms,
             )
         for idx in range(self._engine_count):
@@ -366,7 +369,13 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
                     capture_timestamp_ms = int((prev_ts + current_ts) // 2)
             result["capture_timestamp_ms"] = int(capture_timestamp_ms or 0)
 
-    def _download_request_images(self, images: list) -> tuple[list[tuple[str, bytes]], int, dict[str, int]]:
+    def _download_request_images(
+        self,
+        images: list,
+        *,
+        device_id: str = "",
+        batch_id: str = "",
+    ) -> tuple[list[tuple[str, bytes]], int, dict[str, int]]:
         if self._oss_client is None:
             frames = []
             for image in images:
@@ -394,17 +403,52 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
                 return index, (frame_id, image_data)
             raise ValueError(f"image {frame_id!r} missing object_key")
 
-        with ThreadPoolExecutor(max_workers=self._oss_concurrency(len(images), self._oss_download_workers)) as executor:
+        futures = []
+        executor = ThreadPoolExecutor(max_workers=self._oss_concurrency(len(images), self._oss_download_workers))
+        try:
             futures = [executor.submit(download_one, index, image) for index, image in enumerate(images)]
-            for future in as_completed(futures):
+            timeout_sec = (
+                self._oss_download_wait_timeout_ms / 1000.0
+                if self._oss_download_wait_timeout_ms > 0
+                else None
+            )
+            if timeout_sec is None:
+                done = set()
+                for future in as_completed(futures):
+                    done.add(future)
+            else:
+                done, pending = wait(futures, timeout=timeout_sec)
+                if pending:
+                    for future in pending:
+                        future.cancel()
+                    logging.warning(
+                        (
+                            "Object storage download wait timeout: device_id=%s batch_id=%s waited_ms=%d "
+                            "completed=%d pending=%d"
+                        ),
+                        device_id,
+                        batch_id,
+                        self._oss_download_wait_timeout_ms,
+                        len(done),
+                        len(pending),
+                    )
+                    raise TimeoutError(
+                        (
+                            f"object storage download wait timeout after {self._oss_download_wait_timeout_ms}ms: "
+                            f"completed={len(done)} pending={len(pending)}"
+                        )
+                    )
+
+            for future in done:
                 index, frame = future.result()
                 frames[index] = frame
+        finally:
+            executor.shutdown(wait=self._oss_download_wait_timeout_ms <= 0, cancel_futures=True)
 
-        return (
-            [frame for frame in frames if frame is not None],
-            int((time.perf_counter() - download_start) * 1000),
-            stage_stats.summary(),
-        )
+        summary = stage_stats.summary()
+        summary["wait_timeout_ms"] = self._oss_download_wait_timeout_ms
+        summary["pending"] = 0
+        return [frame for frame in frames if frame is not None], int((time.perf_counter() - download_start) * 1000), summary
 
     def _upload_result_images(
         self,
@@ -565,7 +609,11 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
 
         grpc_start = time.perf_counter()
         try:
-            frames, oss_download_ms, oss_download_stats = self._download_request_images(images)
+            frames, oss_download_ms, oss_download_stats = self._download_request_images(
+                images,
+                device_id=device_id,
+                batch_id=batch_id,
+            )
             if len(frames) != len(images):
                 raise RuntimeError(f"expected {len(images)} downloaded frames, got {len(frames)}")
         except Exception as e:
@@ -650,6 +698,7 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
                 "inputs=%d results=%d "
                 "oss_download_ms=%d oss_download_count=%d oss_download_bytes=%d "
                 "oss_download_p50_ms=%d oss_download_p95_ms=%d oss_download_max_ms=%d "
+                "oss_download_wait_timeout_ms=%d oss_download_pending_count=%d "
                 "engine_infer_ms=%d "
                 "oss_upload_ms=%d oss_upload_count=%d oss_upload_bytes=%d "
                 "oss_upload_p50_ms=%d oss_upload_p95_ms=%d oss_upload_max_ms=%d "
@@ -667,6 +716,8 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
             oss_download_stats["p50_ms"],
             oss_download_stats["p95_ms"],
             oss_download_stats["max_ms"],
+            oss_download_stats.get("wait_timeout_ms", 0),
+            oss_download_stats.get("pending", 0),
             engine_infer_ms,
             oss_upload_ms,
             oss_upload_stats["count"],
@@ -723,6 +774,7 @@ def serve(
     oss_download_workers: int | None = None,
     oss_upload_workers: int | None = None,
     oss_global_workers: int = 8,
+    oss_download_wait_timeout_ms: int = 150,
     oss_upload_wait_timeout_ms: int = 0,
     null_qualitative_results: bool = False,
 ):
@@ -768,6 +820,7 @@ def serve(
             oss_download_workers=oss_download_workers,
             oss_upload_workers=oss_upload_workers,
             oss_global_workers=oss_global_workers,
+            oss_download_wait_timeout_ms=oss_download_wait_timeout_ms,
             oss_upload_wait_timeout_ms=oss_upload_wait_timeout_ms,
             null_qualitative_results=null_qualitative_results,
         ),
@@ -971,6 +1024,12 @@ def main():
         help='global concurrent object storage operations shared by all requests; 0 disables global limiting',
     )
     parser.add_argument(
+        '--oss-download-wait-timeout-ms',
+        default=150,
+        type=int,
+        help='maximum milliseconds to wait for request image downloads before failing the request; 0 waits for all downloads',
+    )
+    parser.add_argument(
         '--oss-upload-wait-timeout-ms',
         default=0,
         type=int,
@@ -1033,6 +1092,7 @@ def main():
         oss_download_workers=args.oss_download_workers,
         oss_upload_workers=args.oss_upload_workers,
         oss_global_workers=args.oss_global_workers,
+        oss_download_wait_timeout_ms=args.oss_download_wait_timeout_ms,
         oss_upload_wait_timeout_ms=args.oss_upload_wait_timeout_ms,
         null_qualitative_results=args.null_qualitative_results,
     )

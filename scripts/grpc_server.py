@@ -138,6 +138,7 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         output_format: str = "png",
         jpeg_quality: int = 80,
         input_modality: str = INPUT_MODALITY_DEPTH,
+        ir_preprocess: bool = False,
         cpu_worker_mode: str = CPU_WORKER_MODE_THREAD,
         cpu_process_start_method: str = "auto",
         model_instances: int = 1,
@@ -238,6 +239,7 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
                     output_format=output_format,
                     jpeg_quality=jpeg_quality,
                     input_modality=input_modality,
+                    ir_preprocess=ir_preprocess,
                     cpu_worker_mode=cpu_worker_mode,
                     cpu_process_start_method=cpu_process_start_method,
                     instance_name=f"model-{idx}",
@@ -630,8 +632,8 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
             engine_start = time.perf_counter()
             results = engine.infer_batch(frames)
             engine_infer_ms = int((time.perf_counter() - engine_start) * 1000)
-            if len(results) != len(images) * 2:
-                raise RuntimeError(f"expected {len(images) * 2} results for {len(images)} inputs, got {len(results)}")
+            if len(results) != len(images):
+                raise RuntimeError(f"expected {len(images)} results for {len(images)} inputs, got {len(results)}")
             self._annotate_result_capture_timestamps(device_id, images, results)
         except Exception as e:
             logging.exception("Infer failed: device_id=%s batch_id=%s instance=%d", device_id, batch_id, engine_index)
@@ -765,6 +767,7 @@ def serve(
     output_format: str = "png",
     jpeg_quality: int = 80,
     input_modality: str = INPUT_MODALITY_DEPTH,
+    ir_preprocess: bool = False,
     cpu_worker_mode: str = CPU_WORKER_MODE_THREAD,
     cpu_process_start_method: str = "auto",
     model_instances: int = 1,
@@ -812,6 +815,7 @@ def serve(
             output_format=output_format,
             jpeg_quality=jpeg_quality,
             input_modality=input_modality,
+            ir_preprocess=ir_preprocess,
             cpu_worker_mode=cpu_worker_mode,
             cpu_process_start_method=cpu_process_start_method,
             model_instances=model_instances,
@@ -858,7 +862,7 @@ def serve(
             model_instances,
         )
     logging.info(
-        'Starting gRPC server on %s (max_msg_mb=%d, max_workers=%d, model_instances=%d, parallel_models=%s, cpu_worker_mode=%s, cpu_process_start_method=%s, input_modality=%s)',
+        'Starting gRPC server on %s (max_msg_mb=%d, max_workers=%d, model_instances=%d, parallel_models=%s, cpu_worker_mode=%s, cpu_process_start_method=%s, input_modality=%s, ir_preprocess=%s)',
         bound_address,
         max_msg_mb,
         max_workers,
@@ -867,6 +871,7 @@ def serve(
         cpu_worker_mode,
         cpu_process_start_method,
         input_modality,
+        "true" if ir_preprocess else "false",
     )
     server.start()
     try:
@@ -961,7 +966,12 @@ def main():
         '--input-modality',
         default=INPUT_MODALITY_DEPTH,
         choices=INPUT_MODALITIES,
-        help='input image modality: ir applies grayscale median filtering plus CLAHE; depth directly applies pseudo color',
+        help='input image modality: ir returns grayscale images by default; depth returns pseudo color images',
+    )
+    parser.add_argument(
+        '--ir-preprocess',
+        action='store_true',
+        help='enable median filtering plus CLAHE for infrared grayscale inputs',
     )
     parser.add_argument(
         '--model-instances',
@@ -1092,6 +1102,7 @@ def main():
         output_format=args.output_format,
         jpeg_quality=args.jpeg_quality,
         input_modality=args.input_modality,
+        ir_preprocess=args.ir_preprocess,
         cpu_worker_mode=args.cpu_worker_mode,
         cpu_process_start_method=args.cpu_process_start_method,
         model_instances=args.model_instances,

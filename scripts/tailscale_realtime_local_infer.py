@@ -181,6 +181,7 @@ def build_engine(args: argparse.Namespace) -> RealtimePoseEngine:
         output_format=args.output_format,
         jpeg_quality=args.jpeg_quality,
         input_modality=args.input_modality,
+        ir_preprocess=args.ir_preprocess,
         cpu_worker_mode=args.cpu_worker_mode,
         cpu_process_start_method=args.cpu_process_start_method,
         instance_name="tailscale-local",
@@ -447,6 +448,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-format", default="jpeg", choices=("png", "jpeg", "jpg"))
     parser.add_argument("--jpeg-quality", default=60, type=int)
     parser.add_argument("--input-modality", default=INPUT_MODALITY_DEPTH, choices=INPUT_MODALITIES)
+    parser.add_argument("--ir-preprocess", action="store_true", help="enable median filtering plus CLAHE for infrared grayscale inputs")
     parser.add_argument("--stateless", action="store_true")
     parser.add_argument("--pose-only", action="store_true")
     parser.add_argument("--no-pose-validate", action="store_true")

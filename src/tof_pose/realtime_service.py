@@ -26,9 +26,9 @@ TRACKER_CONFIG = "botsort.yaml"
 SEG_INFER_IMGSZ = 320
 POSE_INFER_IMGSZ = 320
 POSE_INFER_INTERVAL = 1
-MASK_BLEND_ALPHA = 0.25
 DISPLAY_SIZE = (320, 320)
 DISPLAY_SCALE = 3
+DISPLAY_GAMMA = 1.5
 
 MEDIAN_BLUR_K = 5
 CLAHE_CLIP_LIMIT = 2.0
@@ -63,6 +63,8 @@ DEPTH_PERSON_DISTANCE_CLOSE_THRESHOLD = 150.0
 PERSON_DISTANCE_CLOSE_GAP_RATIO = 0.15
 PERSON_DISTANCE_CLOSE_CENTER_RATIO = 0.90
 QUALITATIVE_KPT_CONF_THRESHOLD = 0.35
+POSE_BATCH_REUSE_MIN_VALID_RATIO = 0.45
+POSE_BATCH_REUSE_MAX_GAP = 1
 ACTION_KEYPOINT_SHIFT_HIGH_PX = 18.0
 ACTION_KEYPOINT_SHIFT_PEAK_HIGH_PX = 28.0
 ACTION_BOX_CENTER_SHIFT_HIGH_RATIO = 0.18
@@ -75,6 +77,8 @@ ACTION_HIGH_CONFIRM_FRAMES = 2
 POSE_FALLBACK_KPT_CONF_THRESHOLD = 0.45
 POSE_FALLBACK_MIN_POINTS = 7
 QUALITATIVE_RESULT_KEYS = ("person_status", "person_distance", "action_level")
+PERSON_FILL_COLOR_SCALE = 0.35
+PERSON_FILL_COLOR_BIAS = 135.0
 
 TRACK_COLORS = [
     (40, 210, 255),
@@ -270,24 +274,65 @@ def _normalize_input_modality(input_modality: str | None) -> str:
     return normalized
 
 
-def _prepare_depth_views_cpu(depth_gray: np.ndarray, input_modality: str = INPUT_MODALITY_DEPTH) -> dict:
+def _apply_depth_display_colormap(depth_u8: np.ndarray) -> np.ndarray:
+    valid_mask = depth_u8 > 0
+    inverted = (255 - depth_u8).astype(np.uint8, copy=False)
+    if np.any(~valid_mask):
+        inverted = inverted.copy()
+        inverted[~valid_mask] = 0
+    return cv2.applyColorMap(inverted, cv2.COLORMAP_VIRIDIS)
+
+
+def _apply_display_colormap(depth_u8: np.ndarray, input_modality: str) -> np.ndarray:
+    if input_modality == INPUT_MODALITY_DEPTH:
+        return _apply_depth_display_colormap(depth_u8)
+    return _gray_to_bgr(depth_u8)
+
+
+def _apply_display_gamma_u8(image_u8: np.ndarray, gamma: float = DISPLAY_GAMMA) -> np.ndarray:
+    if image_u8.dtype != np.uint8:
+        image_u8 = np.clip(image_u8, 0, 255).astype(np.uint8)
+    gamma = float(gamma)
+    if gamma <= 0 or abs(gamma - 1.0) < 1e-3:
+        return image_u8.copy()
+    table = ((np.arange(256, dtype=np.float32) / 255.0) ** (1.0 / gamma) * 255.0)
+    return cv2.LUT(image_u8, np.clip(table, 0, 255).astype(np.uint8))
+
+
+def _gray_to_bgr(gray_u8: np.ndarray) -> np.ndarray:
+    return cv2.cvtColor(gray_u8, cv2.COLOR_GRAY2BGR)
+
+
+def _prepare_depth_views_cpu(
+    depth_gray: np.ndarray,
+    input_modality: str = INPUT_MODALITY_DEPTH,
+    *,
+    ir_preprocess: bool = False,
+) -> dict:
     width, height = DISPLAY_SIZE
     modality = _normalize_input_modality(input_modality)
     depth_u8 = _ensure_uint8_gray_cpu(depth_gray)
     depth_raw = cv2.resize(depth_u8, DISPLAY_SIZE, interpolation=cv2.INTER_LINEAR)
 
     enhanced = depth_u8
-    if modality == INPUT_MODALITY_IR:
+    if modality == INPUT_MODALITY_IR and ir_preprocess:
         if MEDIAN_BLUR_K and MEDIAN_BLUR_K >= 3:
             enhanced = cv2.medianBlur(enhanced, MEDIAN_BLUR_K)
         enhanced = _get_worker_clahe().apply(enhanced)
 
     depth_up = cv2.resize(enhanced, DISPLAY_SIZE, interpolation=cv2.INTER_LINEAR)
-    color_img = cv2.applyColorMap(depth_up, cv2.COLORMAP_MAGMA)
+    display_depth_up = _apply_display_gamma_u8(depth_up)
+    if modality == INPUT_MODALITY_IR:
+        color_img = _gray_to_bgr(display_depth_up)
+        model_color_img = _gray_to_bgr(depth_up)
+    else:
+        model_color_img = cv2.applyColorMap(depth_up, cv2.COLORMAP_MAGMA)
+        color_img = _apply_display_colormap(display_depth_up, modality)
     return {
-        "depth_up": depth_up,
+        "depth_up": display_depth_up,
         "depth_raw": depth_raw,
         "color_img": color_img,
+        "model_color_img": model_color_img,
         "width": width,
         "height": height,
     }
@@ -295,14 +340,20 @@ def _prepare_depth_views_cpu(depth_gray: np.ndarray, input_modality: str = INPUT
 
 def _prepare_color_image_cpu(payload) -> np.ndarray:
     if isinstance(payload, tuple):
-        depth_gray, input_modality = payload
+        if len(payload) >= 3:
+            depth_gray, input_modality, ir_preprocess = payload[:3]
+        else:
+            depth_gray, input_modality = payload
+            ir_preprocess = False
     else:
         depth_gray = payload
         input_modality = INPUT_MODALITY_DEPTH
+        ir_preprocess = False
     return _prepare_depth_views_cpu(
         depth_gray,
         input_modality=input_modality,
-    )["color_img"]
+        ir_preprocess=bool(ir_preprocess),
+    )["model_color_img"]
 
 
 def _track_color(track_id: int) -> tuple[int, int, int]:
@@ -790,6 +841,24 @@ def _copy_qualitative_result_fields(source: dict) -> dict:
     return {key: str(source.get(key, "") or "") for key in QUALITATIVE_RESULT_KEYS}
 
 
+def _person_fill_color(track_color: tuple[int, int, int]) -> tuple[int, int, int]:
+    color = np.array(track_color, dtype=np.float32)
+    fill = color * PERSON_FILL_COLOR_SCALE + PERSON_FILL_COLOR_BIAS
+    return tuple(int(value) for value in np.clip(fill, 0, 255).astype(np.uint8).tolist())
+
+
+def _fill_person_mask_region(display: np.ndarray, mask: np.ndarray, color: tuple[int, int, int]) -> bool:
+    if display.ndim != 3 or display.shape[2] != 3:
+        return False
+    if mask.shape[:2] != display.shape[:2]:
+        mask = cv2.resize(mask, (display.shape[1], display.shape[0]), interpolation=cv2.INTER_NEAREST)
+    selected = mask > 0
+    if not np.any(selected):
+        return False
+    display[selected] = np.array(color, dtype=np.uint8)
+    return True
+
+
 def _render_skeleton_contour_cpu(analysis: dict) -> np.ndarray:
     records = analysis["records"]
     kpt_xy_np = analysis["kpt_xy_np"]
@@ -805,6 +874,9 @@ def _render_skeleton_contour_cpu(analysis: dict) -> np.ndarray:
         contour = record["contour"]
         if contour is None:
             continue
+        mask = record["mask"]
+        if mask is not None:
+            _fill_person_mask_region(display, mask, _person_fill_color(record["track_color"]))
 
         box = record["box"]
         anchor = record.get("anchor")
@@ -1011,6 +1083,7 @@ class RealtimePoseEngine:
         instance_name: str | None = None,
         parallel_models: bool = True,
         input_modality: str = INPUT_MODALITY_DEPTH,
+        ir_preprocess: bool = False,
     ) -> None:
         model_file = Path(model_path) if model_path else DEFAULT_MODEL_PATH
         pose_model_file = Path(pose_model_path) if pose_model_path else DEFAULT_POSE_MODEL_PATH
@@ -1043,6 +1116,7 @@ class RealtimePoseEngine:
         self._output_format = normalized_output_format
         self._jpeg_quality = min(100, max(1, int(jpeg_quality)))
         self._input_modality = _normalize_input_modality(input_modality)
+        self._ir_preprocess = bool(ir_preprocess)
         self._instance_name = str(instance_name).strip() if instance_name else "model-0"
         self._lock = threading.Lock()
         self._stateless = bool(stateless)
@@ -1347,7 +1421,11 @@ class RealtimePoseEngine:
         return normalized.astype(np.uint8)
 
     def _prepare_depth_views(self, depth_gray: np.ndarray) -> dict:
-        return _prepare_depth_views_cpu(depth_gray, input_modality=self._input_modality)
+        return _prepare_depth_views_cpu(
+            depth_gray,
+            input_modality=self._input_modality,
+            ir_preprocess=self._ir_preprocess,
+        )
 
     def _analyze_frame(
         self,
@@ -1361,6 +1439,7 @@ class RealtimePoseEngine:
         depth_up = prepared["depth_up"]
         depth_raw = prepared["depth_raw"]
         color_img = prepared["color_img"]
+        model_color_img = prepared.get("model_color_img", color_img)
         width = prepared["width"]
         height = prepared["height"]
 
@@ -1368,7 +1447,7 @@ class RealtimePoseEngine:
         if self._pose_only:
             if pose_result is None:
                 pose_results = self.pose_model.predict(
-                    color_img,
+                    model_color_img,
                     conf=self._pose_conf_threshold,
                     classes=[0],
                     imgsz=POSE_INFER_IMGSZ,
@@ -1420,7 +1499,7 @@ class RealtimePoseEngine:
 
         if seg_result is None:
             results = self.seg_model.track(
-                color_img,
+                model_color_img,
                 conf=self._seg_conf_threshold,
                 persist=self._persist_tracks,
                 tracker=TRACKER_CONFIG,
@@ -1437,7 +1516,7 @@ class RealtimePoseEngine:
         if run_pose_now:
             if pose_result is None:
                 pose_results = self.pose_model.predict(
-                    color_img,
+                    model_color_img,
                     conf=self._pose_conf_threshold,
                     classes=[0],
                     imgsz=POSE_INFER_IMGSZ,
@@ -1750,6 +1829,7 @@ class RealtimePoseEngine:
                 contour = record["contour"]
                 mask = record["mask"]
                 label = record["label"]
+                shifted_contour = None
 
                 if contour is not None and display_mode != DISPLAY_MODE_SKELETON_ONLY:
                     anchor = record.get("anchor")
@@ -1758,16 +1838,13 @@ class RealtimePoseEngine:
                     else:
                         offset_x, offset_y = int(round(box[0])), int(round(box[1]))
                     shifted_contour = contour + np.array([[[offset_x, offset_y]]])
-                    cv2.drawContours(display, [shifted_contour], -1, track_color, 2, cv2.LINE_AA)
 
-                mask_overlay = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
-                selected = mask_overlay > 0
-                if np.any(selected):
-                    blended = (
-                        display[selected].astype(np.float32) * (1.0 - MASK_BLEND_ALPHA)
-                        + np.array(track_color, dtype=np.float32) * MASK_BLEND_ALPHA
-                    )
-                    display[selected] = blended.astype(np.uint8)
+                if mask is not None:
+                    mask_overlay = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+                    _fill_person_mask_region(display, mask_overlay, _person_fill_color(track_color))
+
+                if shifted_contour is not None:
+                    cv2.drawContours(display, [shifted_contour], -1, track_color, 2, cv2.LINE_AA)
 
                 x1 = max(0, int(round(box[0])))
                 y1 = max(18, int(round(box[1])) - 8)
@@ -2066,9 +2143,84 @@ class RealtimePoseEngine:
     def _prepare_model_color_images(self, source_frames: list[dict]) -> list[np.ndarray]:
         depths = [item["depth"] for item in source_frames]
         if self._cpu_worker_mode == CPU_WORKER_MODE_PROCESS:
-            payloads = [(depth, self._input_modality) for depth in depths]
+            payloads = [(depth, self._input_modality, self._ir_preprocess) for depth in depths]
             return self._map_decode_stage(_prepare_color_image_cpu, payloads)
-        return [self._prepare_depth_views(depth)["color_img"] for depth in depths]
+        return [self._prepare_depth_views(depth)["model_color_img"] for depth in depths]
+
+    def _apply_batch_pose_semantic_reuse(self, current_analyzed_by_input: dict[int, dict]) -> None:
+        if len(current_analyzed_by_input) <= 2:
+            return
+
+        ordered_indices = sorted(current_analyzed_by_input)
+        semantic_indices_by_input: dict[int, list[int]] = {}
+        valid_inputs: list[int] = []
+        for input_index in ordered_indices:
+            analysis = current_analyzed_by_input[input_index]["analysis"]
+            semantic_indices = _select_pose_indices_for_status(analysis)
+            semantic_indices_by_input[input_index] = semantic_indices
+            if semantic_indices:
+                valid_inputs.append(input_index)
+
+        min_valid = max(2, int(np.ceil(len(ordered_indices) * POSE_BATCH_REUSE_MIN_VALID_RATIO)))
+        if len(valid_inputs) < min_valid:
+            return
+
+        valid_set = set(valid_inputs)
+        position_by_input = {input_index: pos for pos, input_index in enumerate(ordered_indices)}
+        pos = 0
+        while pos < len(ordered_indices):
+            input_index = ordered_indices[pos]
+            if input_index in valid_set:
+                pos += 1
+                continue
+
+            run_start = pos
+            while pos < len(ordered_indices) and ordered_indices[pos] not in valid_set:
+                pos += 1
+            run_end = pos - 1
+            run_len = run_end - run_start + 1
+            if run_len > POSE_BATCH_REUSE_MAX_GAP:
+                continue
+
+            prev_input = ordered_indices[run_start - 1] if run_start > 0 else None
+            next_input = ordered_indices[pos] if pos < len(ordered_indices) else None
+            source_input = None
+            if prev_input in valid_set and next_input in valid_set:
+                target_pos = run_start
+                prev_distance = target_pos - position_by_input[prev_input]
+                next_distance = position_by_input[next_input] - target_pos
+                source_input = prev_input if prev_distance <= next_distance else next_input
+            elif prev_input in valid_set:
+                source_input = prev_input
+            elif next_input in valid_set:
+                source_input = next_input
+            if source_input is None:
+                continue
+
+            source_analysis = current_analyzed_by_input[source_input]["analysis"]
+            source_semantic_indices = semantic_indices_by_input.get(source_input) or []
+            if not source_semantic_indices:
+                continue
+
+            for target_pos in range(run_start, run_end + 1):
+                target_input = ordered_indices[target_pos]
+                target = current_analyzed_by_input[target_input]
+                target_analysis = target["analysis"]
+                target_analysis["kpt_xy_np"] = source_analysis.get("kpt_xy_np")
+                target_analysis["kpt_conf_np"] = source_analysis.get("kpt_conf_np")
+                target_analysis["pose_boxes"] = source_analysis.get("pose_boxes") or []
+                target_analysis["pose_to_track"] = {}
+                target_analysis["validated_track_ids"] = set()
+                target_analysis["pose_draw_indices"] = []
+                target_analysis["pose_fallback_indices"] = list(source_semantic_indices[:2])
+                target_analysis["pose_semantic_reused"] = True
+                target_analysis["person_count"] = max(
+                    int(target_analysis.get("person_count", 0) or 0),
+                    len(source_semantic_indices[:2]),
+                )
+                target["person_count"] = int(target_analysis["person_count"])
+                target["person_status"] = _compute_person_status(target_analysis)
+                target["person_distance"] = self._compute_person_distance(target_analysis)
 
     def _infer_one_unlocked(self, frame_id: str, image_bytes: bytes) -> dict:
         analyzed = self._analyze_predecoded_unlocked(frame_id, self._decode_image(image_bytes))
@@ -2272,35 +2424,19 @@ class RealtimePoseEngine:
                 interpolate_start = time.perf_counter()
                 output_frames: list[dict] = []
                 analyzed_results: list[dict] = []
-                previous_source = None if self._stateless else self._last_source_depth
                 for input_index, (frame_id, current_depth) in enumerate(decoded_frames):
                     current_analyzed = current_analyzed_by_input[input_index]
-                    interpolated_depth = self._interpolate_depth(previous_source, current_depth)
-                    interpolated_frame = {
-                        "frame_id": f"{frame_id}_interpolated",
-                        "source_frame_id": frame_id,
-                        "input_index": input_index,
-                        "result_kind": "interpolated",
-                    }
                     current_frame = {
                         "frame_id": f"{frame_id}_current",
                         "source_frame_id": frame_id,
                         "input_index": input_index,
                         "result_kind": "current",
                     }
-                    output_frames.append(interpolated_frame)
-                    analyzed_results.append(
-                        self._reuse_analyzed_result_with_depth(
-                            current_analyzed,
-                            interpolated_frame["frame_id"],
-                            interpolated_depth,
-                        )
-                    )
                     output_frames.append(current_frame)
                     analyzed_results.append(current_analyzed)
-                    previous_source = current_depth.copy()
 
-                self._last_source_depth = previous_source.copy() if previous_source is not None and not self._stateless else None
+                if decoded_frames and not self._stateless:
+                    self._last_source_depth = decoded_frames[-1][1].copy()
                 timings["interpolate_ms"] = _elapsed_ms(interpolate_start)
                 return output_frames, analyzed_results
 
@@ -2334,6 +2470,7 @@ class RealtimePoseEngine:
                         item["depth"],
                         pose_result=pose_results[input_index],
                     )
+                self._apply_batch_pose_semantic_reuse(current_analyzed_by_input)
                 timings["postprocess_ms"] = _elapsed_ms(postprocess_start)
                 self._log_model_confidences(
                     len(source_frames),
@@ -2419,6 +2556,7 @@ class RealtimePoseEngine:
                     seg_result=seg_results[input_index],
                     pose_result=pose_results[input_index],
                 )
+            self._apply_batch_pose_semantic_reuse(current_analyzed_by_input)
             timings["postprocess_ms"] = _elapsed_ms(postprocess_start)
             self._log_model_confidences(
                 len(source_frames),

@@ -85,10 +85,30 @@ def _extract_draw_contour(mask_uint8: np.ndarray, width: int, height: int) -> np
     return _smooth_closed_contour(best_contour, width, height)
 
 
+def extract_draw_contour_from_mask(
+    mask: np.ndarray,
+    width: int,
+    height: int,
+    *,
+    mask_is_binary: bool = False,
+) -> np.ndarray | None:
+    if mask_is_binary:
+        mask_uint8 = mask.astype(np.uint8, copy=False)
+        if mask_uint8.shape[:2] != (height, width):
+            mask_uint8 = cv2.resize(mask_uint8, (width, height), interpolation=cv2.INTER_NEAREST)
+        mask_uint8 = mask_uint8 * 255
+    else:
+        mask_uint8 = _normalize_mask(mask, width, height)
+    return _extract_draw_contour(mask_uint8, width, height)
+
+
 def estimate_person_distance_from_mask(
     depth_map: np.ndarray,
     box: np.ndarray,
     mask: np.ndarray,
+    *,
+    mask_is_binary: bool = False,
+    include_draw_contour: bool = True,
 ) -> PersonDistanceEstimate:
     """根据 YOLO segmentation mask 估计人体距离并提取轮廓。"""
     height, width = depth_map.shape[:2]
@@ -101,8 +121,14 @@ def estimate_person_distance_from_mask(
     if roi.size == 0:
         return PersonDistanceEstimate(None, (x1, y1), None, 0, "roi_empty")
 
-    normalized_mask = _normalize_mask(mask, width, height)
-    draw_contour = _extract_draw_contour(normalized_mask, width, height)
+    if mask_is_binary:
+        normalized_mask = mask.astype(np.uint8, copy=False)
+        if normalized_mask.shape[:2] != (height, width):
+            normalized_mask = cv2.resize(normalized_mask, (width, height), interpolation=cv2.INTER_NEAREST)
+        normalized_mask = normalized_mask * 255
+    else:
+        normalized_mask = _normalize_mask(mask, width, height)
+    draw_contour = _extract_draw_contour(normalized_mask, width, height) if include_draw_contour else None
     mask_roi = normalized_mask[y1:y2, x1:x2]
     if mask_roi.size == 0:
         return PersonDistanceEstimate(None, (x1, y1), None, 0, "mask_roi_empty", draw_contour)

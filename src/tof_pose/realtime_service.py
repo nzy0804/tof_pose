@@ -15,7 +15,7 @@ import numpy as np
 from ultralytics import YOLO
 
 from tof_pose.paths import DEFAULT_MODEL_PATH, DEFAULT_POSE_MODEL_PATH
-from tof_pose.person_distance import estimate_person_distance_from_mask
+from tof_pose.person_distance import estimate_person_distance_from_mask, extract_draw_contour_from_mask
 from tof_pose.pose_drawing import draw_stick_figure
 
 
@@ -354,6 +354,10 @@ def _prepare_depth_views_cpu(
 
 
 def _prepare_color_image_cpu(payload) -> np.ndarray:
+    return _prepare_depth_views_payload_cpu(payload)["model_color_img"]
+
+
+def _prepare_depth_views_payload_cpu(payload) -> dict:
     if isinstance(payload, tuple):
         if len(payload) >= 3:
             depth_gray, input_modality, ir_preprocess = payload[:3]
@@ -368,7 +372,25 @@ def _prepare_color_image_cpu(payload) -> np.ndarray:
         depth_gray,
         input_modality=input_modality,
         ir_preprocess=bool(ir_preprocess),
-    )["model_color_img"]
+    )
+
+
+def _estimate_distance_candidate_cpu(payload: dict) -> dict:
+    estimate = estimate_person_distance_from_mask(
+        payload["depth_raw"],
+        payload["box"],
+        payload["mask"],
+        mask_is_binary=True,
+        include_draw_contour=False,
+    )
+    contour_area = 0.0
+    if estimate.contour is not None:
+        contour_area = float(cv2.contourArea(estimate.contour))
+    return {
+        "task_id": int(payload["task_id"]),
+        "estimate": estimate,
+        "contour_area": contour_area,
+    }
 
 
 def _track_color(track_id: int) -> tuple[int, int, int]:
@@ -997,7 +1019,15 @@ def _lift_display_contour_head(contour: np.ndarray, width: int, height: int) -> 
 
 
 def _record_display_contour(record: dict, width: int, height: int) -> np.ndarray | None:
-    contour = record.get("draw_contour") if record.get("draw_contour") is not None else record.get("contour")
+    contour = record.get("draw_contour")
+    if contour is None:
+        mask = record.get("mask")
+        if mask is not None:
+            contour = extract_draw_contour_from_mask(mask, width, height, mask_is_binary=True)
+            if contour is not None:
+                record["draw_contour"] = contour
+    if contour is None:
+        contour = record.get("contour")
     if contour is None:
         return None
 
@@ -1433,24 +1463,31 @@ class RealtimePoseEngine:
             self._device or "auto",
         )
 
-    def _guard_mask_jump_with_reason(self, track_id: int, mask: np.ndarray) -> tuple[np.ndarray | None, str | None]:
+    def _guard_mask_jump_with_reason(
+        self,
+        track_id: int,
+        mask: np.ndarray,
+        current_area: int | None = None,
+    ) -> tuple[np.ndarray | None, str | None, int]:
         """Reject short-lived, per-track mask area spikes without averaging masks."""
         if mask.ndim != 2:
             raise ValueError("mask must be single-channel")
-        current = (mask > 0).astype(np.uint8)
-        current_area = int(np.count_nonzero(current))
+        current = mask.astype(np.uint8, copy=False)
+        if current.size and int(current.max()) > 1:
+            current = (current > 0).astype(np.uint8)
+        current_area = int(np.count_nonzero(current)) if current_area is None else int(current_area)
         max_area = int(current.size * float(self._mask_max_area_ratio))
         state = self._mask_jump_state.get(int(track_id))
 
         if state is None:
             if current_area > max_area:
-                return None, "mask_area_large"
+                return None, "mask_area_large", 0
             self._mask_jump_state[int(track_id)] = _MaskJumpState(
                 mask=current.copy(),
                 last_seen_frame=int(self._frame_idx),
                 rejected_frames=0,
             )
-            return current, None
+            return current, None, current_area
 
         previous = state.mask
         if previous.shape != current.shape:
@@ -1462,8 +1499,8 @@ class RealtimePoseEngine:
                 state.mask = previous.copy()
                 state.last_seen_frame = int(self._frame_idx)
                 state.rejected_frames = int(state.rejected_frames) + 1
-                return previous.copy(), None
-            return None, "mask_area_large"
+                return previous.copy(), None, previous_area
+            return None, "mask_area_large", 0
 
         area_jump = False
         if previous_area > 0 and current_area > 0:
@@ -1476,15 +1513,15 @@ class RealtimePoseEngine:
             state.mask = previous.copy()
             state.last_seen_frame = int(self._frame_idx)
             state.rejected_frames = int(state.rejected_frames) + 1
-            return previous.copy(), None
+            return previous.copy(), None, previous_area
 
         state.mask = current.copy()
         state.last_seen_frame = int(self._frame_idx)
         state.rejected_frames = 0
-        return current, None
+        return current, None, current_area
 
     def _guard_mask_jump(self, track_id: int, mask: np.ndarray) -> np.ndarray | None:
-        guarded_mask, _reason = self._guard_mask_jump_with_reason(track_id, mask)
+        guarded_mask, _reason, _area = self._guard_mask_jump_with_reason(track_id, mask)
         return guarded_mask
 
     def _contour_shape_reject_reason(
@@ -1494,11 +1531,12 @@ class RealtimePoseEngine:
         person_conf: float,
         width: int,
         height: int,
+        mask_area: int | None = None,
     ) -> str | None:
         if mask.ndim != 2:
             return "invalid_mask"
 
-        mask_area = int(np.count_nonzero(mask > 0))
+        mask_area = int(np.count_nonzero(mask > 0)) if mask_area is None else int(mask_area)
         image_area = max(1, int(width) * int(height))
         if mask_area < int(image_area * float(self._mask_min_area_ratio)):
             return "mask_area_small"
@@ -1616,9 +1654,12 @@ class RealtimePoseEngine:
         *,
         seg_result=None,
         pose_result=None,
+        prepared: dict | None = None,
+        distance_tasks: list[dict] | None = None,
     ) -> dict:
         self._frame_idx += 1
-        prepared = self._prepare_depth_views(depth_gray)
+        if prepared is None:
+            prepared = self._prepare_depth_views(depth_gray)
         depth_up = prepared["depth_up"]
         depth_raw = prepared["depth_raw"]
         color_img = prepared["color_img"]
@@ -1745,6 +1786,7 @@ class RealtimePoseEngine:
         validated_track_ids: set[int] = set()
         contour_reject_reasons: list[str] = []
         contour_debug_summary: list[str] = []
+        pending_distance_records: list[dict] = []
 
         def add_contour_debug(*parts: object) -> None:
             if len(contour_debug_summary) >= 8:
@@ -1878,23 +1920,60 @@ class RealtimePoseEngine:
                 mask = (masks_data[idx] > self._mask_threshold).astype(np.uint8)
                 if mask.shape[:2] != (height, width):
                     mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
-                mask_area = int(np.count_nonzero(mask > 0))
+                mask_area = int(np.count_nonzero(mask))
                 candidate_debug.append(f"mask{mask_area}")
-                mask, mask_reject_reason = self._guard_mask_jump_with_reason(track_id, mask)
+                mask, mask_reject_reason, guarded_area = self._guard_mask_jump_with_reason(track_id, mask, mask_area)
                 if mask is None:
                     contour_reject_reasons.append(mask_reject_reason or "mask_rejected")
                     add_contour_debug(*candidate_debug, f"guard:{mask_reject_reason or 'mask_rejected'}")
                     continue
-                guarded_area = int(np.count_nonzero(mask > 0))
                 if guarded_area != mask_area:
                     candidate_debug.append(f"guarded{guarded_area}")
-                shape_reject_reason = self._contour_shape_reject_reason(box, mask, person_conf, width, height)
+                shape_reject_reason = self._contour_shape_reject_reason(
+                    box,
+                    mask,
+                    person_conf,
+                    width,
+                    height,
+                    mask_area=guarded_area,
+                )
                 if shape_reject_reason is not None:
                     contour_reject_reasons.append(shape_reject_reason)
                     add_contour_debug(*candidate_debug, f"shape:{shape_reject_reason}")
                     continue
+                if distance_tasks is not None:
+                    task_id = len(distance_tasks)
+                    distance_tasks.append(
+                        {
+                            "task_id": task_id,
+                            "depth_raw": depth_raw,
+                            "box": box.copy(),
+                            "mask": mask.copy(),
+                        }
+                    )
+                    pending_distance_records.append(
+                        {
+                            "task_id": task_id,
+                            "track_id": track_id,
+                            "box": box.copy(),
+                            "mask": mask,
+                            "person_conf": person_conf,
+                            "track_color": track_color,
+                            "candidate_debug": list(candidate_debug),
+                        }
+                    )
+                    person_count += 1
+                    self._remember_contour_track(track_id, box)
+                    continue
+
                 # Use non-equalized depth values for distance estimation.
-                estimate = estimate_person_distance_from_mask(depth_raw, box, mask)
+                estimate = estimate_person_distance_from_mask(
+                    depth_raw,
+                    box,
+                    mask,
+                    mask_is_binary=True,
+                    include_draw_contour=False,
+                )
                 contour_area = 0.0
                 if estimate.contour is not None:
                     contour_area = float(cv2.contourArea(estimate.contour))
@@ -1972,7 +2051,7 @@ class RealtimePoseEngine:
             person_count = int(len(pose_fallback_indices))
 
         pair_text, pair_stats = _compute_pairwise_distances(pair_records, width)
-        return {
+        analysis = {
             "depth_up": depth_up,
             "depth_raw": depth_raw,
             "color_img": color_img,
@@ -1996,6 +2075,9 @@ class RealtimePoseEngine:
             "width": width,
             "height": height,
         }
+        if pending_distance_records:
+            analysis["_pending_distance_records"] = pending_distance_records
+        return analysis
 
     def _render_display(self, analysis: dict, display_mode: str) -> np.ndarray:
         display = analysis["color_img"].copy()
@@ -2145,6 +2227,9 @@ class RealtimePoseEngine:
             return self._map_process_stage(func, items, self._render_workers)
         return self._map_thread_stage(self._render_executor, self._render_workers, func, items)
 
+    def _map_postprocess_stage(self, func, items: list):
+        return self._map_render_stage(func, items)
+
     def _interpolate_depth(self, previous_depth: np.ndarray | None, current_depth: np.ndarray) -> np.ndarray:
         current_u8 = self._ensure_uint8_gray(current_depth)
         if previous_depth is None:
@@ -2219,22 +2304,33 @@ class RealtimePoseEngine:
         *,
         seg_result=None,
         pose_result=None,
+        prepared: dict | None = None,
+        distance_tasks: list[dict] | None = None,
     ) -> dict:
         if self._stateless:
             self.reset()
 
         start = time.time()
-        analysis = self._analyze_frame(depth, seg_result=seg_result, pose_result=pose_result)
+        analysis = self._analyze_frame(
+            depth,
+            seg_result=seg_result,
+            pose_result=pose_result,
+            prepared=prepared,
+            distance_tasks=distance_tasks,
+        )
         elapsed = int((time.time() - start) * 1000)
-        return {
+        analyzed = {
             "frame_id": frame_id,
             "analysis": analysis,
             "person_count": int(analysis["person_count"]),
             "processing_time_ms": elapsed,
-            "person_status": _compute_person_status(analysis),
-            "person_distance": self._compute_person_distance(analysis),
-            "action_level": self._classify_action_level(analysis),
         }
+        if distance_tasks is not None:
+            return analyzed
+        analyzed["person_status"] = _compute_person_status(analysis)
+        analyzed["person_distance"] = self._compute_person_distance(analysis)
+        analyzed["action_level"] = self._classify_action_level(analysis)
+        return analyzed
 
     def _reuse_analyzed_result_with_depth(self, analyzed: dict, frame_id: str, depth: np.ndarray) -> dict:
         prepared = self._prepare_depth_views(depth)
@@ -2339,12 +2435,109 @@ class RealtimePoseEngine:
     def _decode_frames(self, frames: list[tuple[str, bytes]]) -> list[tuple[str, np.ndarray]]:
         return self._map_decode_stage(_decode_frame_cpu, frames)
 
-    def _prepare_model_color_images(self, source_frames: list[dict]) -> list[np.ndarray]:
+    def _prepare_source_views(self, source_frames: list[dict]) -> list[dict]:
         depths = [item["depth"] for item in source_frames]
         if self._cpu_worker_mode == CPU_WORKER_MODE_PROCESS:
             payloads = [(depth, self._input_modality, self._ir_preprocess) for depth in depths]
-            return self._map_decode_stage(_prepare_color_image_cpu, payloads)
-        return [self._prepare_depth_views(depth)["model_color_img"] for depth in depths]
+            return self._map_decode_stage(_prepare_depth_views_payload_cpu, payloads)
+        return [self._prepare_depth_views(depth) for depth in depths]
+
+    def _finalize_deferred_distance_results(
+        self,
+        current_analyzed_by_input: dict[int, dict],
+        distance_tasks: list[dict],
+    ) -> None:
+        if distance_tasks:
+            distance_results = self._map_postprocess_stage(_estimate_distance_candidate_cpu, distance_tasks)
+            distance_by_task = {int(result["task_id"]): result for result in distance_results}
+        else:
+            distance_by_task = {}
+
+        def add_contour_debug(summary: list[str], *parts: object) -> None:
+            if len(summary) >= 8:
+                return
+            tokens = []
+            for part in parts:
+                if part is None:
+                    continue
+                text = str(part).strip().replace(" ", "_")
+                if text:
+                    tokens.append(text)
+            if tokens:
+                summary.append("/".join(tokens))
+
+        for input_index in sorted(current_analyzed_by_input):
+            analyzed = current_analyzed_by_input[input_index]
+            analysis = analyzed["analysis"]
+            pending_records = list(analysis.pop("_pending_distance_records", []) or [])
+            records = list(analysis.get("records") or [])
+            tracked_labels = list(analysis.get("tracked_labels") or [])
+            pair_records = [
+                (
+                    int(record["track_id"]),
+                    np.asarray(record["box"], dtype=np.float32).copy(),
+                    record.get("distance"),
+                )
+                for record in records
+            ]
+            contour_debug_summary = list(analysis.get("contour_debug_summary") or [])
+
+            for pending in pending_records:
+                task_id = int(pending["task_id"])
+                distance_result = distance_by_task.get(task_id)
+                if distance_result is None:
+                    raise RuntimeError(f"missing deferred distance result for task_id={task_id}")
+                estimate = distance_result["estimate"]
+                contour_area = float(distance_result.get("contour_area", 0.0) or 0.0)
+                estimate_reason = getattr(estimate, "reason", None) or "ok"
+                add_contour_debug(
+                    contour_debug_summary,
+                    *(pending.get("candidate_debug") or []),
+                    f"estimate:{estimate_reason}",
+                    f"contour{contour_area:.1f}",
+                    f"depthpx{int(estimate.valid_pixels)}",
+                    "kept",
+                )
+
+                track_id = int(pending["track_id"])
+                person_conf = float(pending["person_conf"])
+                if estimate.distance is None:
+                    tracked_labels.append(f"{track_id}:N/A")
+                    label = f"ID {track_id} P={person_conf * 100:.0f}% Dist=N/A"
+                else:
+                    tracked_labels.append(f"{track_id}:{estimate.distance:.1f}")
+                    label = f"ID {track_id} P={person_conf * 100:.0f}% Dist~{estimate.distance:.1f}"
+
+                box = np.asarray(pending["box"], dtype=np.float32).copy()
+                pair_records.append((track_id, box.copy(), estimate.distance))
+                records.append(
+                    {
+                        "track_id": track_id,
+                        "box": box,
+                        "mask": pending["mask"],
+                        "contour": estimate.contour,
+                        "draw_contour": getattr(estimate, "draw_contour", None),
+                        "anchor": getattr(estimate, "anchor", None),
+                        "distance": estimate.distance,
+                        "person_conf": person_conf,
+                        "label": label,
+                        "track_color": pending["track_color"],
+                    }
+                )
+
+            pair_text, pair_stats = _compute_pairwise_distances(
+                pair_records,
+                int(analysis.get("width", DISPLAY_SIZE[0]) or DISPLAY_SIZE[0]),
+            )
+            analysis["records"] = records
+            analysis["tracked_labels"] = tracked_labels
+            analysis["pair_text"] = pair_text
+            analysis["pair_stats"] = pair_stats
+            analysis["contour_debug_summary"] = contour_debug_summary
+            analyzed["person_count"] = int(analysis["person_count"])
+            analyzed["person_status"] = _compute_person_status(analysis)
+            analyzed["person_distance"] = self._compute_person_distance(analysis)
+            analyzed["action_level"] = self._classify_action_level(analysis)
 
     def _apply_batch_pose_semantic_reuse(self, current_analyzed_by_input: dict[int, dict]) -> None:
         if len(current_analyzed_by_input) <= 2:
@@ -2591,12 +2784,12 @@ class RealtimePoseEngine:
         )
 
     def infer_batch(self, frames: list[tuple[str, bytes]]) -> list[dict]:
+        if not frames:
+            return []
+
         lock_start = time.perf_counter()
         self._lock.acquire()
         try:
-            if not frames:
-                return []
-
             timings: dict[str, int] = {
                 "queue_wait_ms": _elapsed_ms(lock_start),
             }
@@ -2640,7 +2833,12 @@ class RealtimePoseEngine:
                 return output_frames, analyzed_results
 
             model_prepare_start = time.perf_counter()
-            color_imgs = self._prepare_model_color_images(source_frames)
+            prepared_views = self._prepare_source_views(source_frames)
+            if len(prepared_views) != len(source_frames):
+                raise RuntimeError(f"prepared {len(prepared_views)} views for {len(source_frames)} source frames")
+            for item, prepared in zip(source_frames, prepared_views):
+                item["prepared"] = prepared
+            color_imgs = [prepared.get("model_color_img", prepared["color_img"]) for prepared in prepared_views]
             timings["model_prepare_ms"] = _elapsed_ms(model_prepare_start)
 
             if self._pose_only:
@@ -2668,111 +2866,105 @@ class RealtimePoseEngine:
                         f"{item['frame_id']}_current",
                         item["depth"],
                         pose_result=pose_results[input_index],
+                        prepared=item.get("prepared"),
                     )
                 self._apply_batch_pose_semantic_reuse(current_analyzed_by_input)
                 timings["postprocess_ms"] = _elapsed_ms(postprocess_start)
-                self._log_model_confidences(
-                    len(source_frames),
-                    current_analyzed_by_input,
-                    pose_results=pose_results,
-                )
+                confidence_log_kwargs = {"pose_results": pose_results}
                 output_frames, analyzed_results = build_output_results(current_analyzed_by_input)
-
-                results = self._encode_analyzed_results(analyzed_results, timings)
-                for output_index, (result, item) in enumerate(zip(results, output_frames)):
-                    result["source_frame_id"] = item["source_frame_id"]
-                    result["input_index"] = int(item["input_index"])
-                    result["output_index"] = int(output_index)
-                    result["result_kind"] = item["result_kind"]
-                timings["total_ms"] = _elapsed_ms(total_start)
-                self._log_batch_timings(len(frames), len(output_frames), timings)
-                return results
-
-            model_start = time.perf_counter()
-
-            def run_seg_model():
-                seg_model_start = time.perf_counter()
-                results = self.seg_model.track(
-                    color_imgs,
-                    conf=self._seg_conf_threshold,
-                    persist=self._persist_tracks,
-                    tracker=TRACKER_CONFIG,
-                    classes=[0],
-                    imgsz=SEG_INFER_IMGSZ,
-                    device=self._device,
-                    verbose=False,
-                )
-                return results, _elapsed_ms(seg_model_start)
-
-            def run_pose_model():
-                pose_model_start = time.perf_counter()
-                results = self.pose_model.predict(
-                    color_imgs,
-                    conf=self._pose_conf_threshold,
-                    classes=[0],
-                    imgsz=POSE_INFER_IMGSZ,
-                    device=self._device,
-                    verbose=False,
-                )
-                return results, _elapsed_ms(pose_model_start)
-
-            if self._parallel_models and self._model_executor is not None:
-                seg_future = self._model_executor.submit(run_seg_model)
-                pose_future = self._model_executor.submit(run_pose_model)
-                try:
-                    seg_results, timings["seg_model_ms"] = seg_future.result()
-                    pose_results, timings["pose_model_ms"] = pose_future.result()
-                except Exception:
-                    for future in (seg_future, pose_future):
-                        future.cancel()
-                    for future in (seg_future, pose_future):
-                        if future.cancelled():
-                            continue
-                        try:
-                            future.result()
-                        except Exception:
-                            pass
-                    raise
-                timings["parallel_models"] = 1
             else:
-                seg_results, timings["seg_model_ms"] = run_seg_model()
-                pose_results, timings["pose_model_ms"] = run_pose_model()
-                timings["parallel_models"] = 0
+                model_start = time.perf_counter()
 
-            timings["model_infer_ms"] = _elapsed_ms(model_start)
-            if len(seg_results) != len(source_frames):
-                raise RuntimeError(f"seg batch returned {len(seg_results)} results for {len(source_frames)} source frames")
-            if len(pose_results) != len(source_frames):
-                raise RuntimeError(f"pose batch returned {len(pose_results)} results for {len(source_frames)} source frames")
+                def run_seg_model():
+                    seg_model_start = time.perf_counter()
+                    results = self.seg_model.track(
+                        color_imgs,
+                        conf=self._seg_conf_threshold,
+                        persist=self._persist_tracks,
+                        tracker=TRACKER_CONFIG,
+                        classes=[0],
+                        imgsz=SEG_INFER_IMGSZ,
+                        device=self._device,
+                        verbose=False,
+                    )
+                    return results, _elapsed_ms(seg_model_start)
 
-            postprocess_start = time.perf_counter()
-            current_analyzed_by_input: dict[int, dict] = {}
-            for item in source_frames:
-                input_index = int(item["input_index"])
-                current_analyzed_by_input[input_index] = self._analyze_predecoded_unlocked(
-                    f"{item['frame_id']}_current",
-                    item["depth"],
-                    seg_result=seg_results[input_index],
-                    pose_result=pose_results[input_index],
-                )
-            self._apply_batch_pose_semantic_reuse(current_analyzed_by_input)
-            timings["postprocess_ms"] = _elapsed_ms(postprocess_start)
-            self._log_model_confidences(
-                len(source_frames),
-                current_analyzed_by_input,
-                contour_results=seg_results,
-                pose_results=pose_results,
-            )
-            output_frames, analyzed_results = build_output_results(current_analyzed_by_input)
+                def run_pose_model():
+                    pose_model_start = time.perf_counter()
+                    results = self.pose_model.predict(
+                        color_imgs,
+                        conf=self._pose_conf_threshold,
+                        classes=[0],
+                        imgsz=POSE_INFER_IMGSZ,
+                        device=self._device,
+                        verbose=False,
+                    )
+                    return results, _elapsed_ms(pose_model_start)
 
-            results = self._encode_analyzed_results(analyzed_results, timings)
-            for output_index, (result, item) in enumerate(zip(results, output_frames)):
-                result["source_frame_id"] = item["source_frame_id"]
-                result["input_index"] = int(item["input_index"])
-                result["output_index"] = int(output_index)
-                result["result_kind"] = item["result_kind"]
-            timings["total_ms"] = _elapsed_ms(total_start)
-            self._log_batch_timings(len(frames), len(output_frames), timings)
-            return results
+                if self._parallel_models and self._model_executor is not None:
+                    seg_future = self._model_executor.submit(run_seg_model)
+                    pose_future = self._model_executor.submit(run_pose_model)
+                    try:
+                        seg_results, timings["seg_model_ms"] = seg_future.result()
+                        pose_results, timings["pose_model_ms"] = pose_future.result()
+                    except Exception:
+                        for future in (seg_future, pose_future):
+                            future.cancel()
+                        for future in (seg_future, pose_future):
+                            if future.cancelled():
+                                continue
+                            try:
+                                future.result()
+                            except Exception:
+                                pass
+                        raise
+                    timings["parallel_models"] = 1
+                else:
+                    seg_results, timings["seg_model_ms"] = run_seg_model()
+                    pose_results, timings["pose_model_ms"] = run_pose_model()
+                    timings["parallel_models"] = 0
+
+                timings["model_infer_ms"] = _elapsed_ms(model_start)
+                if len(seg_results) != len(source_frames):
+                    raise RuntimeError(f"seg batch returned {len(seg_results)} results for {len(source_frames)} source frames")
+                if len(pose_results) != len(source_frames):
+                    raise RuntimeError(f"pose batch returned {len(pose_results)} results for {len(source_frames)} source frames")
+
+                postprocess_start = time.perf_counter()
+                current_analyzed_by_input = {}
+                distance_tasks: list[dict] = []
+                for item in source_frames:
+                    input_index = int(item["input_index"])
+                    current_analyzed_by_input[input_index] = self._analyze_predecoded_unlocked(
+                        f"{item['frame_id']}_current",
+                        item["depth"],
+                        seg_result=seg_results[input_index],
+                        pose_result=pose_results[input_index],
+                        prepared=item.get("prepared"),
+                        distance_tasks=distance_tasks,
+                    )
+                self._finalize_deferred_distance_results(current_analyzed_by_input, distance_tasks)
+                self._apply_batch_pose_semantic_reuse(current_analyzed_by_input)
+                timings["postprocess_ms"] = _elapsed_ms(postprocess_start)
+                confidence_log_kwargs = {
+                    "contour_results": seg_results,
+                    "pose_results": pose_results,
+                }
+                output_frames, analyzed_results = build_output_results(current_analyzed_by_input)
         finally:
             self._lock.release()
+
+        self._log_model_confidences(
+            len(source_frames),
+            current_analyzed_by_input,
+            **confidence_log_kwargs,
+        )
+        results = self._encode_analyzed_results(analyzed_results, timings)
+        for output_index, (result, item) in enumerate(zip(results, output_frames)):
+            result["source_frame_id"] = item["source_frame_id"]
+            result["input_index"] = int(item["input_index"])
+            result["output_index"] = int(output_index)
+            result["result_kind"] = item["result_kind"]
+        timings["total_ms"] = _elapsed_ms(total_start)
+        self._log_batch_timings(len(frames), len(output_frames), timings)
+        return results

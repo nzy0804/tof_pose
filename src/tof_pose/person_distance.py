@@ -10,6 +10,8 @@ MIN_VALID_PIXELS = 24
 DEPTH_OFFSET = 35.0
 FOREGROUND_KEEP_RATIO = 0.30
 MASK_ERODE_KERNEL = 3
+DRAW_CONTOUR_CLOSE_KERNEL = 3
+DRAW_CONTOUR_SMOOTH_WINDOW = 5
 
 
 @dataclass
@@ -19,6 +21,7 @@ class PersonDistanceEstimate:
     contour: np.ndarray | None
     valid_pixels: int
     reason: str | None = None
+    draw_contour: np.ndarray | None = None
 
 
 def _clip_box(
@@ -47,6 +50,41 @@ def _normalize_mask(mask: np.ndarray, width: int, height: int) -> np.ndarray:
     return mask_uint8
 
 
+def _smooth_closed_contour(contour: np.ndarray, width: int, height: int) -> np.ndarray:
+    window = max(1, int(DRAW_CONTOUR_SMOOTH_WINDOW))
+    if window <= 1 or window % 2 == 0:
+        return contour.astype(np.int32)
+    points = contour.reshape(-1, 2).astype(np.float32)
+    if len(points) < window * 2:
+        return contour.astype(np.int32)
+
+    pad = window // 2
+    padded = np.concatenate([points[-pad:], points, points[:pad]], axis=0)
+    kernel = np.ones(window, dtype=np.float32) / float(window)
+    smoothed_x = np.convolve(padded[:, 0], kernel, mode="valid")
+    smoothed_y = np.convolve(padded[:, 1], kernel, mode="valid")
+    smoothed = np.stack([smoothed_x, smoothed_y], axis=1)
+    smoothed = np.rint(smoothed).astype(np.int32)
+    smoothed[:, 0] = np.clip(smoothed[:, 0], 0, max(0, width - 1))
+    smoothed[:, 1] = np.clip(smoothed[:, 1], 0, max(0, height - 1))
+    return smoothed.reshape(-1, 1, 2)
+
+
+def _extract_draw_contour(mask_uint8: np.ndarray, width: int, height: int) -> np.ndarray | None:
+    draw_mask = np.where(mask_uint8 > 0, 255, 0).astype(np.uint8)
+    if DRAW_CONTOUR_CLOSE_KERNEL > 1:
+        kernel = np.ones((DRAW_CONTOUR_CLOSE_KERNEL, DRAW_CONTOUR_CLOSE_KERNEL), np.uint8)
+        draw_mask = cv2.morphologyEx(draw_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(draw_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return None
+    best_contour = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(best_contour) <= 0:
+        return None
+    return _smooth_closed_contour(best_contour, width, height)
+
+
 def estimate_person_distance_from_mask(
     depth_map: np.ndarray,
     box: np.ndarray,
@@ -64,11 +102,12 @@ def estimate_person_distance_from_mask(
         return PersonDistanceEstimate(None, (x1, y1), None, 0, "roi_empty")
 
     normalized_mask = _normalize_mask(mask, width, height)
+    draw_contour = _extract_draw_contour(normalized_mask, width, height)
     mask_roi = normalized_mask[y1:y2, x1:x2]
     if mask_roi.size == 0:
-        return PersonDistanceEstimate(None, (x1, y1), None, 0, "mask_roi_empty")
+        return PersonDistanceEstimate(None, (x1, y1), None, 0, "mask_roi_empty", draw_contour)
     if int(np.count_nonzero(mask_roi)) <= 0:
-        return PersonDistanceEstimate(None, (x1, y1), None, 0, "mask_roi_empty")
+        return PersonDistanceEstimate(None, (x1, y1), None, 0, "mask_roi_empty", draw_contour)
 
     if MASK_ERODE_KERNEL > 1:
         kernel = np.ones((MASK_ERODE_KERNEL, MASK_ERODE_KERNEL), np.uint8)
@@ -81,15 +120,15 @@ def estimate_person_distance_from_mask(
         iterations=1,
     )
     if int(np.count_nonzero(mask_roi)) <= 0:
-        return PersonDistanceEstimate(None, (x1, y1), None, 0, "mask_empty_after_morph")
+        return PersonDistanceEstimate(None, (x1, y1), None, 0, "mask_empty_after_morph", draw_contour)
 
-    contours, _ = cv2.findContours(mask_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(mask_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     if not contours:
-        return PersonDistanceEstimate(None, (x1, y1), None, 0, "contour_missing")
+        return PersonDistanceEstimate(None, (x1, y1), None, 0, "contour_missing", draw_contour)
 
     best_contour = max(contours, key=cv2.contourArea)
     if cv2.contourArea(best_contour) <= 0:
-        return PersonDistanceEstimate(None, (x1, y1), None, 0, "contour_area_zero")
+        return PersonDistanceEstimate(None, (x1, y1), None, 0, "contour_area_zero", draw_contour)
 
     contour_mask = np.zeros_like(mask_roi)
     cv2.drawContours(contour_mask, [best_contour], -1, 255, thickness=cv2.FILLED)
@@ -97,10 +136,10 @@ def estimate_person_distance_from_mask(
     valid_depths = valid_depths[valid_depths > 0]
     valid_pixels = int(valid_depths.size)
     if valid_pixels < MIN_VALID_PIXELS:
-        return PersonDistanceEstimate(None, (x1, y1), best_contour, valid_pixels, "depth_valid_pixels_low")
+        return PersonDistanceEstimate(None, (x1, y1), best_contour, valid_pixels, "depth_valid_pixels_low", draw_contour)
 
     sorted_depths = np.sort(valid_depths.astype(np.float32), axis=None)
     keep_count = max(MIN_VALID_PIXELS, int(round(sorted_depths.size * FOREGROUND_KEEP_RATIO)))
     foreground_depths = sorted_depths[: min(keep_count, sorted_depths.size)]
     distance = float(np.median(foreground_depths)) - DEPTH_OFFSET
-    return PersonDistanceEstimate(distance, (x1, y1), best_contour, valid_pixels, None)
+    return PersonDistanceEstimate(distance, (x1, y1), best_contour, valid_pixels, None, draw_contour)

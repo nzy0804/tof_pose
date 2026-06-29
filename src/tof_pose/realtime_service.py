@@ -77,8 +77,22 @@ ACTION_HIGH_CONFIRM_FRAMES = 2
 POSE_FALLBACK_KPT_CONF_THRESHOLD = 0.45
 POSE_FALLBACK_MIN_POINTS = 7
 QUALITATIVE_RESULT_KEYS = ("person_status", "person_distance", "action_level")
-PERSON_FILL_COLOR_SCALE = 0.35
-PERSON_FILL_COLOR_BIAS = 135.0
+PERSON_FILL_BACKGROUND_DEFAULT = "bg_08_dark_frost_reference.png"
+PERSON_FILL_BACKGROUND_NAMES = (
+    "bg_01_dense_white_fog.png",
+    "bg_02_soft_frosted_gray.png",
+    "bg_03_milky_glass.png",
+    "bg_04_fogged_concrete.png",
+    "bg_05_silver_mist.png",
+    "bg_06_low_contrast_frost.png",
+    "bg_07_white_smoke_patch.png",
+    "bg_08_dark_frost_reference.png",
+)
+PERSON_FILL_FALLBACK_GRAY = 232
+PERSON_FILL_BACKGROUND_BLEND = 0.5
+DISPLAY_CONTOUR_HEAD_TOP_RATIO = 0.20
+DISPLAY_CONTOUR_HEAD_MAX_SCALE = 1.10
+DISPLAY_CONTOUR_HEAD_MIN_HEIGHT = 12
 
 TRACK_COLORS = [
     (40, 210, 255),
@@ -94,6 +108,7 @@ TRACK_COLORS = [
 _CPU_PROCESS_POOLS: dict[tuple[int, str], ProcessPoolExecutor] = {}
 _CPU_PROCESS_POOLS_LOCK = threading.Lock()
 _WORKER_CLAHE = None
+_PERSON_FILL_BACKGROUND_CACHE: dict[str, np.ndarray] = {}
 
 
 def _elapsed_ms(start: float) -> int:
@@ -695,7 +710,11 @@ def _extract_person_boxes(analysis: dict, max_people: int = 2) -> list[np.ndarra
     return boxes[:max_people]
 
 
-def _compute_person_distance_ir(analysis: dict) -> str:
+def _compute_person_distance_ir(
+    analysis: dict,
+    close_gap_ratio: float = PERSON_DISTANCE_CLOSE_GAP_RATIO,
+    close_center_ratio: float = PERSON_DISTANCE_CLOSE_CENTER_RATIO,
+) -> str:
     person_count = int(analysis.get("person_count", 0) or 0)
     if person_count < 2:
         return ""
@@ -705,6 +724,8 @@ def _compute_person_distance_ir(analysis: dict) -> str:
         return ""
 
     width = int(analysis.get("width", DISPLAY_SIZE[0]) or DISPLAY_SIZE[0])
+    close_gap_ratio = _normalize_distance_threshold(close_gap_ratio, PERSON_DISTANCE_CLOSE_GAP_RATIO)
+    close_center_ratio = _normalize_distance_threshold(close_center_ratio, PERSON_DISTANCE_CLOSE_CENTER_RATIO)
     for idx in range(len(boxes)):
         box_a = boxes[idx]
         for jdx in range(idx + 1, len(boxes)):
@@ -714,13 +735,16 @@ def _compute_person_distance_ir(analysis: dict) -> str:
             separated_gap = float(np.hypot(horizontal_gap, vertical_gap))
             center_distance = _box_center_distance(box_a, box_b)
             avg_extent = (_box_extent(box_a) + _box_extent(box_b)) * 0.5
-            close_gap_px = max(float(width) * PERSON_DISTANCE_CLOSE_GAP_RATIO, avg_extent * 0.35)
-            if separated_gap <= close_gap_px or center_distance <= avg_extent * PERSON_DISTANCE_CLOSE_CENTER_RATIO:
+            close_gap_px = max(float(width) * close_gap_ratio, avg_extent * 0.35)
+            if separated_gap <= close_gap_px or center_distance <= avg_extent * close_center_ratio:
                 return "close"
     return "far"
 
 
-def _compute_person_distance_depth(analysis: dict) -> str:
+def _compute_person_distance_depth(
+    analysis: dict,
+    close_threshold: float = DEPTH_PERSON_DISTANCE_CLOSE_THRESHOLD,
+) -> str:
     person_count = int(analysis.get("person_count", 0) or 0)
     if person_count < 2:
         return ""
@@ -731,7 +755,8 @@ def _compute_person_distance_depth(analysis: dict) -> str:
     if not spacings:
         return ""
     nearest = min(spacings)
-    return "close" if nearest <= DEPTH_PERSON_DISTANCE_CLOSE_THRESHOLD else "far"
+    close_threshold = _normalize_distance_threshold(close_threshold, DEPTH_PERSON_DISTANCE_CLOSE_THRESHOLD)
+    return "close" if nearest <= close_threshold else "far"
 
 
 def _build_action_signature(analysis: dict) -> dict:
@@ -841,13 +866,67 @@ def _copy_qualitative_result_fields(source: dict) -> dict:
     return {key: str(source.get(key, "") or "") for key in QUALITATIVE_RESULT_KEYS}
 
 
-def _person_fill_color(track_color: tuple[int, int, int]) -> tuple[int, int, int]:
-    color = np.array(track_color, dtype=np.float32)
-    fill = color * PERSON_FILL_COLOR_SCALE + PERSON_FILL_COLOR_BIAS
-    return tuple(int(value) for value in np.clip(fill, 0, 255).astype(np.uint8).tolist())
+def _clamp_float(value: float | None, default: float, min_value: float, max_value: float | None = None) -> float:
+    try:
+        numeric = float(default if value is None else value)
+    except (TypeError, ValueError):
+        numeric = float(default)
+    if not np.isfinite(numeric):
+        numeric = float(default)
+    numeric = max(float(min_value), numeric)
+    if max_value is not None:
+        numeric = min(float(max_value), numeric)
+    return float(numeric)
 
 
-def _fill_person_mask_region(display: np.ndarray, mask: np.ndarray, color: tuple[int, int, int]) -> bool:
+def _normalize_person_fill_background_blend(value: float | None) -> float:
+    return _clamp_float(value, PERSON_FILL_BACKGROUND_BLEND, 0.0, 1.0)
+
+
+def _normalize_distance_threshold(value: float | None, default: float) -> float:
+    return _clamp_float(value, default, 0.0)
+
+
+def _normalize_person_fill_background(background: str | None) -> str:
+    value = str(background or "").strip()
+    if not value:
+        return PERSON_FILL_BACKGROUND_DEFAULT
+    path = Path(value)
+    if len(path.parts) <= 1 and path.suffix == "":
+        value = f"{value}.png"
+    return value
+
+
+def _resolve_person_fill_background_path(background: str | None) -> Path:
+    normalized = _normalize_person_fill_background(background)
+    path = Path(normalized)
+    if path.is_absolute() or len(path.parts) > 1:
+        return path
+    return Path(__file__).resolve().parent / "assets" / path.name
+
+
+def _get_person_fill_background(width: int, height: int, background: str | None = None) -> np.ndarray:
+    normalized = _normalize_person_fill_background(background)
+    cache_key = str(_resolve_person_fill_background_path(normalized))
+    if cache_key not in _PERSON_FILL_BACKGROUND_CACHE:
+        asset_path = Path(cache_key)
+        background = cv2.imread(str(asset_path), cv2.IMREAD_COLOR)
+        if background is None:
+            background = np.full((DISPLAY_SIZE[1], DISPLAY_SIZE[0], 3), PERSON_FILL_FALLBACK_GRAY, dtype=np.uint8)
+        _PERSON_FILL_BACKGROUND_CACHE[cache_key] = background
+
+    background = _PERSON_FILL_BACKGROUND_CACHE[cache_key]
+    if background.shape[:2] != (height, width):
+        return cv2.resize(background, (width, height), interpolation=cv2.INTER_LINEAR)
+    return background
+
+
+def _fill_person_mask_region(
+    display: np.ndarray,
+    mask: np.ndarray,
+    background: str | None = None,
+    background_blend: float | None = None,
+) -> bool:
     if display.ndim != 3 or display.shape[2] != 3:
         return False
     if mask.shape[:2] != display.shape[:2]:
@@ -855,8 +934,96 @@ def _fill_person_mask_region(display: np.ndarray, mask: np.ndarray, color: tuple
     selected = mask > 0
     if not np.any(selected):
         return False
-    display[selected] = np.array(color, dtype=np.uint8)
+    fill_background = _get_person_fill_background(display.shape[1], display.shape[0], background)
+    original_gray = cv2.cvtColor(display, cv2.COLOR_BGR2GRAY)
+    background_gray = cv2.cvtColor(fill_background, cv2.COLOR_BGR2GRAY)
+    background_weight = _normalize_person_fill_background_blend(background_blend)
+    blended_gray = cv2.addWeighted(
+        background_gray,
+        background_weight,
+        original_gray,
+        1.0 - background_weight,
+        0,
+    )
+    blended_bgr = cv2.cvtColor(blended_gray, cv2.COLOR_GRAY2BGR)
+    display[selected] = blended_bgr[selected]
     return True
+
+
+def _lift_display_contour_head(contour: np.ndarray, width: int, height: int) -> np.ndarray:
+    points = contour.reshape(-1, 2).astype(np.float32)
+    if len(points) < 3:
+        return contour.astype(np.int32)
+
+    y_min = float(np.min(points[:, 1]))
+    y_max = float(np.max(points[:, 1]))
+    contour_height = y_max - y_min + 1.0
+    if contour_height < DISPLAY_CONTOUR_HEAD_MIN_HEIGHT:
+        return contour.astype(np.int32)
+
+    head_bottom = y_min + contour_height * DISPLAY_CONTOUR_HEAD_TOP_RATIO
+    upper_mask = points[:, 1] <= head_bottom
+    if not np.any(upper_mask):
+        return contour.astype(np.int32)
+
+    upper_points = points[upper_mask]
+    row_bounds: dict[int, tuple[float, float]] = {}
+    for row in np.unique(np.rint(upper_points[:, 1]).astype(np.int32)):
+        row_points = upper_points[np.rint(upper_points[:, 1]).astype(np.int32) == row]
+        if row_points.size:
+            row_bounds[int(row)] = (float(np.min(row_points[:, 0])), float(np.max(row_points[:, 0])))
+
+    x_min = float(np.min(upper_points[:, 0]))
+    x_max = float(np.max(upper_points[:, 0]))
+    global_center = (x_min + x_max) * 0.5
+    global_half_width = max(1.0, (x_max - x_min) * 0.5)
+    lift_ratio = max(0.0, DISPLAY_CONTOUR_HEAD_MAX_SCALE - 1.0)
+    adjusted = points.copy()
+
+    for idx in np.flatnonzero(upper_mask):
+        x, y = adjusted[idx]
+        row = int(round(float(y)))
+        row_min, row_max = row_bounds.get(row, (global_center - global_half_width, global_center + global_half_width))
+        center = (row_min + row_max) * 0.5
+        half_width = max(1.0, (row_max - row_min) * 0.5)
+        distance_ratio = min(1.0, abs(float(x) - center) / half_width)
+        lateral_weight = max(0.0, 1.0 - distance_ratio * distance_ratio)
+        vertical_distance = max(0.0, head_bottom - float(y))
+        adjusted[idx, 1] = float(y) - vertical_distance * lift_ratio * lateral_weight
+
+    adjusted[:, 0] = np.clip(np.rint(adjusted[:, 0]), 0, max(0, width - 1))
+    adjusted[:, 1] = np.clip(np.rint(adjusted[:, 1]), 0, max(0, height - 1))
+    return adjusted.astype(np.int32).reshape(-1, 1, 2)
+
+
+def _record_display_contour(record: dict, width: int, height: int) -> np.ndarray | None:
+    contour = record.get("draw_contour") if record.get("draw_contour") is not None else record.get("contour")
+    if contour is None:
+        return None
+
+    if record.get("draw_contour") is not None:
+        shifted_contour = contour
+    else:
+        box = record["box"]
+        anchor = record.get("anchor")
+        if anchor is not None and len(anchor) >= 2:
+            offset_x, offset_y = int(anchor[0]), int(anchor[1])
+        else:
+            offset_x, offset_y = int(round(box[0])), int(round(box[1]))
+        shifted_contour = contour + np.array([[[offset_x, offset_y]]])
+
+    return _lift_display_contour_head(shifted_contour, width, height)
+
+
+def _fill_person_contour_region(
+    display: np.ndarray,
+    contour: np.ndarray,
+    background: str | None = None,
+    background_blend: float | None = None,
+) -> bool:
+    mask = np.zeros(display.shape[:2], dtype=np.uint8)
+    cv2.drawContours(mask, [contour], -1, 255, thickness=cv2.FILLED)
+    return _fill_person_mask_region(display, mask, background, background_blend)
 
 
 def _render_skeleton_contour_cpu(analysis: dict) -> np.ndarray:
@@ -868,24 +1035,21 @@ def _render_skeleton_contour_cpu(analysis: dict) -> np.ndarray:
     pose_only = bool(analysis.get("pose_only", False))
     pose_draw_indices = analysis.get("pose_draw_indices") or []
     pose_fallback_indices = analysis.get("pose_fallback_indices") or []
+    person_fill_background = analysis.get("person_fill_background")
+    person_fill_background_blend = analysis.get("person_fill_background_blend", PERSON_FILL_BACKGROUND_BLEND)
     display = analysis["color_img"].copy()
+    height, width = display.shape[:2]
 
     for record in records:
-        contour = record["contour"]
-        if contour is None:
+        shifted_contour = _record_display_contour(record, width, height)
+        if shifted_contour is None:
             continue
-        mask = record["mask"]
-        if mask is not None:
-            _fill_person_mask_region(display, mask, _person_fill_color(record["track_color"]))
-
-        box = record["box"]
-        anchor = record.get("anchor")
-        if anchor is not None and len(anchor) >= 2:
-            offset_x, offset_y = int(anchor[0]), int(anchor[1])
-        else:
-            offset_x, offset_y = int(round(box[0])), int(round(box[1]))
-
-        shifted_contour = contour + np.array([[[offset_x, offset_y]]])
+        _fill_person_contour_region(
+            display,
+            shifted_contour,
+            person_fill_background,
+            person_fill_background_blend,
+        )
         cv2.drawContours(display, [shifted_contour], -1, record["track_color"], 2, cv2.LINE_AA)
 
     if kpt_xy_np is not None and kpt_conf_np is not None:
@@ -1084,6 +1248,11 @@ class RealtimePoseEngine:
         parallel_models: bool = True,
         input_modality: str = INPUT_MODALITY_DEPTH,
         ir_preprocess: bool = False,
+        person_fill_background: str | None = None,
+        person_fill_background_blend: float = PERSON_FILL_BACKGROUND_BLEND,
+        depth_distance_close_threshold: float = DEPTH_PERSON_DISTANCE_CLOSE_THRESHOLD,
+        ir_distance_close_gap_ratio: float = PERSON_DISTANCE_CLOSE_GAP_RATIO,
+        ir_distance_close_center_ratio: float = PERSON_DISTANCE_CLOSE_CENTER_RATIO,
     ) -> None:
         model_file = Path(model_path) if model_path else DEFAULT_MODEL_PATH
         pose_model_file = Path(pose_model_path) if pose_model_path else DEFAULT_POSE_MODEL_PATH
@@ -1117,6 +1286,20 @@ class RealtimePoseEngine:
         self._jpeg_quality = min(100, max(1, int(jpeg_quality)))
         self._input_modality = _normalize_input_modality(input_modality)
         self._ir_preprocess = bool(ir_preprocess)
+        self._person_fill_background = _normalize_person_fill_background(person_fill_background)
+        self._person_fill_background_blend = _normalize_person_fill_background_blend(person_fill_background_blend)
+        self._depth_distance_close_threshold = _normalize_distance_threshold(
+            depth_distance_close_threshold,
+            DEPTH_PERSON_DISTANCE_CLOSE_THRESHOLD,
+        )
+        self._ir_distance_close_gap_ratio = _normalize_distance_threshold(
+            ir_distance_close_gap_ratio,
+            PERSON_DISTANCE_CLOSE_GAP_RATIO,
+        )
+        self._ir_distance_close_center_ratio = _normalize_distance_threshold(
+            ir_distance_close_center_ratio,
+            PERSON_DISTANCE_CLOSE_CENTER_RATIO,
+        )
         self._instance_name = str(instance_name).strip() if instance_name else "model-0"
         self._lock = threading.Lock()
         self._stateless = bool(stateless)
@@ -1493,6 +1676,8 @@ class RealtimePoseEngine:
                 "pose_draw_indices": pose_draw_indices,
                 "pose_fallback_indices": [],
                 "contour_reject_reasons": ["pose_only"],
+                "person_fill_background": self._person_fill_background,
+                "person_fill_background_blend": self._person_fill_background_blend,
                 "width": width,
                 "height": height,
             }
@@ -1737,6 +1922,7 @@ class RealtimePoseEngine:
                         "box": box.copy(),
                         "mask": mask,
                         "contour": estimate.contour,
+                        "draw_contour": getattr(estimate, "draw_contour", None),
                         "anchor": getattr(estimate, "anchor", None),
                         "distance": estimate.distance,
                         "person_conf": person_conf,
@@ -1805,6 +1991,8 @@ class RealtimePoseEngine:
             "pose_fallback_indices": pose_fallback_indices,
             "contour_reject_reasons": contour_reject_reasons,
             "contour_debug_summary": contour_debug_summary,
+            "person_fill_background": self._person_fill_background,
+            "person_fill_background_blend": self._person_fill_background_blend,
             "width": width,
             "height": height,
         }
@@ -1819,6 +2007,8 @@ class RealtimePoseEngine:
         pose_only = bool(analysis.get("pose_only", False))
         pose_draw_indices = analysis.get("pose_draw_indices") or []
         pose_fallback_indices = analysis.get("pose_fallback_indices") or []
+        person_fill_background = analysis.get("person_fill_background")
+        person_fill_background_blend = analysis.get("person_fill_background_blend", PERSON_FILL_BACKGROUND_BLEND)
         width = analysis["width"]
         height = analysis["height"]
 
@@ -1826,22 +2016,25 @@ class RealtimePoseEngine:
             for record in records:
                 box = record["box"]
                 track_color = record["track_color"]
-                contour = record["contour"]
                 mask = record["mask"]
                 label = record["label"]
-                shifted_contour = None
+                shifted_contour = _record_display_contour(record, width, height)
 
-                if contour is not None and display_mode != DISPLAY_MODE_SKELETON_ONLY:
-                    anchor = record.get("anchor")
-                    if anchor is not None and len(anchor) >= 2:
-                        offset_x, offset_y = int(anchor[0]), int(anchor[1])
-                    else:
-                        offset_x, offset_y = int(round(box[0])), int(round(box[1]))
-                    shifted_contour = contour + np.array([[[offset_x, offset_y]]])
-
-                if mask is not None:
+                if shifted_contour is not None:
+                    _fill_person_contour_region(
+                        display,
+                        shifted_contour,
+                        person_fill_background,
+                        person_fill_background_blend,
+                    )
+                elif mask is not None:
                     mask_overlay = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
-                    _fill_person_mask_region(display, mask_overlay, _person_fill_color(track_color))
+                    _fill_person_mask_region(
+                        display,
+                        mask_overlay,
+                        person_fill_background,
+                        person_fill_background_blend,
+                    )
 
                 if shifted_contour is not None:
                     cv2.drawContours(display, [shifted_contour], -1, track_color, 2, cv2.LINE_AA)
@@ -2007,8 +2200,12 @@ class RealtimePoseEngine:
 
     def _compute_person_distance(self, analysis: dict) -> str:
         if self._input_modality == INPUT_MODALITY_IR:
-            return _compute_person_distance_ir(analysis)
-        return _compute_person_distance_depth(analysis)
+            return _compute_person_distance_ir(
+                analysis,
+                self._ir_distance_close_gap_ratio,
+                self._ir_distance_close_center_ratio,
+            )
+        return _compute_person_distance_depth(analysis, self._depth_distance_close_threshold)
 
     def _classify_action_level(self, analysis: dict) -> str:
         if self._input_modality == INPUT_MODALITY_IR:
@@ -2047,6 +2244,8 @@ class RealtimePoseEngine:
         analysis["color_img"] = prepared["color_img"]
         analysis["width"] = prepared["width"]
         analysis["height"] = prepared["height"]
+        analysis["person_fill_background"] = self._person_fill_background
+        analysis["person_fill_background_blend"] = self._person_fill_background_blend
         return {
             "frame_id": frame_id,
             "analysis": analysis,

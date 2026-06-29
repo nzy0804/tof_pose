@@ -46,7 +46,19 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from tof_pose.realtime_service import CPU_WORKER_MODE_PROCESS, CPU_WORKER_MODE_THREAD, INPUT_MODALITIES, INPUT_MODALITY_DEPTH, RealtimePoseEngine
+from tof_pose.realtime_service import (
+    CPU_WORKER_MODE_PROCESS,
+    CPU_WORKER_MODE_THREAD,
+    DEPTH_PERSON_DISTANCE_CLOSE_THRESHOLD,
+    INPUT_MODALITIES,
+    INPUT_MODALITY_DEPTH,
+    PERSON_FILL_BACKGROUND_DEFAULT,
+    PERSON_FILL_BACKGROUND_BLEND,
+    PERSON_FILL_BACKGROUND_NAMES,
+    PERSON_DISTANCE_CLOSE_CENTER_RATIO,
+    PERSON_DISTANCE_CLOSE_GAP_RATIO,
+    RealtimePoseEngine,
+)
 
 
 @dataclass(frozen=True)
@@ -182,6 +194,11 @@ def build_engine(args: argparse.Namespace) -> RealtimePoseEngine:
         jpeg_quality=args.jpeg_quality,
         input_modality=args.input_modality,
         ir_preprocess=args.ir_preprocess,
+        person_fill_background=args.person_fill_background,
+        person_fill_background_blend=args.person_fill_background_blend,
+        depth_distance_close_threshold=args.depth_distance_close_threshold,
+        ir_distance_close_gap_ratio=args.ir_distance_close_gap_ratio,
+        ir_distance_close_center_ratio=args.ir_distance_close_center_ratio,
         cpu_worker_mode=args.cpu_worker_mode,
         cpu_process_start_method=args.cpu_process_start_method,
         instance_name="tailscale-local",
@@ -449,6 +466,18 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--jpeg-quality", default=60, type=int)
     parser.add_argument("--input-modality", default=INPUT_MODALITY_DEPTH, choices=INPUT_MODALITIES)
     parser.add_argument("--ir-preprocess", action="store_true", help="enable median filtering plus CLAHE for infrared grayscale inputs")
+    parser.add_argument(
+        "--person-fill-background",
+        default=PERSON_FILL_BACKGROUND_DEFAULT,
+        help=(
+            "background image used to fill detected person masks; pass an asset name "
+            f"({', '.join(PERSON_FILL_BACKGROUND_NAMES)}) or an image file path"
+        ),
+    )
+    parser.add_argument("--person-fill-background-blend", default=PERSON_FILL_BACKGROUND_BLEND, type=float)
+    parser.add_argument("--depth-distance-close-threshold", default=DEPTH_PERSON_DISTANCE_CLOSE_THRESHOLD, type=float)
+    parser.add_argument("--ir-distance-close-gap-ratio", default=PERSON_DISTANCE_CLOSE_GAP_RATIO, type=float)
+    parser.add_argument("--ir-distance-close-center-ratio", default=PERSON_DISTANCE_CLOSE_CENTER_RATIO, type=float)
     parser.add_argument("--stateless", action="store_true")
     parser.add_argument("--pose-only", action="store_true")
     parser.add_argument("--no-pose-validate", action="store_true")

@@ -64,7 +64,18 @@ except Exception:
     pass
 
 from tof_pose.realtime_service import RealtimePoseEngine
-from tof_pose.realtime_service import CPU_WORKER_MODE_PROCESS, CPU_WORKER_MODE_THREAD, INPUT_MODALITIES, INPUT_MODALITY_DEPTH
+from tof_pose.realtime_service import (
+    CPU_WORKER_MODE_PROCESS,
+    CPU_WORKER_MODE_THREAD,
+    INPUT_MODALITIES,
+    INPUT_MODALITY_DEPTH,
+    DEPTH_PERSON_DISTANCE_CLOSE_THRESHOLD,
+    PERSON_FILL_BACKGROUND_DEFAULT,
+    PERSON_FILL_BACKGROUND_BLEND,
+    PERSON_FILL_BACKGROUND_NAMES,
+    PERSON_DISTANCE_CLOSE_CENTER_RATIO,
+    PERSON_DISTANCE_CLOSE_GAP_RATIO,
+)
 from tof_pose.object_storage import (
     ObjectStorageConfig,
     build_result_object_key,
@@ -139,6 +150,11 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         jpeg_quality: int = 80,
         input_modality: str = INPUT_MODALITY_DEPTH,
         ir_preprocess: bool = False,
+        person_fill_background: str | None = None,
+        person_fill_background_blend: float = PERSON_FILL_BACKGROUND_BLEND,
+        depth_distance_close_threshold: float = DEPTH_PERSON_DISTANCE_CLOSE_THRESHOLD,
+        ir_distance_close_gap_ratio: float = PERSON_DISTANCE_CLOSE_GAP_RATIO,
+        ir_distance_close_center_ratio: float = PERSON_DISTANCE_CLOSE_CENTER_RATIO,
         cpu_worker_mode: str = CPU_WORKER_MODE_THREAD,
         cpu_process_start_method: str = "auto",
         model_instances: int = 1,
@@ -240,6 +256,11 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
                     jpeg_quality=jpeg_quality,
                     input_modality=input_modality,
                     ir_preprocess=ir_preprocess,
+                    person_fill_background=person_fill_background,
+                    person_fill_background_blend=person_fill_background_blend,
+                    depth_distance_close_threshold=depth_distance_close_threshold,
+                    ir_distance_close_gap_ratio=ir_distance_close_gap_ratio,
+                    ir_distance_close_center_ratio=ir_distance_close_center_ratio,
                     cpu_worker_mode=cpu_worker_mode,
                     cpu_process_start_method=cpu_process_start_method,
                     instance_name=f"model-{idx}",
@@ -768,6 +789,11 @@ def serve(
     jpeg_quality: int = 80,
     input_modality: str = INPUT_MODALITY_DEPTH,
     ir_preprocess: bool = False,
+    person_fill_background: str | None = None,
+    person_fill_background_blend: float = PERSON_FILL_BACKGROUND_BLEND,
+    depth_distance_close_threshold: float = DEPTH_PERSON_DISTANCE_CLOSE_THRESHOLD,
+    ir_distance_close_gap_ratio: float = PERSON_DISTANCE_CLOSE_GAP_RATIO,
+    ir_distance_close_center_ratio: float = PERSON_DISTANCE_CLOSE_CENTER_RATIO,
     cpu_worker_mode: str = CPU_WORKER_MODE_THREAD,
     cpu_process_start_method: str = "auto",
     model_instances: int = 1,
@@ -816,6 +842,11 @@ def serve(
             jpeg_quality=jpeg_quality,
             input_modality=input_modality,
             ir_preprocess=ir_preprocess,
+            person_fill_background=person_fill_background,
+            person_fill_background_blend=person_fill_background_blend,
+            depth_distance_close_threshold=depth_distance_close_threshold,
+            ir_distance_close_gap_ratio=ir_distance_close_gap_ratio,
+            ir_distance_close_center_ratio=ir_distance_close_center_ratio,
             cpu_worker_mode=cpu_worker_mode,
             cpu_process_start_method=cpu_process_start_method,
             model_instances=model_instances,
@@ -862,7 +893,13 @@ def serve(
             model_instances,
         )
     logging.info(
-        'Starting gRPC server on %s (max_msg_mb=%d, max_workers=%d, model_instances=%d, parallel_models=%s, cpu_worker_mode=%s, cpu_process_start_method=%s, input_modality=%s, ir_preprocess=%s)',
+        (
+            'Starting gRPC server on %s (max_msg_mb=%d, max_workers=%d, model_instances=%d, '
+            'parallel_models=%s, cpu_worker_mode=%s, cpu_process_start_method=%s, input_modality=%s, '
+            'ir_preprocess=%s, person_fill_background=%s, person_fill_background_blend=%.3f, '
+            'depth_distance_close_threshold=%.3f, ir_distance_close_gap_ratio=%.3f, '
+            'ir_distance_close_center_ratio=%.3f)'
+        ),
         bound_address,
         max_msg_mb,
         max_workers,
@@ -872,6 +909,11 @@ def serve(
         cpu_process_start_method,
         input_modality,
         "true" if ir_preprocess else "false",
+        person_fill_background or PERSON_FILL_BACKGROUND_DEFAULT,
+        person_fill_background_blend,
+        depth_distance_close_threshold,
+        ir_distance_close_gap_ratio,
+        ir_distance_close_center_ratio,
     )
     server.start()
     try:
@@ -972,6 +1014,38 @@ def main():
         '--ir-preprocess',
         action='store_true',
         help='enable median filtering plus CLAHE for infrared grayscale inputs',
+    )
+    parser.add_argument(
+        '--person-fill-background',
+        default=PERSON_FILL_BACKGROUND_DEFAULT,
+        help=(
+            'background image used to fill detected person masks; pass an asset name '
+            f'({", ".join(PERSON_FILL_BACKGROUND_NAMES)}) or an image file path'
+        ),
+    )
+    parser.add_argument(
+        '--person-fill-background-blend',
+        default=PERSON_FILL_BACKGROUND_BLEND,
+        type=float,
+        help='background gray blend ratio for filled person masks, 0 keeps original person gray and 1 uses background gray',
+    )
+    parser.add_argument(
+        '--depth-distance-close-threshold',
+        default=DEPTH_PERSON_DISTANCE_CLOSE_THRESHOLD,
+        type=float,
+        help='depth-mode close/far threshold for pairwise person distance',
+    )
+    parser.add_argument(
+        '--ir-distance-close-gap-ratio',
+        default=PERSON_DISTANCE_CLOSE_GAP_RATIO,
+        type=float,
+        help='IR-mode close/far threshold as image-width gap ratio',
+    )
+    parser.add_argument(
+        '--ir-distance-close-center-ratio',
+        default=PERSON_DISTANCE_CLOSE_CENTER_RATIO,
+        type=float,
+        help='IR-mode close/far threshold as average-person-extent center-distance ratio',
     )
     parser.add_argument(
         '--model-instances',
@@ -1103,6 +1177,11 @@ def main():
         jpeg_quality=args.jpeg_quality,
         input_modality=args.input_modality,
         ir_preprocess=args.ir_preprocess,
+        person_fill_background=args.person_fill_background,
+        person_fill_background_blend=args.person_fill_background_blend,
+        depth_distance_close_threshold=args.depth_distance_close_threshold,
+        ir_distance_close_gap_ratio=args.ir_distance_close_gap_ratio,
+        ir_distance_close_center_ratio=args.ir_distance_close_center_ratio,
         cpu_worker_mode=args.cpu_worker_mode,
         cpu_process_start_method=args.cpu_process_start_method,
         model_instances=args.model_instances,

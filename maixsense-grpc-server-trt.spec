@@ -73,6 +73,10 @@ for package in (
 
 binaries = []
 datas = []
+tof_pose_assets_dir = os.path.join("src", "tof_pose", "assets")
+if os.path.isdir(tof_pose_assets_dir):
+    datas.append((tof_pose_assets_dir, os.path.join("tof_pose", "assets")))
+
 for package in (
     "oss2",
     "boto3",

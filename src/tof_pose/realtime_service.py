@@ -25,6 +25,9 @@ CONF_THRESHOLD = 0.2
 TRACKER_CONFIG = "botsort.yaml"
 SEG_INFER_IMGSZ = 320
 POSE_INFER_IMGSZ = 320
+MODEL_INPUT_SIZE_320 = 320
+MODEL_INPUT_SIZE_160 = 160
+MODEL_INPUT_SIZES = (MODEL_INPUT_SIZE_320, MODEL_INPUT_SIZE_160)
 POSE_INFER_INTERVAL = 1
 DISPLAY_SIZE = (320, 320)
 DISPLAY_SCALE = 3
@@ -63,6 +66,9 @@ DEPTH_PERSON_DISTANCE_CLOSE_THRESHOLD = 150.0
 PERSON_DISTANCE_CLOSE_GAP_RATIO = 0.15
 PERSON_DISTANCE_CLOSE_CENTER_RATIO = 0.90
 QUALITATIVE_KPT_CONF_THRESHOLD = 0.35
+POSE_STATUS_MIN_TORSO_Y_PX = 20.0
+POSE_STATUS_MIN_THIGH_Y_PX = 12.0
+POSE_STATUS_THIGH_TORSO_RATIO_THRESHOLD = 0.65
 POSE_BATCH_REUSE_MIN_VALID_RATIO = 0.45
 POSE_BATCH_REUSE_MAX_GAP = 1
 ACTION_KEYPOINT_SHIFT_HIGH_PX = 18.0
@@ -318,36 +324,73 @@ def _gray_to_bgr(gray_u8: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(gray_u8, cv2.COLOR_GRAY2BGR)
 
 
+def normalize_model_input_size(value: int | str | None) -> int:
+    if value is None:
+        return MODEL_INPUT_SIZE_320
+    try:
+        size = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"model_input_size must be one of {MODEL_INPUT_SIZES}") from exc
+    if size not in MODEL_INPUT_SIZES:
+        raise ValueError(f"model_input_size must be one of {MODEL_INPUT_SIZES}")
+    return size
+
+
+def _scale_boxes_to_display(boxes: np.ndarray, scale_x: float, scale_y: float) -> np.ndarray:
+    scaled = np.asarray(boxes, dtype=np.float32).copy()
+    if scaled.size:
+        scaled[..., [0, 2]] *= float(scale_x)
+        scaled[..., [1, 3]] *= float(scale_y)
+    return scaled
+
+
+def _scale_keypoints_to_display(keypoints: np.ndarray, scale_x: float, scale_y: float) -> np.ndarray:
+    scaled = np.asarray(keypoints, dtype=np.float32).copy()
+    if scaled.size:
+        scaled[..., 0] *= float(scale_x)
+        scaled[..., 1] *= float(scale_y)
+    return scaled
+
+
 def _prepare_depth_views_cpu(
     depth_gray: np.ndarray,
     input_modality: str = INPUT_MODALITY_DEPTH,
     *,
     ir_preprocess: bool = False,
+    model_input_size: int = MODEL_INPUT_SIZE_320,
 ) -> dict:
+    model_input_size = normalize_model_input_size(model_input_size)
     width, height = DISPLAY_SIZE
     modality = _normalize_input_modality(input_modality)
     depth_u8 = _ensure_uint8_gray_cpu(depth_gray)
-    depth_raw = cv2.resize(depth_u8, DISPLAY_SIZE, interpolation=cv2.INTER_LINEAR)
+    input_source = depth_u8
+    depth_raw = cv2.resize(input_source, DISPLAY_SIZE, interpolation=cv2.INTER_LINEAR)
 
-    enhanced = depth_u8
+    enhanced = input_source
     if modality == INPUT_MODALITY_IR and ir_preprocess:
         if MEDIAN_BLUR_K and MEDIAN_BLUR_K >= 3:
             enhanced = cv2.medianBlur(enhanced, MEDIAN_BLUR_K)
         enhanced = _get_worker_clahe().apply(enhanced)
 
     depth_up = cv2.resize(enhanced, DISPLAY_SIZE, interpolation=cv2.INTER_LINEAR)
+    model_depth = cv2.resize(enhanced, (model_input_size, model_input_size), interpolation=cv2.INTER_LINEAR)
     display_depth_up = _apply_display_gamma_u8(depth_up)
     if modality == INPUT_MODALITY_IR:
         color_img = _gray_to_bgr(display_depth_up)
-        model_color_img = _gray_to_bgr(depth_up)
+        model_color_img = _gray_to_bgr(model_depth)
     else:
-        model_color_img = cv2.applyColorMap(depth_up, cv2.COLORMAP_MAGMA)
+        model_color_img = cv2.applyColorMap(model_depth, cv2.COLORMAP_MAGMA)
         color_img = _apply_display_colormap(display_depth_up, modality)
     return {
         "depth_up": display_depth_up,
         "depth_raw": depth_raw,
         "color_img": color_img,
         "model_color_img": model_color_img,
+        "model_input_size": model_input_size,
+        "model_width": int(model_input_size),
+        "model_height": int(model_input_size),
+        "model_to_display_scale_x": float(width) / max(float(model_input_size), 1.0),
+        "model_to_display_scale_y": float(height) / max(float(model_input_size), 1.0),
         "width": width,
         "height": height,
     }
@@ -359,19 +402,25 @@ def _prepare_color_image_cpu(payload) -> np.ndarray:
 
 def _prepare_depth_views_payload_cpu(payload) -> dict:
     if isinstance(payload, tuple):
-        if len(payload) >= 3:
+        if len(payload) >= 4:
+            depth_gray, input_modality, ir_preprocess, model_input_size = payload[:4]
+        elif len(payload) >= 3:
             depth_gray, input_modality, ir_preprocess = payload[:3]
+            model_input_size = MODEL_INPUT_SIZE_320
         else:
             depth_gray, input_modality = payload
             ir_preprocess = False
+            model_input_size = MODEL_INPUT_SIZE_320
     else:
         depth_gray = payload
         input_modality = INPUT_MODALITY_DEPTH
         ir_preprocess = False
+        model_input_size = MODEL_INPUT_SIZE_320
     return _prepare_depth_views_cpu(
         depth_gray,
         input_modality=input_modality,
         ir_preprocess=bool(ir_preprocess),
+        model_input_size=model_input_size,
     )
 
 
@@ -509,10 +558,20 @@ def _mean_keypoint_y(
     return float(np.mean(values))
 
 
+def _normalize_pose_status_thigh_torso_ratio(value: float | None) -> float:
+    if value is None:
+        return POSE_STATUS_THIGH_TORSO_RATIO_THRESHOLD
+    ratio = float(value)
+    if not np.isfinite(ratio) or ratio <= 0.0:
+        raise ValueError("pose_status_thigh_torso_ratio_threshold must be > 0")
+    return ratio
+
+
 def _classify_person_pose_status(
     kpt_xy: np.ndarray | None,
     kpt_conf: np.ndarray | None,
     threshold: float = QUALITATIVE_KPT_CONF_THRESHOLD,
+    thigh_torso_ratio_threshold: float = POSE_STATUS_THIGH_TORSO_RATIO_THRESHOLD,
 ) -> str | None:
     if kpt_xy is None or kpt_conf is None or len(kpt_xy) <= 0 or len(kpt_conf) <= 0:
         return None
@@ -520,26 +579,18 @@ def _classify_person_pose_status(
     shoulder_y = _mean_keypoint_y(kpt_xy, kpt_conf, (5, 6), threshold)
     hip_y = _mean_keypoint_y(kpt_xy, kpt_conf, (11, 12), threshold)
     knee_y = _mean_keypoint_y(kpt_xy, kpt_conf, (13, 14), threshold)
-    ankle_y = _mean_keypoint_y(kpt_xy, kpt_conf, (15, 16), threshold)
-
-    if hip_y is not None and knee_y is not None and ankle_y is not None:
-        upper_leg = abs(knee_y - hip_y)
-        lower_leg = abs(ankle_y - knee_y)
-        leg_span = abs(ankle_y - hip_y)
-        if leg_span < 45.0 or min(upper_leg, lower_leg) < 18.0:
-            return "坐"
-        if upper_leg < max(12.0, lower_leg * 0.55):
-            return "坐"
-        if leg_span >= 65.0 and min(upper_leg, lower_leg) >= 18.0:
-            return "站"
-        return None
 
     if shoulder_y is not None and hip_y is not None and knee_y is not None:
         torso = abs(hip_y - shoulder_y)
-        upper_leg = abs(knee_y - hip_y)
-        if upper_leg < max(14.0, torso * 0.45):
+        thigh = abs(knee_y - hip_y)
+        if torso < POSE_STATUS_MIN_TORSO_Y_PX:
+            return None
+        thigh_torso_ratio = thigh / max(torso, 1.0)
+        if thigh < POSE_STATUS_MIN_THIGH_Y_PX:
             return "坐"
-        return None
+        if thigh_torso_ratio <= thigh_torso_ratio_threshold:
+            return "坐"
+        return "站"
 
     return None
 
@@ -655,12 +706,19 @@ def _compute_person_status(analysis: dict) -> str:
     person_count = int(analysis.get("person_count", 0) or 0)
     kpt_xy_np = analysis.get("kpt_xy_np")
     kpt_conf_np = analysis.get("kpt_conf_np")
+    thigh_torso_ratio_threshold = _normalize_pose_status_thigh_torso_ratio(
+        analysis.get("pose_status_thigh_torso_ratio_threshold")
+    )
     statuses: list[str] = []
     if kpt_xy_np is not None and kpt_conf_np is not None:
         for idx in _select_pose_indices_for_status(analysis):
             if idx >= len(kpt_xy_np) or idx >= len(kpt_conf_np):
                 continue
-            status = _classify_person_pose_status(kpt_xy_np[idx], kpt_conf_np[idx])
+            status = _classify_person_pose_status(
+                kpt_xy_np[idx],
+                kpt_conf_np[idx],
+                thigh_torso_ratio_threshold=thigh_torso_ratio_threshold,
+            )
             if status is not None:
                 statuses.append(status)
     return _format_person_status(statuses, person_count)
@@ -1278,8 +1336,10 @@ class RealtimePoseEngine:
         parallel_models: bool = True,
         input_modality: str = INPUT_MODALITY_DEPTH,
         ir_preprocess: bool = False,
+        model_input_size: int = MODEL_INPUT_SIZE_320,
         person_fill_background: str | None = None,
         person_fill_background_blend: float = PERSON_FILL_BACKGROUND_BLEND,
+        pose_status_thigh_torso_ratio_threshold: float = POSE_STATUS_THIGH_TORSO_RATIO_THRESHOLD,
         depth_distance_close_threshold: float = DEPTH_PERSON_DISTANCE_CLOSE_THRESHOLD,
         ir_distance_close_gap_ratio: float = PERSON_DISTANCE_CLOSE_GAP_RATIO,
         ir_distance_close_center_ratio: float = PERSON_DISTANCE_CLOSE_CENTER_RATIO,
@@ -1299,13 +1359,19 @@ class RealtimePoseEngine:
         self._cpu_process_start_method = _resolve_cpu_process_start_method(cpu_process_start_method)
         self._decode_executor: ThreadPoolExecutor | None = None
         self._render_executor: ThreadPoolExecutor | None = None
+        self._postprocess_workers = max(1, min(self._render_workers, self._decode_workers))
+        self._postprocess_executor: ThreadPoolExecutor | None = None
         if self._cpu_worker_mode == CPU_WORKER_MODE_THREAD:
             if self._decode_workers > 1:
                 self._decode_executor = ThreadPoolExecutor(max_workers=self._decode_workers)
-            if self._render_workers > 1:
-                self._render_executor = ThreadPoolExecutor(max_workers=self._render_workers)
         else:
-            _warm_cpu_process_pool(max(self._decode_workers, self._render_workers), self._cpu_process_start_method)
+            _warm_cpu_process_pool(self._decode_workers, self._cpu_process_start_method)
+        # These stages run after model inference and often carry full-frame numpy arrays.
+        # Keep them in-process so out-of-lock work does not queue behind decode/model prep.
+        if self._render_workers > 1:
+            self._render_executor = ThreadPoolExecutor(max_workers=self._render_workers)
+        if self._postprocess_workers > 1:
+            self._postprocess_executor = ThreadPoolExecutor(max_workers=self._postprocess_workers)
         self._png_compression = min(9, max(0, int(png_compression)))
         normalized_output_format = str(output_format or "png").strip().lower()
         if normalized_output_format == "jpg":
@@ -1316,8 +1382,14 @@ class RealtimePoseEngine:
         self._jpeg_quality = min(100, max(1, int(jpeg_quality)))
         self._input_modality = _normalize_input_modality(input_modality)
         self._ir_preprocess = bool(ir_preprocess)
+        self._model_input_size = normalize_model_input_size(model_input_size)
+        self._seg_infer_imgsz = int(self._model_input_size)
+        self._pose_infer_imgsz = int(self._model_input_size)
         self._person_fill_background = _normalize_person_fill_background(person_fill_background)
         self._person_fill_background_blend = _normalize_person_fill_background_blend(person_fill_background_blend)
+        self._pose_status_thigh_torso_ratio_threshold = _normalize_pose_status_thigh_torso_ratio(
+            pose_status_thigh_torso_ratio_threshold
+        )
         self._depth_distance_close_threshold = _normalize_distance_threshold(
             depth_distance_close_threshold,
             DEPTH_PERSON_DISTANCE_CLOSE_THRESHOLD,
@@ -1417,7 +1489,7 @@ class RealtimePoseEngine:
         """Run one synthetic model batch so CUDA kernels and model graphs are ready before serving traffic."""
         batch_size = max(1, int(batch_size))
         color_imgs = [
-            np.zeros((DISPLAY_SIZE[1], DISPLAY_SIZE[0], 3), dtype=np.uint8)
+            np.zeros((self._model_input_size, self._model_input_size, 3), dtype=np.uint8)
             for _ in range(batch_size)
         ]
 
@@ -1433,7 +1505,7 @@ class RealtimePoseEngine:
                     persist=False,
                     tracker=TRACKER_CONFIG,
                     classes=[0],
-                    imgsz=SEG_INFER_IMGSZ,
+                    imgsz=self._seg_infer_imgsz,
                     device=self._device,
                     verbose=False,
                 )
@@ -1444,7 +1516,7 @@ class RealtimePoseEngine:
                 color_imgs,
                 conf=self._pose_conf_threshold,
                 classes=[0],
-                imgsz=POSE_INFER_IMGSZ,
+                imgsz=self._pose_infer_imgsz,
                 device=self._device,
                 verbose=False,
             )
@@ -1454,9 +1526,10 @@ class RealtimePoseEngine:
             self.reset()
 
         LOGGER.info(
-            "Warmup timing: instance=%s batch_size=%d seg_model_ms=%d pose_model_ms=%d total_ms=%d device=%s",
+            "Warmup timing: instance=%s batch_size=%d model_input_size=%d seg_model_ms=%d pose_model_ms=%d total_ms=%d device=%s",
             self._instance_name,
             batch_size,
+            self._model_input_size,
             seg_yolo_ms,
             pose_yolo_ms,
             total_ms,
@@ -1646,6 +1719,7 @@ class RealtimePoseEngine:
             depth_gray,
             input_modality=self._input_modality,
             ir_preprocess=self._ir_preprocess,
+            model_input_size=self._model_input_size,
         )
 
     def _analyze_frame(
@@ -1666,6 +1740,8 @@ class RealtimePoseEngine:
         model_color_img = prepared.get("model_color_img", color_img)
         width = prepared["width"]
         height = prepared["height"]
+        model_to_display_scale_x = float(prepared.get("model_to_display_scale_x", 1.0) or 1.0)
+        model_to_display_scale_y = float(prepared.get("model_to_display_scale_y", 1.0) or 1.0)
 
         # Pose-only mode: do not rely on segmentation model outputs.
         if self._pose_only:
@@ -1674,7 +1750,7 @@ class RealtimePoseEngine:
                     model_color_img,
                     conf=self._pose_conf_threshold,
                     classes=[0],
-                    imgsz=POSE_INFER_IMGSZ,
+                    imgsz=self._pose_infer_imgsz,
                     device=self._device,
                     verbose=False,
                 )
@@ -1684,12 +1760,21 @@ class RealtimePoseEngine:
             pose_boxes_np: list[np.ndarray] = []
             if pose_result is not None:
                 if pose_result.boxes is not None and len(pose_result.boxes) > 0:
-                    pose_boxes_np = [box.copy() for box in pose_result.boxes.xyxy.cpu().numpy()]
+                    scaled_pose_boxes = _scale_boxes_to_display(
+                        pose_result.boxes.xyxy.cpu().numpy(),
+                        model_to_display_scale_x,
+                        model_to_display_scale_y,
+                    )
+                    pose_boxes_np = [box.copy() for box in scaled_pose_boxes]
                 if pose_result.keypoints is not None:
                     keypoints_xy = pose_result.keypoints.xy
                     keypoints_conf = pose_result.keypoints.conf
                     if keypoints_xy is not None and keypoints_conf is not None:
-                        kpt_xy_np = keypoints_xy.cpu().numpy()
+                        kpt_xy_np = _scale_keypoints_to_display(
+                            keypoints_xy.cpu().numpy(),
+                            model_to_display_scale_x,
+                            model_to_display_scale_y,
+                        )
                         kpt_conf_np = keypoints_conf.cpu().numpy()
 
             pose_draw_indices: list[int] = []
@@ -1719,6 +1804,7 @@ class RealtimePoseEngine:
                 "contour_reject_reasons": ["pose_only"],
                 "person_fill_background": self._person_fill_background,
                 "person_fill_background_blend": self._person_fill_background_blend,
+                "pose_status_thigh_torso_ratio_threshold": self._pose_status_thigh_torso_ratio_threshold,
                 "width": width,
                 "height": height,
             }
@@ -1730,7 +1816,7 @@ class RealtimePoseEngine:
                 persist=self._persist_tracks,
                 tracker=TRACKER_CONFIG,
                 classes=[0],
-                imgsz=SEG_INFER_IMGSZ,
+                imgsz=self._seg_infer_imgsz,
                 device=self._device,
                 verbose=False,
             )
@@ -1745,7 +1831,7 @@ class RealtimePoseEngine:
                     model_color_img,
                     conf=self._pose_conf_threshold,
                     classes=[0],
-                    imgsz=POSE_INFER_IMGSZ,
+                    imgsz=self._pose_infer_imgsz,
                     device=self._device,
                     verbose=False,
                 )
@@ -1755,7 +1841,11 @@ class RealtimePoseEngine:
                     keypoints_xy = pose_result.keypoints.xy
                     keypoints_conf = pose_result.keypoints.conf
                     if keypoints_xy is not None and keypoints_conf is not None:
-                        self._cached_kpt_xy = keypoints_xy.cpu().numpy()
+                        self._cached_kpt_xy = _scale_keypoints_to_display(
+                            keypoints_xy.cpu().numpy(),
+                            model_to_display_scale_x,
+                            model_to_display_scale_y,
+                        )
                         self._cached_kpt_conf = keypoints_conf.cpu().numpy()
                 elif not self._warned_no_keypoints:
                     print(
@@ -1765,7 +1855,12 @@ class RealtimePoseEngine:
                     self._warned_no_keypoints = True
 
                 if pose_result.boxes is not None and len(pose_result.boxes) > 0:
-                    self._cached_pose_boxes = [box.copy() for box in pose_result.boxes.xyxy.cpu().numpy()]
+                    scaled_pose_boxes = _scale_boxes_to_display(
+                        pose_result.boxes.xyxy.cpu().numpy(),
+                        model_to_display_scale_x,
+                        model_to_display_scale_y,
+                    )
+                    self._cached_pose_boxes = [box.copy() for box in scaled_pose_boxes]
 
         pose_boxes_np = self._cached_pose_boxes
         kpt_xy_np = self._cached_kpt_xy
@@ -1802,7 +1897,11 @@ class RealtimePoseEngine:
                 contour_debug_summary.append("/".join(tokens))
 
         if result.boxes is not None and len(result.boxes) > 0 and result.masks is not None:
-            boxes_xyxy = result.boxes.xyxy.cpu().numpy()
+            boxes_xyxy = _scale_boxes_to_display(
+                result.boxes.xyxy.cpu().numpy(),
+                model_to_display_scale_x,
+                model_to_display_scale_y,
+            )
             track_ids = (
                 result.boxes.id.int().cpu().tolist()
                 if result.boxes.id is not None
@@ -2072,6 +2171,7 @@ class RealtimePoseEngine:
             "contour_debug_summary": contour_debug_summary,
             "person_fill_background": self._person_fill_background,
             "person_fill_background_blend": self._person_fill_background_blend,
+            "pose_status_thigh_torso_ratio_threshold": self._pose_status_thigh_torso_ratio_threshold,
             "width": width,
             "height": height,
         }
@@ -2223,12 +2323,10 @@ class RealtimePoseEngine:
         return self._map_thread_stage(self._decode_executor, self._decode_workers, func, items)
 
     def _map_render_stage(self, func, items: list):
-        if self._cpu_worker_mode == CPU_WORKER_MODE_PROCESS:
-            return self._map_process_stage(func, items, self._render_workers)
         return self._map_thread_stage(self._render_executor, self._render_workers, func, items)
 
     def _map_postprocess_stage(self, func, items: list):
-        return self._map_render_stage(func, items)
+        return self._map_thread_stage(self._postprocess_executor, self._postprocess_workers, func, items)
 
     def _interpolate_depth(self, previous_depth: np.ndarray | None, current_depth: np.ndarray) -> np.ndarray:
         current_u8 = self._ensure_uint8_gray(current_depth)
@@ -2342,6 +2440,7 @@ class RealtimePoseEngine:
         analysis["height"] = prepared["height"]
         analysis["person_fill_background"] = self._person_fill_background
         analysis["person_fill_background_blend"] = self._person_fill_background_blend
+        analysis["pose_status_thigh_torso_ratio_threshold"] = self._pose_status_thigh_torso_ratio_threshold
         return {
             "frame_id": frame_id,
             "analysis": analysis,
@@ -2405,14 +2504,7 @@ class RealtimePoseEngine:
 
     def _encode_analyzed_results(self, analyzed_results: list[dict], timings: dict[str, int] | None = None) -> list[dict]:
         render_encode_start = time.perf_counter()
-        if self._cpu_worker_mode == CPU_WORKER_MODE_PROCESS:
-            payloads = [
-                (analyzed, self._output_format, self._png_compression, self._jpeg_quality)
-                for analyzed in analyzed_results
-            ]
-            encoded_results = self._map_render_stage(_render_and_encode_analyzed_result_cpu, payloads)
-        else:
-            encoded_results = self._map_render_stage(self._render_and_encode_analyzed_result, analyzed_results)
+        encoded_results = self._map_render_stage(self._render_and_encode_analyzed_result, analyzed_results)
         render_encode_ms = _elapsed_ms(render_encode_start)
 
         render_cpu_ms = 0
@@ -2438,7 +2530,10 @@ class RealtimePoseEngine:
     def _prepare_source_views(self, source_frames: list[dict]) -> list[dict]:
         depths = [item["depth"] for item in source_frames]
         if self._cpu_worker_mode == CPU_WORKER_MODE_PROCESS:
-            payloads = [(depth, self._input_modality, self._ir_preprocess) for depth in depths]
+            payloads = [
+                (depth, self._input_modality, self._ir_preprocess, self._model_input_size)
+                for depth in depths
+            ]
             return self._map_decode_stage(_prepare_depth_views_payload_cpu, payloads)
         return [self._prepare_depth_views(depth) for depth in depths]
 
@@ -2633,7 +2728,8 @@ class RealtimePoseEngine:
                 "model_infer_ms=%d seg_model_ms=%d pose_model_ms=%d parallel_models=%s "
                 "postprocess_ms=%d interpolate_ms=%d render_ms=%d png_encode_ms=%d total_ms=%d "
                 "decode_workers=%d render_workers=%d cpu_worker_mode=%s cpu_process_start_method=%s "
-                "png_compression=%d output_format=%s jpeg_quality=%d input_modality=%s device=%s"
+                "png_compression=%d output_format=%s jpeg_quality=%d input_modality=%s "
+                "model_input_size=%d device=%s"
             ),
             input_count,
             output_count,
@@ -2660,6 +2756,7 @@ class RealtimePoseEngine:
             self._output_format,
             self._jpeg_quality,
             self._input_modality,
+            self._model_input_size,
             self._device or "auto",
         )
 
@@ -2847,7 +2944,7 @@ class RealtimePoseEngine:
                     color_imgs,
                     conf=self._pose_conf_threshold,
                     classes=[0],
-                    imgsz=POSE_INFER_IMGSZ,
+                    imgsz=self._pose_infer_imgsz,
                     device=self._device,
                     verbose=False,
                 )
@@ -2883,7 +2980,7 @@ class RealtimePoseEngine:
                         persist=self._persist_tracks,
                         tracker=TRACKER_CONFIG,
                         classes=[0],
-                        imgsz=SEG_INFER_IMGSZ,
+                        imgsz=self._seg_infer_imgsz,
                         device=self._device,
                         verbose=False,
                     )
@@ -2895,7 +2992,7 @@ class RealtimePoseEngine:
                         color_imgs,
                         conf=self._pose_conf_threshold,
                         classes=[0],
-                        imgsz=POSE_INFER_IMGSZ,
+                        imgsz=self._pose_infer_imgsz,
                         device=self._device,
                         verbose=False,
                     )

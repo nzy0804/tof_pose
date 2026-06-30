@@ -39,6 +39,8 @@ from tof_pose.realtime_service import (
     DEPTH_PERSON_DISTANCE_CLOSE_THRESHOLD,
     INPUT_MODALITIES,
     INPUT_MODALITY_DEPTH,
+    MODEL_INPUT_SIZES,
+    MODEL_INPUT_SIZE_320,
     PERSON_FILL_BACKGROUND_DEFAULT,
     PERSON_FILL_BACKGROUND_BLEND,
     PERSON_FILL_BACKGROUND_NAMES,
@@ -243,6 +245,7 @@ def build_engine(args: argparse.Namespace) -> RealtimePoseEngine:
         jpeg_quality=args.jpeg_quality,
         input_modality=args.input_modality,
         ir_preprocess=args.ir_preprocess,
+        model_input_size=args.model_input_size,
         person_fill_background=args.person_fill_background,
         person_fill_background_blend=args.person_fill_background_blend,
         depth_distance_close_threshold=args.depth_distance_close_threshold,
@@ -357,6 +360,13 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--jpeg-quality", default=60, type=int)
     parser.add_argument("--input-modality", default=INPUT_MODALITY_DEPTH, choices=INPUT_MODALITIES)
     parser.add_argument("--ir-preprocess", action="store_true", help="enable median filtering plus CLAHE for infrared grayscale inputs")
+    parser.add_argument(
+        "--model-input-size",
+        default=MODEL_INPUT_SIZE_320,
+        type=int,
+        choices=MODEL_INPUT_SIZES,
+        help="model inference input size; 160 scales the raw image directly before inference",
+    )
     parser.add_argument(
         "--person-fill-background",
         default=PERSON_FILL_BACKGROUND_DEFAULT,

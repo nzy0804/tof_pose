@@ -69,12 +69,15 @@ from tof_pose.realtime_service import (
     CPU_WORKER_MODE_THREAD,
     INPUT_MODALITIES,
     INPUT_MODALITY_DEPTH,
+    MODEL_INPUT_SIZES,
+    MODEL_INPUT_SIZE_320,
     DEPTH_PERSON_DISTANCE_CLOSE_THRESHOLD,
     PERSON_FILL_BACKGROUND_DEFAULT,
     PERSON_FILL_BACKGROUND_BLEND,
     PERSON_FILL_BACKGROUND_NAMES,
     PERSON_DISTANCE_CLOSE_CENTER_RATIO,
     PERSON_DISTANCE_CLOSE_GAP_RATIO,
+    POSE_STATUS_THIGH_TORSO_RATIO_THRESHOLD,
 )
 from tof_pose.object_storage import (
     ObjectStorageConfig,
@@ -150,8 +153,10 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         jpeg_quality: int = 80,
         input_modality: str = INPUT_MODALITY_DEPTH,
         ir_preprocess: bool = False,
+        model_input_size: int = MODEL_INPUT_SIZE_320,
         person_fill_background: str | None = None,
         person_fill_background_blend: float = PERSON_FILL_BACKGROUND_BLEND,
+        pose_status_thigh_torso_ratio_threshold: float = POSE_STATUS_THIGH_TORSO_RATIO_THRESHOLD,
         depth_distance_close_threshold: float = DEPTH_PERSON_DISTANCE_CLOSE_THRESHOLD,
         ir_distance_close_gap_ratio: float = PERSON_DISTANCE_CLOSE_GAP_RATIO,
         ir_distance_close_center_ratio: float = PERSON_DISTANCE_CLOSE_CENTER_RATIO,
@@ -256,8 +261,10 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
                     jpeg_quality=jpeg_quality,
                     input_modality=input_modality,
                     ir_preprocess=ir_preprocess,
+                    model_input_size=model_input_size,
                     person_fill_background=person_fill_background,
                     person_fill_background_blend=person_fill_background_blend,
+                    pose_status_thigh_torso_ratio_threshold=pose_status_thigh_torso_ratio_threshold,
                     depth_distance_close_threshold=depth_distance_close_threshold,
                     ir_distance_close_gap_ratio=ir_distance_close_gap_ratio,
                     ir_distance_close_center_ratio=ir_distance_close_center_ratio,
@@ -789,8 +796,10 @@ def serve(
     jpeg_quality: int = 80,
     input_modality: str = INPUT_MODALITY_DEPTH,
     ir_preprocess: bool = False,
+    model_input_size: int = MODEL_INPUT_SIZE_320,
     person_fill_background: str | None = None,
     person_fill_background_blend: float = PERSON_FILL_BACKGROUND_BLEND,
+    pose_status_thigh_torso_ratio_threshold: float = POSE_STATUS_THIGH_TORSO_RATIO_THRESHOLD,
     depth_distance_close_threshold: float = DEPTH_PERSON_DISTANCE_CLOSE_THRESHOLD,
     ir_distance_close_gap_ratio: float = PERSON_DISTANCE_CLOSE_GAP_RATIO,
     ir_distance_close_center_ratio: float = PERSON_DISTANCE_CLOSE_CENTER_RATIO,
@@ -842,8 +851,10 @@ def serve(
             jpeg_quality=jpeg_quality,
             input_modality=input_modality,
             ir_preprocess=ir_preprocess,
+            model_input_size=model_input_size,
             person_fill_background=person_fill_background,
             person_fill_background_blend=person_fill_background_blend,
+            pose_status_thigh_torso_ratio_threshold=pose_status_thigh_torso_ratio_threshold,
             depth_distance_close_threshold=depth_distance_close_threshold,
             ir_distance_close_gap_ratio=ir_distance_close_gap_ratio,
             ir_distance_close_center_ratio=ir_distance_close_center_ratio,
@@ -896,8 +907,8 @@ def serve(
         (
             'Starting gRPC server on %s (max_msg_mb=%d, max_workers=%d, model_instances=%d, '
             'parallel_models=%s, cpu_worker_mode=%s, cpu_process_start_method=%s, input_modality=%s, '
-            'ir_preprocess=%s, person_fill_background=%s, person_fill_background_blend=%.3f, '
-            'depth_distance_close_threshold=%.3f, ir_distance_close_gap_ratio=%.3f, '
+            'ir_preprocess=%s, model_input_size=%d, person_fill_background=%s, person_fill_background_blend=%.3f, '
+            'pose_status_thigh_torso_ratio_threshold=%.3f, depth_distance_close_threshold=%.3f, ir_distance_close_gap_ratio=%.3f, '
             'ir_distance_close_center_ratio=%.3f)'
         ),
         bound_address,
@@ -909,8 +920,10 @@ def serve(
         cpu_process_start_method,
         input_modality,
         "true" if ir_preprocess else "false",
+        model_input_size,
         person_fill_background or PERSON_FILL_BACKGROUND_DEFAULT,
         person_fill_background_blend,
+        pose_status_thigh_torso_ratio_threshold,
         depth_distance_close_threshold,
         ir_distance_close_gap_ratio,
         ir_distance_close_center_ratio,
@@ -1016,6 +1029,13 @@ def main():
         help='enable median filtering plus CLAHE for infrared grayscale inputs',
     )
     parser.add_argument(
+        '--model-input-size',
+        default=MODEL_INPUT_SIZE_320,
+        type=int,
+        choices=MODEL_INPUT_SIZES,
+        help='model inference input size; 160 scales the raw image directly before inference',
+    )
+    parser.add_argument(
         '--person-fill-background',
         default=PERSON_FILL_BACKGROUND_DEFAULT,
         help=(
@@ -1028,6 +1048,12 @@ def main():
         default=PERSON_FILL_BACKGROUND_BLEND,
         type=float,
         help='background gray blend ratio for filled person masks, 0 keeps original person gray and 1 uses background gray',
+    )
+    parser.add_argument(
+        '--pose-status-thigh-torso-ratio-threshold',
+        default=POSE_STATUS_THIGH_TORSO_RATIO_THRESHOLD,
+        type=float,
+        help='person_status threshold: thigh_y / torso_y <= this value is sitting, otherwise standing',
     )
     parser.add_argument(
         '--depth-distance-close-threshold',
@@ -1177,8 +1203,10 @@ def main():
         jpeg_quality=args.jpeg_quality,
         input_modality=args.input_modality,
         ir_preprocess=args.ir_preprocess,
+        model_input_size=args.model_input_size,
         person_fill_background=args.person_fill_background,
         person_fill_background_blend=args.person_fill_background_blend,
+        pose_status_thigh_torso_ratio_threshold=args.pose_status_thigh_torso_ratio_threshold,
         depth_distance_close_threshold=args.depth_distance_close_threshold,
         ir_distance_close_gap_ratio=args.ir_distance_close_gap_ratio,
         ir_distance_close_center_ratio=args.ir_distance_close_center_ratio,

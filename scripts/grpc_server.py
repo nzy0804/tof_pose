@@ -9,7 +9,9 @@ import logging
 import multiprocessing
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed, wait
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed, wait
+from dataclasses import dataclass
 from pathlib import Path
 
 import grpc
@@ -125,6 +127,166 @@ class _ObjectStorageStageStats:
         }
 
 
+@dataclass
+class _DynamicInferJob:
+    request_id: int
+    stream_key: str
+    frame_id: str
+    image_data: bytes
+    input_index: int
+    future: Future
+    enqueued_at: float
+
+
+class _DynamicInferBatcher:
+    def __init__(
+        self,
+        *,
+        engine: RealtimePoseEngine,
+        instance_name: str,
+        max_batch_size: int,
+        max_wait_ms: int,
+        max_queue_size: int,
+    ) -> None:
+        self._engine = engine
+        self._instance_name = instance_name
+        self._max_batch_size = max(1, int(max_batch_size))
+        self._max_wait_ms = max(0, int(max_wait_ms))
+        self._max_queue_size = max(1, int(max_queue_size))
+        self._condition = threading.Condition()
+        self._queue: deque[_DynamicInferJob] = deque()
+        self._closed = False
+        self._next_request_id = 0
+        self._worker = threading.Thread(
+            target=self._run,
+            name=f"{instance_name}-dynamic-batch",
+            daemon=True,
+        )
+        self._worker.start()
+
+    @property
+    def max_batch_size(self) -> int:
+        return self._max_batch_size
+
+    @property
+    def max_wait_ms(self) -> int:
+        return self._max_wait_ms
+
+    def close(self) -> None:
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+
+    def submit(self, *, stream_key: str, frames: list[tuple[str, bytes]]) -> list[dict]:
+        if not frames:
+            return []
+
+        with self._condition:
+            if self._closed:
+                raise RuntimeError(f"dynamic batcher {self._instance_name} is closed")
+            if len(self._queue) + len(frames) > self._max_queue_size:
+                raise RuntimeError(
+                    (
+                        f"dynamic batch queue full for {self._instance_name}: "
+                        f"queued={len(self._queue)} incoming={len(frames)} max_queue_size={self._max_queue_size}"
+                    )
+                )
+            request_id = self._next_request_id
+            self._next_request_id += 1
+            enqueued_at = time.perf_counter()
+            jobs = [
+                _DynamicInferJob(
+                    request_id=request_id,
+                    stream_key=stream_key,
+                    frame_id=frame_id,
+                    image_data=image_data,
+                    input_index=input_index,
+                    future=Future(),
+                    enqueued_at=enqueued_at,
+                )
+                for input_index, (frame_id, image_data) in enumerate(frames)
+            ]
+            self._queue.extend(jobs)
+            self._condition.notify_all()
+
+        results = [job.future.result() for job in jobs]
+        for output_index, result in enumerate(results):
+            result["input_index"] = output_index
+            result["output_index"] = output_index
+        return results
+
+    def _take_batch(self) -> tuple[list[_DynamicInferJob], int] | None:
+        with self._condition:
+            while not self._queue and not self._closed:
+                self._condition.wait()
+            if self._closed and not self._queue:
+                return None
+
+            first_enqueued_at = self._queue[0].enqueued_at
+            while len(self._queue) < self._max_batch_size and not self._closed:
+                if self._max_wait_ms <= 0:
+                    break
+                elapsed_ms = int((time.perf_counter() - first_enqueued_at) * 1000)
+                remaining_ms = self._max_wait_ms - elapsed_ms
+                if remaining_ms <= 0:
+                    break
+                self._condition.wait(timeout=remaining_ms / 1000.0)
+
+            batch_size = min(len(self._queue), self._max_batch_size)
+            batch = [self._queue.popleft() for _ in range(batch_size)]
+            queue_remaining = len(self._queue)
+            return batch, queue_remaining
+
+    def _run(self) -> None:
+        while True:
+            taken = self._take_batch()
+            if taken is None:
+                return
+            batch, queue_remaining = taken
+            if not batch:
+                continue
+
+            wait_ms = int((time.perf_counter() - batch[0].enqueued_at) * 1000)
+            stream_count = len({job.stream_key for job in batch})
+            request_count = len({job.request_id for job in batch})
+            logging.info(
+                (
+                    "Dynamic infer batch: instance=%s frames=%d requests=%d streams=%d "
+                    "wait_ms=%d max_batch_size=%d max_wait_ms=%d queue_remaining=%d"
+                ),
+                self._instance_name,
+                len(batch),
+                request_count,
+                stream_count,
+                wait_ms,
+                self._max_batch_size,
+                self._max_wait_ms,
+                queue_remaining,
+            )
+            try:
+                items = [
+                    {
+                        "request_id": job.request_id,
+                        "stream_key": job.stream_key,
+                        "frame_id": job.frame_id,
+                        "image_data": job.image_data,
+                        "input_index": job.input_index,
+                    }
+                    for job in batch
+                ]
+                results = self._engine.infer_multi_stream_batch(items)
+                if len(results) != len(batch):
+                    raise RuntimeError(f"dynamic model batch returned {len(results)} results for {len(batch)} inputs")
+                for job, result in zip(batch, results):
+                    if not job.future.done():
+                        job.future.set_result(result)
+            except Exception as exc:
+                logging.exception("Dynamic infer batch failed: instance=%s frames=%d", self._instance_name, len(batch))
+                for job in batch:
+                    if not job.future.done():
+                        job.future.set_exception(exc)
+
+
 class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
     def __init__(
         self,
@@ -167,6 +329,10 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         warmup_models: bool = True,
         warmup_batch_size: int = 10,
         device_binding_ttl_sec: float = 120.0,
+        dynamic_batching: bool = False,
+        dynamic_max_batch_size: int = 80,
+        dynamic_max_wait_ms: int = 300,
+        dynamic_max_queue_size: int = 2000,
         oss_config: ObjectStorageConfig | None = None,
         oss_workers: int | None = 4,
         oss_download_workers: int | None = None,
@@ -184,6 +350,11 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         self._device_binding_ttl_sec = max(0.0, float(device_binding_ttl_sec))
         self._engine_inflight = [0 for _ in range(self._engine_count)]
         self._engine_device_counts = [0 for _ in range(self._engine_count)]
+        self._dynamic_batching = bool(dynamic_batching)
+        self._dynamic_max_batch_size = max(1, int(dynamic_max_batch_size))
+        self._dynamic_max_wait_ms = max(0, int(dynamic_max_wait_ms))
+        self._dynamic_max_queue_size = max(1, int(dynamic_max_queue_size))
+        self._dynamic_batchers: list[_DynamicInferBatcher] = []
         self._capture_timestamp_lock = threading.Lock()
         self._last_capture_timestamp_by_device: dict[str, int] = {}
         self._oss_config = oss_config
@@ -279,6 +450,27 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
             for idx, engine in enumerate(self._engines):
                 logging.info("Warming AI model instance %d/%d with batch_size=%d", idx + 1, self._engine_count, warmup_batch_size)
                 engine.warmup(batch_size=warmup_batch_size)
+        if self._dynamic_batching:
+            self._dynamic_batchers = [
+                _DynamicInferBatcher(
+                    engine=engine,
+                    instance_name=f"model-{idx}",
+                    max_batch_size=self._dynamic_max_batch_size,
+                    max_wait_ms=self._dynamic_max_wait_ms,
+                    max_queue_size=self._dynamic_max_queue_size,
+                )
+                for idx, engine in enumerate(self._engines)
+            ]
+            logging.info(
+                (
+                    "Dynamic batching enabled: model_instances=%d max_batch_size=%d "
+                    "max_wait_ms=%d max_queue_size=%d"
+                ),
+                self._engine_count,
+                self._dynamic_max_batch_size,
+                self._dynamic_max_wait_ms,
+                self._dynamic_max_queue_size,
+            )
 
     def _prune_stale_device_bindings(self, now: float) -> None:
         if self._device_binding_ttl_sec <= 0:
@@ -294,6 +486,8 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
             self._last_capture_timestamp_by_device.pop(key, None)
             if index is not None and 0 <= index < len(self._engine_device_counts):
                 self._engine_device_counts[index] = max(0, self._engine_device_counts[index] - 1)
+                if 0 <= index < len(self._engines):
+                    self._engines[index].drop_stream_state(key)
         if stale_keys:
             logging.info(
                 "Pruned %d stale AI stream bindings (ttl_sec=%.1f, engine_device_counts=%s)",
@@ -308,7 +502,7 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
             key=lambda idx: (self._engine_device_counts[idx], self._engine_inflight[idx], idx),
         )
 
-    def _acquire_engine(self, device_id: str, batch_id: str) -> tuple[int, RealtimePoseEngine, str]:
+    def _acquire_engine(self, device_id: str, batch_id: str) -> tuple[int, RealtimePoseEngine, str, str]:
         normalized_device_id = str(device_id or "").strip()
         if normalized_device_id:
             key = normalized_device_id
@@ -342,7 +536,7 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
             self._engine_inflight[index] += 1
             inflight_snapshot = list(self._engine_inflight)
 
-        return index, self._engines[index], ",".join(str(value) for value in inflight_snapshot)
+        return index, self._engines[index], key, ",".join(str(value) for value in inflight_snapshot)
 
     def _release_engine(self, index: int) -> None:
         with self._dispatch_lock:
@@ -654,11 +848,19 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
             context.set_code(grpc.StatusCode.INTERNAL)
             return ai_pb2.InferResponse(device_id=device_id, batch_id=batch_id)
 
-        engine_index, engine, engine_inflight = self._acquire_engine(device_id, batch_id)
+        engine_index, engine, stream_key, engine_inflight = self._acquire_engine(device_id, batch_id)
         engine_infer_ms = 0
         try:
             engine_start = time.perf_counter()
-            results = engine.infer_batch(frames)
+            if self._dynamic_batching:
+                if not (0 <= engine_index < len(self._dynamic_batchers)):
+                    raise RuntimeError(f"dynamic batcher missing for model-{engine_index}")
+                results = self._dynamic_batchers[engine_index].submit(
+                    stream_key=stream_key,
+                    frames=frames,
+                )
+            else:
+                results = engine.infer_batch(frames)
             engine_infer_ms = int((time.perf_counter() - engine_start) * 1000)
             if len(results) != len(images):
                 raise RuntimeError(f"expected {len(images)} results for {len(images)} inputs, got {len(results)}")
@@ -810,6 +1012,10 @@ def serve(
     warmup_models: bool = True,
     warmup_batch_size: int = 10,
     device_binding_ttl_sec: float = 120.0,
+    dynamic_batching: bool = False,
+    dynamic_max_batch_size: int = 80,
+    dynamic_max_wait_ms: int = 300,
+    dynamic_max_queue_size: int = 2000,
     oss_config: ObjectStorageConfig | None = None,
     oss_workers: int | None = 4,
     oss_download_workers: int | None = None,
@@ -865,6 +1071,10 @@ def serve(
             warmup_models=warmup_models,
             warmup_batch_size=warmup_batch_size,
             device_binding_ttl_sec=device_binding_ttl_sec,
+            dynamic_batching=dynamic_batching,
+            dynamic_max_batch_size=dynamic_max_batch_size,
+            dynamic_max_wait_ms=dynamic_max_wait_ms,
+            dynamic_max_queue_size=dynamic_max_queue_size,
             oss_config=oss_config,
             oss_workers=oss_workers,
             oss_download_workers=oss_download_workers,
@@ -909,7 +1119,8 @@ def serve(
             'parallel_models=%s, cpu_worker_mode=%s, cpu_process_start_method=%s, input_modality=%s, '
             'ir_preprocess=%s, model_input_size=%d, person_fill_background=%s, person_fill_background_blend=%.3f, '
             'pose_status_thigh_torso_ratio_threshold=%.3f, depth_distance_close_threshold=%.3f, ir_distance_close_gap_ratio=%.3f, '
-            'ir_distance_close_center_ratio=%.3f)'
+            'ir_distance_close_center_ratio=%.3f, dynamic_batching=%s, dynamic_max_batch_size=%d, '
+            'dynamic_max_wait_ms=%d, dynamic_max_queue_size=%d)'
         ),
         bound_address,
         max_msg_mb,
@@ -927,6 +1138,10 @@ def serve(
         depth_distance_close_threshold,
         ir_distance_close_gap_ratio,
         ir_distance_close_center_ratio,
+        "true" if dynamic_batching else "false",
+        dynamic_max_batch_size,
+        dynamic_max_wait_ms,
+        dynamic_max_queue_size,
     )
     server.start()
     try:
@@ -1102,6 +1317,29 @@ def main():
         help='seconds after which an inactive device_id is unbound from its sticky model instance; 0 disables pruning',
     )
     parser.add_argument(
+        '--dynamic-batching',
+        action='store_true',
+        help='queue concurrent Infer calls per model instance and run one larger model batch',
+    )
+    parser.add_argument(
+        '--dynamic-max-batch-size',
+        default=80,
+        type=int,
+        help='maximum frames in one dynamic model batch before immediate inference',
+    )
+    parser.add_argument(
+        '--dynamic-max-wait-ms',
+        default=300,
+        type=int,
+        help='maximum milliseconds the first queued frame waits for more frames before inference',
+    )
+    parser.add_argument(
+        '--dynamic-max-queue-size',
+        default=2000,
+        type=int,
+        help='maximum queued frames per model instance before rejecting new requests',
+    )
+    parser.add_argument(
         '--null-qualitative-results',
         action='store_true',
         help='omit unvalidated qualitative fields: person_status, person_distance, and action_level',
@@ -1217,6 +1455,10 @@ def main():
         warmup_models=not args.no_warmup,
         warmup_batch_size=args.warmup_batch_size,
         device_binding_ttl_sec=args.device_binding_ttl_sec,
+        dynamic_batching=args.dynamic_batching,
+        dynamic_max_batch_size=args.dynamic_max_batch_size,
+        dynamic_max_wait_ms=args.dynamic_max_wait_ms,
+        dynamic_max_queue_size=args.dynamic_max_queue_size,
         oss_config=oss_config,
         oss_workers=args.oss_workers,
         oss_download_workers=args.oss_download_workers,

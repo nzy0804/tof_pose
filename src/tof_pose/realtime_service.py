@@ -7,7 +7,7 @@ import logging
 import multiprocessing
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
@@ -64,22 +64,23 @@ MASK_AREA_JUMP_RATIO = 1.5
 MASK_JUMP_HOLD_FRAMES = 2
 DEPTH_PERSON_DISTANCE_CLOSE_THRESHOLD = 150.0
 PERSON_DISTANCE_CLOSE_GAP_RATIO = 0.15
-PERSON_DISTANCE_CLOSE_CENTER_RATIO = 0.90
+PERSON_DISTANCE_CLOSE_CENTER_RATIO = 0.50
 QUALITATIVE_KPT_CONF_THRESHOLD = 0.35
 POSE_STATUS_MIN_TORSO_Y_PX = 20.0
 POSE_STATUS_MIN_THIGH_Y_PX = 12.0
 POSE_STATUS_THIGH_TORSO_RATIO_THRESHOLD = 0.65
 POSE_BATCH_REUSE_MIN_VALID_RATIO = 0.45
 POSE_BATCH_REUSE_MAX_GAP = 1
-ACTION_KEYPOINT_SHIFT_HIGH_PX = 18.0
-ACTION_KEYPOINT_SHIFT_PEAK_HIGH_PX = 28.0
-ACTION_BOX_CENTER_SHIFT_HIGH_RATIO = 0.18
-ACTION_BOX_SCALE_SHIFT_HIGH_RATIO = 0.25
-ACTION_DEPTH_MEAN_DIFF_HIGH = 6.0
-ACTION_DEPTH_P95_DIFF_HIGH = 24.0
-ACTION_IR_MEAN_DIFF_HIGH = 10.0
-ACTION_IR_P95_DIFF_HIGH = 32.0
+ACTION_KEYPOINT_SHIFT_HIGH_RATIO = 0.056
+ACTION_KEYPOINT_SHIFT_PEAK_HIGH_RATIO = 0.088
+ACTION_BOX_CENTER_SHIFT_HIGH_RATIO = 0.056
+ACTION_BOX_AREA_SHIFT_HIGH_RATIO = 0.05
+ACTION_MOTION_WINDOW_FRAMES = 8
+ACTION_MOTION_WINDOW_HIGH_RATIO = 0.40
 ACTION_HIGH_CONFIRM_FRAMES = 2
+QUALITATIVE_STABILITY_WINDOW_FRAMES = 8
+QUALITATIVE_STABILITY_MIN_CONFIRM_FRAMES = 3
+QUALITATIVE_STABILITY_SWITCH_RATIO = 0.60
 POSE_FALLBACK_KPT_CONF_THRESHOLD = 0.45
 POSE_FALLBACK_MIN_POINTS = 7
 QUALITATIVE_RESULT_KEYS = ("person_status", "person_distance", "action_level")
@@ -840,12 +841,16 @@ def _compute_person_distance_depth(
 
 
 def _build_action_signature(analysis: dict) -> dict:
+    width = int(analysis.get("width", DISPLAY_SIZE[0]) or DISPLAY_SIZE[0])
+    height = int(analysis.get("height", DISPLAY_SIZE[1]) or DISPLAY_SIZE[1])
     person_count = int(analysis.get("person_count", 0) or 0)
     if person_count <= 0:
         return {
             "person_count": 0,
             "boxes": [],
             "poses": [],
+            "width": width,
+            "height": height,
         }
 
     kpt_xy_np = analysis.get("kpt_xy_np")
@@ -869,26 +874,35 @@ def _build_action_signature(analysis: dict) -> dict:
         "person_count": person_count,
         "boxes": [box.copy() for box in _extract_person_boxes(analysis, max_people=2)],
         "poses": poses[:2],
+        "width": width,
+        "height": height,
     }
 
 
-def _action_signature_has_sources(signature: dict | None) -> bool:
+def _action_frame_extent(signature: dict | None) -> float:
     if not signature:
-        return False
-    return bool(signature.get("boxes") or signature.get("poses"))
+        return float(max(DISPLAY_SIZE))
+    width = int(signature.get("width", DISPLAY_SIZE[0]) or DISPLAY_SIZE[0])
+    height = int(signature.get("height", DISPLAY_SIZE[1]) or DISPLAY_SIZE[1])
+    return max(1.0, float(max(width, height)))
 
 
-def _action_signature_is_high(previous: dict | None, current: dict | None) -> bool:
+def _action_frame_area(signature: dict | None) -> float:
+    if not signature:
+        return float(DISPLAY_SIZE[0] * DISPLAY_SIZE[1])
+    width = int(signature.get("width", DISPLAY_SIZE[0]) or DISPLAY_SIZE[0])
+    height = int(signature.get("height", DISPLAY_SIZE[1]) or DISPLAY_SIZE[1])
+    return max(1.0, float(width) * float(height))
+
+
+def _action_signature_motion_state(previous: dict | None, current: dict | None) -> tuple[bool, bool]:
     if not previous or not current:
-        return False
-
-    previous_count = int(previous.get("person_count", 0) or 0)
-    current_count = int(current.get("person_count", 0) or 0)
-    if previous_count != current_count and max(previous_count, current_count) > 0:
-        return True
+        return False, False
 
     previous_poses = previous.get("poses") or []
     current_poses = current.get("poses") or []
+    has_pose_motion_source = False
+    frame_extent = _action_frame_extent(current)
     for idx in range(min(len(previous_poses), len(current_poses))):
         prev_pose = previous_poses[idx]
         curr_pose = current_poses[idx]
@@ -897,49 +911,32 @@ def _action_signature_is_high(previous: dict | None, current: dict | None) -> bo
         valid = prev_valid & curr_valid
         if int(np.sum(valid)) < 3:
             continue
+        has_pose_motion_source = True
         prev_points = np.asarray(prev_pose.get("points"), dtype=np.float32)
         curr_points = np.asarray(curr_pose.get("points"), dtype=np.float32)
-        shifts = np.linalg.norm(curr_points[valid] - prev_points[valid], axis=1)
-        if float(np.mean(shifts)) >= ACTION_KEYPOINT_SHIFT_HIGH_PX:
-            return True
-        if float(np.percentile(shifts, 75)) >= ACTION_KEYPOINT_SHIFT_PEAK_HIGH_PX:
-            return True
+        shift_ratios = np.linalg.norm(curr_points[valid] - prev_points[valid], axis=1) / frame_extent
+        if float(np.mean(shift_ratios)) >= ACTION_KEYPOINT_SHIFT_HIGH_RATIO:
+            return True, True
+        if float(np.percentile(shift_ratios, 75)) >= ACTION_KEYPOINT_SHIFT_PEAK_HIGH_RATIO:
+            return True, True
+    if has_pose_motion_source:
+        return True, False
 
     previous_boxes = previous.get("boxes") or []
     current_boxes = current.get("boxes") or []
+    has_box_motion_source = False
+    frame_area = _action_frame_area(current)
     for idx in range(min(len(previous_boxes), len(current_boxes))):
         prev_box = previous_boxes[idx]
         curr_box = current_boxes[idx]
-        avg_extent = (_box_extent(prev_box) + _box_extent(curr_box)) * 0.5
-        center_shift_ratio = _box_center_distance(prev_box, curr_box) / max(1.0, avg_extent)
-        area_shift_ratio = abs(_box_area(curr_box) - _box_area(prev_box)) / max(_box_area(curr_box), _box_area(prev_box), 1.0)
+        has_box_motion_source = True
+        center_shift_ratio = _box_center_distance(prev_box, curr_box) / frame_extent
+        area_shift_ratio = abs(_box_area(curr_box) - _box_area(prev_box)) / frame_area
         if center_shift_ratio >= ACTION_BOX_CENTER_SHIFT_HIGH_RATIO:
-            return True
-        if area_shift_ratio >= ACTION_BOX_SCALE_SHIFT_HIGH_RATIO:
-            return True
-    return False
-
-
-def _ir_frame_motion_is_high(previous_frame: np.ndarray | None, current_frame: np.ndarray) -> bool:
-    if previous_frame is None:
-        return False
-    if previous_frame.shape != current_frame.shape:
-        previous_frame = cv2.resize(previous_frame, (current_frame.shape[1], current_frame.shape[0]), interpolation=cv2.INTER_LINEAR)
-    diff = cv2.absdiff(current_frame, previous_frame)
-    mean_diff = float(np.mean(diff)) if diff.size else 0.0
-    p95_diff = float(np.percentile(diff, 95)) if diff.size else 0.0
-    return mean_diff >= ACTION_IR_MEAN_DIFF_HIGH or p95_diff >= ACTION_IR_P95_DIFF_HIGH
-
-
-def _depth_frame_motion_is_high(previous_frame: np.ndarray | None, current_frame: np.ndarray) -> bool:
-    if previous_frame is None:
-        return False
-    if previous_frame.shape != current_frame.shape:
-        previous_frame = cv2.resize(previous_frame, (current_frame.shape[1], current_frame.shape[0]), interpolation=cv2.INTER_LINEAR)
-    diff = cv2.absdiff(current_frame, previous_frame)
-    mean_diff = float(np.mean(diff)) if diff.size else 0.0
-    p95_diff = float(np.percentile(diff, 95)) if diff.size else 0.0
-    return mean_diff >= ACTION_DEPTH_MEAN_DIFF_HIGH or p95_diff >= ACTION_DEPTH_P95_DIFF_HIGH
+            return True, True
+        if area_shift_ratio >= ACTION_BOX_AREA_SHIFT_HIGH_RATIO:
+            return True, True
+    return has_box_motion_source, False
 
 
 def _copy_qualitative_result_fields(source: dict) -> dict:
@@ -1168,6 +1165,7 @@ def _render_analyzed_result_cpu(analyzed: dict) -> dict:
         "frame_id": analyzed["frame_id"],
         "pseudo_color_image": analysis["color_img"],
         "skeleton_contour_image": _render_skeleton_contour_cpu(analysis),
+        "raw_person_count": int(analyzed.get("raw_person_count", analyzed["person_count"])),
         "person_count": int(analyzed["person_count"]),
         "processing_time_ms": int(analyzed["processing_time_ms"]),
         **_copy_qualitative_result_fields(analyzed),
@@ -1202,13 +1200,14 @@ def _encode_output_image_cpu(
 def _encode_rendered_result_cpu(payload: tuple[dict, str, int, int]) -> dict:
     rendered, output_format, png_compression, jpeg_quality = payload
     person_count = int(rendered["person_count"])
+    raw_person_count = int(rendered.get("raw_person_count", person_count))
     pseudo_color_image, pseudo_color_format = _encode_output_image_cpu(
         rendered["pseudo_color_image"],
         output_format,
         png_compression,
         jpeg_quality,
     )
-    if person_count <= 0:
+    if raw_person_count <= 0:
         skeleton_contour_image = pseudo_color_image
         skeleton_contour_format = pseudo_color_format
     else:
@@ -1234,11 +1233,12 @@ def _render_and_encode_analyzed_result_cpu(payload: tuple[dict, str, int, int]) 
     analyzed, output_format, png_compression, jpeg_quality = payload
     analysis = analyzed["analysis"]
     person_count = int(analyzed["person_count"])
+    raw_person_count = int(analyzed.get("raw_person_count", person_count))
 
     render_start = time.perf_counter()
     pseudo_color_image = analysis["color_img"]
     skeleton_contour_image = None
-    if person_count > 0:
+    if raw_person_count > 0:
         skeleton_contour_image = _render_skeleton_contour_cpu(analysis)
     render_ms = _elapsed_ms(render_start)
 
@@ -1249,7 +1249,7 @@ def _render_and_encode_analyzed_result_cpu(payload: tuple[dict, str, int, int]) 
         png_compression,
         jpeg_quality,
     )
-    if person_count <= 0:
+    if raw_person_count <= 0:
         skeleton_contour_bytes = pseudo_color_bytes
         skeleton_contour_format = pseudo_color_format
     else:
@@ -1301,6 +1301,34 @@ class _MaskJumpState:
 class _ContourTrackState:
     box: np.ndarray
     last_seen_frame: int
+
+
+@dataclass
+class _StableValueState:
+    history: deque[object] = field(
+        default_factory=lambda: deque(maxlen=QUALITATIVE_STABILITY_WINDOW_FRAMES)
+    )
+    stable_value: object | None = None
+    initialized: bool = False
+
+
+@dataclass
+class _RealtimeStreamState:
+    frame_idx: int = 0
+    cached_pose_boxes: list[np.ndarray] = field(default_factory=list)
+    cached_kpt_xy: np.ndarray | None = None
+    cached_kpt_conf: np.ndarray | None = None
+    last_source_depth: np.ndarray | None = None
+    last_action_signature: dict | None = None
+    action_motion_window: deque[bool] = field(
+        default_factory=lambda: deque(maxlen=ACTION_MOTION_WINDOW_FRAMES)
+    )
+    stable_person_count: _StableValueState = field(default_factory=_StableValueState)
+    stable_person_status: _StableValueState = field(default_factory=_StableValueState)
+    stable_action_level: _StableValueState = field(default_factory=_StableValueState)
+    track_gate: dict[int, _TrackGateState] = field(default_factory=dict)
+    mask_jump_state: dict[int, _MaskJumpState] = field(default_factory=dict)
+    contour_track_state: dict[int, _ContourTrackState] = field(default_factory=dict)
 
 
 class RealtimePoseEngine:
@@ -1464,12 +1492,15 @@ class RealtimePoseEngine:
         self._warned_no_keypoints = False
         self._warned_pose_gate_fallback = False
         self._last_source_depth: np.ndarray | None = None
-        self._last_action_frame: np.ndarray | None = None
         self._last_action_signature: dict | None = None
-        self._action_high_streak = 0
+        self._action_motion_window: deque[bool] = deque(maxlen=ACTION_MOTION_WINDOW_FRAMES)
+        self._stable_person_count = _StableValueState()
+        self._stable_person_status = _StableValueState()
+        self._stable_action_level = _StableValueState()
         self._track_gate: dict[int, _TrackGateState] = {}
         self._mask_jump_state: dict[int, _MaskJumpState] = {}
         self._contour_track_state: dict[int, _ContourTrackState] = {}
+        self._stream_states: dict[str, _RealtimeStreamState] = {}
 
     def reset(self) -> None:
         """Reset per-stream caches so next infer behaves like the first frame."""
@@ -1478,12 +1509,109 @@ class RealtimePoseEngine:
         self._cached_kpt_xy = None
         self._cached_kpt_conf = None
         self._last_source_depth = None
-        self._last_action_frame = None
         self._last_action_signature = None
-        self._action_high_streak = 0
+        self._action_motion_window.clear()
+        self._stable_person_count = _StableValueState()
+        self._stable_person_status = _StableValueState()
+        self._stable_action_level = _StableValueState()
         self._track_gate.clear()
         self._mask_jump_state.clear()
         self._contour_track_state.clear()
+        self._stream_states.clear()
+
+    @staticmethod
+    def _copy_track_gate_state(state: _TrackGateState) -> _TrackGateState:
+        return _TrackGateState(
+            votes=deque(state.votes, maxlen=state.votes.maxlen),
+            ttl_remaining=int(state.ttl_remaining),
+            confirmed=bool(state.confirmed),
+            last_seen_frame=int(state.last_seen_frame),
+        )
+
+    @staticmethod
+    def _copy_mask_jump_state(state: _MaskJumpState) -> _MaskJumpState:
+        return _MaskJumpState(
+            mask=state.mask.copy(),
+            last_seen_frame=int(state.last_seen_frame),
+            rejected_frames=int(state.rejected_frames),
+        )
+
+    @staticmethod
+    def _copy_contour_track_state(state: _ContourTrackState) -> _ContourTrackState:
+        return _ContourTrackState(
+            box=state.box.copy(),
+            last_seen_frame=int(state.last_seen_frame),
+        )
+
+    @staticmethod
+    def _copy_stable_value_state(state: _StableValueState) -> _StableValueState:
+        return _StableValueState(
+            history=deque(state.history, maxlen=QUALITATIVE_STABILITY_WINDOW_FRAMES),
+            stable_value=state.stable_value,
+            initialized=bool(state.initialized),
+        )
+
+    @staticmethod
+    def _initialized_stable_value_state(value: object) -> _StableValueState:
+        state = _StableValueState()
+        state.history.append(value)
+        state.stable_value = value
+        state.initialized = True
+        return state
+
+    def _capture_stream_state(self) -> _RealtimeStreamState:
+        return _RealtimeStreamState(
+            frame_idx=int(self._frame_idx),
+            cached_pose_boxes=[box.copy() for box in self._cached_pose_boxes],
+            cached_kpt_xy=None if self._cached_kpt_xy is None else self._cached_kpt_xy.copy(),
+            cached_kpt_conf=None if self._cached_kpt_conf is None else self._cached_kpt_conf.copy(),
+            last_source_depth=None if self._last_source_depth is None else self._last_source_depth.copy(),
+            last_action_signature=None if self._last_action_signature is None else dict(self._last_action_signature),
+            action_motion_window=deque(self._action_motion_window, maxlen=ACTION_MOTION_WINDOW_FRAMES),
+            stable_person_count=self._copy_stable_value_state(self._stable_person_count),
+            stable_person_status=self._copy_stable_value_state(self._stable_person_status),
+            stable_action_level=self._copy_stable_value_state(self._stable_action_level),
+            track_gate={int(tid): self._copy_track_gate_state(state) for tid, state in self._track_gate.items()},
+            mask_jump_state={int(tid): self._copy_mask_jump_state(state) for tid, state in self._mask_jump_state.items()},
+            contour_track_state={
+                int(tid): self._copy_contour_track_state(state)
+                for tid, state in self._contour_track_state.items()
+            },
+        )
+
+    def _restore_stream_state(self, state: _RealtimeStreamState | None) -> None:
+        state = state or _RealtimeStreamState()
+        self._frame_idx = int(state.frame_idx)
+        self._cached_pose_boxes = [box.copy() for box in state.cached_pose_boxes]
+        self._cached_kpt_xy = None if state.cached_kpt_xy is None else state.cached_kpt_xy.copy()
+        self._cached_kpt_conf = None if state.cached_kpt_conf is None else state.cached_kpt_conf.copy()
+        self._last_source_depth = None if state.last_source_depth is None else state.last_source_depth.copy()
+        self._last_action_signature = None if state.last_action_signature is None else dict(state.last_action_signature)
+        self._action_motion_window = deque(state.action_motion_window, maxlen=ACTION_MOTION_WINDOW_FRAMES)
+        self._stable_person_count = self._copy_stable_value_state(state.stable_person_count)
+        self._stable_person_status = self._copy_stable_value_state(state.stable_person_status)
+        self._stable_action_level = self._copy_stable_value_state(state.stable_action_level)
+        self._track_gate = {
+            int(tid): self._copy_track_gate_state(track_state)
+            for tid, track_state in state.track_gate.items()
+        }
+        self._mask_jump_state = {
+            int(tid): self._copy_mask_jump_state(mask_state)
+            for tid, mask_state in state.mask_jump_state.items()
+        }
+        self._contour_track_state = {
+            int(tid): self._copy_contour_track_state(contour_state)
+            for tid, contour_state in state.contour_track_state.items()
+        }
+
+    @staticmethod
+    def _normalize_stream_key(stream_key: str | None) -> str:
+        return str(stream_key or "default").strip() or "default"
+
+    def drop_stream_state(self, stream_key: str | None) -> None:
+        key = self._normalize_stream_key(stream_key)
+        with self._lock:
+            self._stream_states.pop(key, None)
 
     def warmup(self, batch_size: int = 1) -> None:
         """Run one synthetic model batch so CUDA kernels and model graphs are ready before serving traffic."""
@@ -2348,38 +2476,105 @@ class RealtimePoseEngine:
         return np.clip(midpoint, 0, 255).astype(np.uint8)
 
     def _classify_action_level_from_ir(self, analysis: dict) -> str:
-        current_frame = self._ensure_uint8_gray(analysis["depth_raw"])
         current_signature = _build_action_signature(analysis)
-        raw_high_motion = _action_signature_is_high(self._last_action_signature, current_signature)
-        if (
-            not raw_high_motion
-            and int(current_signature.get("person_count", 0) or 0) > 0
-            and not _action_signature_has_sources(current_signature)
-        ):
-            raw_high_motion = _ir_frame_motion_is_high(self._last_action_frame, current_frame)
-
+        has_motion_source, raw_high_motion = _action_signature_motion_state(
+            self._last_action_signature,
+            current_signature,
+        )
         self._last_action_signature = current_signature
-        self._last_action_frame = current_frame.copy()
-        if raw_high_motion:
-            self._action_high_streak += 1
-        else:
-            self._action_high_streak = 0
-        return "high" if self._action_high_streak >= ACTION_HIGH_CONFIRM_FRAMES else "low"
+        return self._update_action_motion_window(bool(raw_high_motion and has_motion_source))
 
     def _classify_action_level_from_depth(self, analysis: dict) -> str:
-        current_frame = self._ensure_uint8_gray(analysis["depth_raw"])
         current_signature = _build_action_signature(analysis)
-        raw_high_motion = _action_signature_is_high(self._last_action_signature, current_signature)
-        if not raw_high_motion:
-            raw_high_motion = _depth_frame_motion_is_high(self._last_action_frame, current_frame)
-
+        has_motion_source, raw_high_motion = _action_signature_motion_state(
+            self._last_action_signature,
+            current_signature,
+        )
         self._last_action_signature = current_signature
-        self._last_action_frame = current_frame.copy()
-        if raw_high_motion:
-            self._action_high_streak += 1
+        return self._update_action_motion_window(bool(raw_high_motion and has_motion_source))
+
+    def _update_action_motion_window(self, raw_high_motion: bool) -> str:
+        self._action_motion_window.append(bool(raw_high_motion))
+        window_size = len(self._action_motion_window)
+        if window_size < ACTION_HIGH_CONFIRM_FRAMES:
+            return "low"
+        high_count = sum(1 for item in self._action_motion_window if item)
+        required_high = max(
+            ACTION_HIGH_CONFIRM_FRAMES,
+            int(np.ceil(float(window_size) * float(ACTION_MOTION_WINDOW_HIGH_RATIO))),
+        )
+        return "high" if high_count >= required_high else "low"
+
+    @staticmethod
+    def _stability_required_count(window_size: int) -> int:
+        return max(
+            int(QUALITATIVE_STABILITY_MIN_CONFIRM_FRAMES),
+            int(np.ceil(float(window_size) * float(QUALITATIVE_STABILITY_SWITCH_RATIO))),
+        )
+
+    @staticmethod
+    def _trailing_value_count(history: deque[object], value: object) -> int:
+        count = 0
+        for item in reversed(history):
+            if item != value:
+                break
+            count += 1
+        return count
+
+    def _stabilize_value(self, state: _StableValueState, raw_value: object) -> object:
+        value = "" if raw_value is None else raw_value
+        state.history.append(value)
+        if not state.initialized:
+            state.stable_value = value
+            state.initialized = True
+            return value
+
+        if value == state.stable_value:
+            return state.stable_value
+
+        window_size = len(state.history)
+        candidate_count = sum(1 for item in state.history if item == value)
+        trailing_count = self._trailing_value_count(state.history, value)
+        required_count = self._stability_required_count(window_size)
+        if (
+            trailing_count >= int(QUALITATIVE_STABILITY_MIN_CONFIRM_FRAMES)
+            or candidate_count >= required_count
+        ):
+            state.stable_value = value
+        return state.stable_value
+
+    def _finalize_analyzed_qualitative_fields(self, analyzed: dict) -> dict:
+        if analyzed.get("_qualitative_finalized"):
+            return analyzed
+
+        analysis = analyzed["analysis"]
+        raw_person_count = int(analysis.get("person_count", 0) or 0)
+        raw_person_status = _compute_person_status(analysis)
+        raw_person_distance = self._compute_person_distance(analysis)
+        raw_action_level = self._classify_action_level(analysis)
+
+        stable_person_count = int(self._stabilize_value(self._stable_person_count, raw_person_count))
+        if raw_person_count > 0 and not raw_person_status:
+            stable_person_status = str(self._stable_person_status.stable_value or "")
         else:
-            self._action_high_streak = 0
-        return "high" if self._action_high_streak >= ACTION_HIGH_CONFIRM_FRAMES else "low"
+            stable_person_status = str(self._stabilize_value(self._stable_person_status, raw_person_status))
+        stable_action_level = str(self._stabilize_value(self._stable_action_level, raw_action_level))
+
+        if stable_person_count <= 0:
+            stable_person_status = ""
+            stable_action_level = "low"
+            self._stable_person_status = _StableValueState()
+            self._stable_action_level = self._initialized_stable_value_state("low")
+
+        analyzed["raw_person_count"] = raw_person_count
+        analyzed["raw_person_status"] = raw_person_status
+        analyzed["raw_action_level"] = raw_action_level
+        analyzed["person_count"] = stable_person_count
+        analyzed["person_status"] = stable_person_status
+        analyzed["person_distance"] = raw_person_distance
+        analyzed["action_level"] = stable_action_level
+        analyzed["_qualitative_finalized"] = True
+        return analyzed
 
     def _compute_person_distance(self, analysis: dict) -> str:
         if self._input_modality == INPUT_MODALITY_IR:
@@ -2404,6 +2599,7 @@ class RealtimePoseEngine:
         pose_result=None,
         prepared: dict | None = None,
         distance_tasks: list[dict] | None = None,
+        finalize_qualitative: bool = True,
     ) -> dict:
         if self._stateless:
             self.reset()
@@ -2420,15 +2616,13 @@ class RealtimePoseEngine:
         analyzed = {
             "frame_id": frame_id,
             "analysis": analysis,
+            "raw_person_count": int(analysis["person_count"]),
             "person_count": int(analysis["person_count"]),
             "processing_time_ms": elapsed,
         }
-        if distance_tasks is not None:
+        if distance_tasks is not None or not finalize_qualitative:
             return analyzed
-        analyzed["person_status"] = _compute_person_status(analysis)
-        analyzed["person_distance"] = self._compute_person_distance(analysis)
-        analyzed["action_level"] = self._classify_action_level(analysis)
-        return analyzed
+        return self._finalize_analyzed_qualitative_fields(analyzed)
 
     def _reuse_analyzed_result_with_depth(self, analyzed: dict, frame_id: str, depth: np.ndarray) -> dict:
         prepared = self._prepare_depth_views(depth)
@@ -2444,6 +2638,7 @@ class RealtimePoseEngine:
         return {
             "frame_id": frame_id,
             "analysis": analysis,
+            "raw_person_count": int(analyzed.get("raw_person_count", analyzed["person_count"])),
             "person_count": int(analyzed["person_count"]),
             "processing_time_ms": 0,
             **_copy_qualitative_result_fields(analyzed),
@@ -2455,6 +2650,7 @@ class RealtimePoseEngine:
             "frame_id": analyzed["frame_id"],
             "pseudo_color_image": self._render_color_depth(analysis),
             "skeleton_contour_image": self._render_skeleton_contour(analysis),
+            "raw_person_count": int(analyzed.get("raw_person_count", analyzed["person_count"])),
             "person_count": int(analyzed["person_count"]),
             "processing_time_ms": int(analyzed["processing_time_ms"]),
             **_copy_qualitative_result_fields(analyzed),
@@ -2462,8 +2658,9 @@ class RealtimePoseEngine:
 
     def _encode_rendered_result(self, rendered: dict) -> dict:
         person_count = int(rendered["person_count"])
+        raw_person_count = int(rendered.get("raw_person_count", person_count))
         pseudo_color_image, pseudo_color_format = self._encode_output_image(rendered["pseudo_color_image"])
-        if person_count <= 0:
+        if raw_person_count <= 0:
             skeleton_contour_image = pseudo_color_image
             skeleton_contour_format = pseudo_color_format
         else:
@@ -2629,10 +2826,9 @@ class RealtimePoseEngine:
             analysis["pair_text"] = pair_text
             analysis["pair_stats"] = pair_stats
             analysis["contour_debug_summary"] = contour_debug_summary
+            analyzed["raw_person_count"] = int(analysis["person_count"])
             analyzed["person_count"] = int(analysis["person_count"])
-            analyzed["person_status"] = _compute_person_status(analysis)
-            analyzed["person_distance"] = self._compute_person_distance(analysis)
-            analyzed["action_level"] = self._classify_action_level(analysis)
+            analyzed.pop("_qualitative_finalized", None)
 
     def _apply_batch_pose_semantic_reuse(self, current_analyzed_by_input: dict[int, dict]) -> None:
         if len(current_analyzed_by_input) <= 2:
@@ -2705,9 +2901,9 @@ class RealtimePoseEngine:
                     int(target_analysis.get("person_count", 0) or 0),
                     len(source_semantic_indices[:2]),
                 )
+                target["raw_person_count"] = int(target_analysis["person_count"])
                 target["person_count"] = int(target_analysis["person_count"])
-                target["person_status"] = _compute_person_status(target_analysis)
-                target["person_distance"] = self._compute_person_distance(target_analysis)
+                target.pop("_qualitative_finalized", None)
 
     def _infer_one_unlocked(self, frame_id: str, image_bytes: bytes) -> dict:
         analyzed = self._analyze_predecoded_unlocked(frame_id, self._decode_image(image_bytes))
@@ -2880,6 +3076,269 @@ class RealtimePoseEngine:
             _format_number_list(pose_fallback_counts),
         )
 
+    def infer_multi_stream_batch(self, items: list[dict]) -> list[dict]:
+        """Run one model batch while keeping postprocess caches isolated by stream_key."""
+        if not items:
+            return []
+
+        normalized_items: list[dict] = []
+        for global_index, item in enumerate(items):
+            frame_id = str(item.get("frame_id", "") or "")
+            image_data = bytes(item.get("image_data", b"") or b"")
+            if not image_data:
+                raise ValueError(f"empty image_data for dynamic batch item {global_index}")
+            try:
+                request_id = int(item.get("request_id", 0) or 0)
+            except (TypeError, ValueError):
+                request_id = 0
+            try:
+                input_index = int(item.get("input_index", global_index) or 0)
+            except (TypeError, ValueError):
+                input_index = global_index
+            normalized_items.append(
+                {
+                    "global_index": global_index,
+                    "request_id": request_id,
+                    "stream_key": self._normalize_stream_key(item.get("stream_key")),
+                    "frame_id": frame_id,
+                    "input_index": input_index,
+                    "image_data": image_data,
+                }
+            )
+
+        frames = [(item["frame_id"], item["image_data"]) for item in normalized_items]
+        lock_start = time.perf_counter()
+        self._lock.acquire()
+        original_state = self._capture_stream_state()
+        try:
+            timings: dict[str, int] = {
+                "queue_wait_ms": _elapsed_ms(lock_start),
+            }
+            total_start = time.perf_counter()
+
+            decode_start = time.perf_counter()
+            decoded_frames = self._decode_frames(frames)
+            if len(decoded_frames) != len(normalized_items):
+                raise RuntimeError(f"decoded {len(decoded_frames)} frames for {len(normalized_items)} dynamic batch items")
+            timings["decode_ms"] = _elapsed_ms(decode_start)
+
+            source_frames: list[dict] = []
+            stream_groups: dict[str, list[dict]] = {}
+            stream_order: list[str] = []
+            for item, (frame_id, current_depth) in zip(normalized_items, decoded_frames):
+                source_item = {
+                    **item,
+                    "frame_id": frame_id,
+                    "depth": current_depth,
+                }
+                source_frames.append(source_item)
+                stream_key = str(source_item["stream_key"])
+                if stream_key not in stream_groups:
+                    stream_groups[stream_key] = []
+                    stream_order.append(stream_key)
+                stream_groups[stream_key].append(source_item)
+
+            timings["model_input_count"] = len(source_frames)
+            timings["postprocess_input_count"] = len(source_frames)
+
+            model_prepare_start = time.perf_counter()
+            prepared_views = self._prepare_source_views(source_frames)
+            if len(prepared_views) != len(source_frames):
+                raise RuntimeError(f"prepared {len(prepared_views)} views for {len(source_frames)} source frames")
+            for item, prepared in zip(source_frames, prepared_views):
+                item["prepared"] = prepared
+            color_imgs = [prepared.get("model_color_img", prepared["color_img"]) for prepared in prepared_views]
+            timings["model_prepare_ms"] = _elapsed_ms(model_prepare_start)
+
+            if self._pose_only:
+                model_start = time.perf_counter()
+                pose_results = self.pose_model.predict(
+                    color_imgs,
+                    conf=self._pose_conf_threshold,
+                    classes=[0],
+                    imgsz=self._pose_infer_imgsz,
+                    device=self._device,
+                    verbose=False,
+                )
+                timings["pose_model_ms"] = _elapsed_ms(model_start)
+                timings["seg_model_ms"] = 0
+                timings["model_infer_ms"] = int(timings["pose_model_ms"])
+                timings["parallel_models"] = 0
+                if len(pose_results) != len(source_frames):
+                    raise RuntimeError(f"pose batch returned {len(pose_results)} results for {len(source_frames)} source frames")
+
+                postprocess_start = time.perf_counter()
+                current_analyzed_by_input: dict[int, dict] = {}
+                output_frames_by_global: dict[int, dict] = {}
+                for stream_key in stream_order:
+                    group = stream_groups[stream_key]
+                    self._restore_stream_state(self._stream_states.get(stream_key))
+                    stream_analyzed: dict[int, dict] = {}
+                    for item in group:
+                        global_index = int(item["global_index"])
+                        stream_analyzed[global_index] = self._analyze_predecoded_unlocked(
+                            f"{item['frame_id']}_current",
+                            item["depth"],
+                            pose_result=pose_results[global_index],
+                            prepared=item.get("prepared"),
+                            finalize_qualitative=False,
+                        )
+                    self._apply_batch_pose_semantic_reuse(stream_analyzed)
+                    for item in group:
+                        self._finalize_analyzed_qualitative_fields(
+                            stream_analyzed[int(item["global_index"])]
+                        )
+                    if not self._stateless:
+                        self._stream_states[stream_key] = self._capture_stream_state()
+                    else:
+                        self._stream_states.pop(stream_key, None)
+                    for item in group:
+                        global_index = int(item["global_index"])
+                        current_analyzed_by_input[global_index] = stream_analyzed[global_index]
+                        output_frames_by_global[global_index] = {
+                            "frame_id": f"{item['frame_id']}_current",
+                            "source_frame_id": item["frame_id"],
+                            "global_index": global_index,
+                            "request_id": int(item["request_id"]),
+                            "input_index": int(item["input_index"]),
+                            "stream_key": stream_key,
+                            "result_kind": "current",
+                        }
+                timings["postprocess_ms"] = _elapsed_ms(postprocess_start)
+                confidence_log_kwargs = {"pose_results": pose_results}
+            else:
+                model_start = time.perf_counter()
+                seg_persist = bool(self._persist_tracks and len(stream_groups) == 1)
+
+                def run_seg_model():
+                    seg_model_start = time.perf_counter()
+                    results = self.seg_model.track(
+                        color_imgs,
+                        conf=self._seg_conf_threshold,
+                        persist=seg_persist,
+                        tracker=TRACKER_CONFIG,
+                        classes=[0],
+                        imgsz=self._seg_infer_imgsz,
+                        device=self._device,
+                        verbose=False,
+                    )
+                    return results, _elapsed_ms(seg_model_start)
+
+                def run_pose_model():
+                    pose_model_start = time.perf_counter()
+                    results = self.pose_model.predict(
+                        color_imgs,
+                        conf=self._pose_conf_threshold,
+                        classes=[0],
+                        imgsz=self._pose_infer_imgsz,
+                        device=self._device,
+                        verbose=False,
+                    )
+                    return results, _elapsed_ms(pose_model_start)
+
+                if self._parallel_models and self._model_executor is not None:
+                    seg_future = self._model_executor.submit(run_seg_model)
+                    pose_future = self._model_executor.submit(run_pose_model)
+                    try:
+                        seg_results, timings["seg_model_ms"] = seg_future.result()
+                        pose_results, timings["pose_model_ms"] = pose_future.result()
+                    except Exception:
+                        for future in (seg_future, pose_future):
+                            future.cancel()
+                        for future in (seg_future, pose_future):
+                            if future.cancelled():
+                                continue
+                            try:
+                                future.result()
+                            except Exception:
+                                pass
+                        raise
+                    timings["parallel_models"] = 1
+                else:
+                    seg_results, timings["seg_model_ms"] = run_seg_model()
+                    pose_results, timings["pose_model_ms"] = run_pose_model()
+                    timings["parallel_models"] = 0
+
+                timings["model_infer_ms"] = _elapsed_ms(model_start)
+                if len(seg_results) != len(source_frames):
+                    raise RuntimeError(f"seg batch returned {len(seg_results)} results for {len(source_frames)} source frames")
+                if len(pose_results) != len(source_frames):
+                    raise RuntimeError(f"pose batch returned {len(pose_results)} results for {len(source_frames)} source frames")
+
+                postprocess_start = time.perf_counter()
+                current_analyzed_by_input = {}
+                output_frames_by_global = {}
+                for stream_key in stream_order:
+                    group = stream_groups[stream_key]
+                    self._restore_stream_state(self._stream_states.get(stream_key))
+                    stream_analyzed: dict[int, dict] = {}
+                    distance_tasks: list[dict] = []
+                    for item in group:
+                        global_index = int(item["global_index"])
+                        stream_analyzed[global_index] = self._analyze_predecoded_unlocked(
+                            f"{item['frame_id']}_current",
+                            item["depth"],
+                            seg_result=seg_results[global_index],
+                            pose_result=pose_results[global_index],
+                            prepared=item.get("prepared"),
+                            distance_tasks=distance_tasks,
+                            finalize_qualitative=False,
+                        )
+                    self._finalize_deferred_distance_results(stream_analyzed, distance_tasks)
+                    self._apply_batch_pose_semantic_reuse(stream_analyzed)
+                    for item in group:
+                        self._finalize_analyzed_qualitative_fields(
+                            stream_analyzed[int(item["global_index"])]
+                        )
+                    if group and not self._stateless:
+                        self._last_source_depth = group[-1]["depth"].copy()
+                    if not self._stateless:
+                        self._stream_states[stream_key] = self._capture_stream_state()
+                    else:
+                        self._stream_states.pop(stream_key, None)
+                    for item in group:
+                        global_index = int(item["global_index"])
+                        current_analyzed_by_input[global_index] = stream_analyzed[global_index]
+                        output_frames_by_global[global_index] = {
+                            "frame_id": f"{item['frame_id']}_current",
+                            "source_frame_id": item["frame_id"],
+                            "global_index": global_index,
+                            "request_id": int(item["request_id"]),
+                            "input_index": int(item["input_index"]),
+                            "stream_key": stream_key,
+                            "result_kind": "current",
+                        }
+                timings["postprocess_ms"] = _elapsed_ms(postprocess_start)
+                confidence_log_kwargs = {
+                    "contour_results": seg_results,
+                    "pose_results": pose_results,
+                }
+
+            interpolate_start = time.perf_counter()
+            output_frames = [output_frames_by_global[index] for index in range(len(source_frames))]
+            analyzed_results = [current_analyzed_by_input[index] for index in range(len(source_frames))]
+            timings["interpolate_ms"] = _elapsed_ms(interpolate_start)
+        finally:
+            self._restore_stream_state(original_state)
+            self._lock.release()
+
+        self._log_model_confidences(
+            len(source_frames),
+            current_analyzed_by_input,
+            **confidence_log_kwargs,
+        )
+        results = self._encode_analyzed_results(analyzed_results, timings)
+        for result, item in zip(results, output_frames):
+            result["source_frame_id"] = item["source_frame_id"]
+            result["input_index"] = int(item["input_index"])
+            result["output_index"] = int(item["input_index"])
+            result["request_id"] = int(item["request_id"])
+            result["stream_key"] = item["stream_key"]
+            result["result_kind"] = item["result_kind"]
+        timings["total_ms"] = _elapsed_ms(total_start)
+        self._log_batch_timings(len(items), len(output_frames), timings)
+        return results
+
     def infer_batch(self, frames: list[tuple[str, bytes]]) -> list[dict]:
         if not frames:
             return []
@@ -2964,8 +3423,13 @@ class RealtimePoseEngine:
                         item["depth"],
                         pose_result=pose_results[input_index],
                         prepared=item.get("prepared"),
+                        finalize_qualitative=False,
                     )
                 self._apply_batch_pose_semantic_reuse(current_analyzed_by_input)
+                for item in source_frames:
+                    self._finalize_analyzed_qualitative_fields(
+                        current_analyzed_by_input[int(item["input_index"])]
+                    )
                 timings["postprocess_ms"] = _elapsed_ms(postprocess_start)
                 confidence_log_kwargs = {"pose_results": pose_results}
                 output_frames, analyzed_results = build_output_results(current_analyzed_by_input)
@@ -3039,9 +3503,14 @@ class RealtimePoseEngine:
                         pose_result=pose_results[input_index],
                         prepared=item.get("prepared"),
                         distance_tasks=distance_tasks,
+                        finalize_qualitative=False,
                     )
                 self._finalize_deferred_distance_results(current_analyzed_by_input, distance_tasks)
                 self._apply_batch_pose_semantic_reuse(current_analyzed_by_input)
+                for item in source_frames:
+                    self._finalize_analyzed_qualitative_fields(
+                        current_analyzed_by_input[int(item["input_index"])]
+                    )
                 timings["postprocess_ms"] = _elapsed_ms(postprocess_start)
                 confidence_log_kwargs = {
                     "contour_results": seg_results,

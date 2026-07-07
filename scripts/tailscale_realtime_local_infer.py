@@ -216,9 +216,7 @@ def write_result_images(output_dir: Path, batch_index: int, results: list[dict])
     batch_dir.mkdir(parents=True, exist_ok=True)
     for idx, result in enumerate(results):
         frame_id = str(result.get("frame_id") or f"result_{idx:04d}").replace("/", "_")
-        pseudo_format = str(result.get("pseudo_color_image_format") or "png")
         skeleton_format = str(result.get("skeleton_contour_image_format") or "png")
-        (batch_dir / f"{idx:04d}_{frame_id}_pseudo.{pseudo_format}").write_bytes(result.get("pseudo_color_image", b""))
         (batch_dir / f"{idx:04d}_{frame_id}_skeleton_contour.{skeleton_format}").write_bytes(
             result.get("skeleton_contour_image", b"")
         )
@@ -292,10 +290,8 @@ def build_display_row(
 
     if result is None:
         blank = np.zeros((tile_size, tile_size, 3), dtype=np.uint8)
-        pseudo_tile = label_tile(blank, "pseudo", "missing")
         skeleton_tile = label_tile(blank, "skeleton", "missing")
     else:
-        pseudo_tile = decode_image_bytes(result.get("pseudo_color_image", b""), tile_size)
         skeleton_tile = decode_image_bytes(result.get("skeleton_contour_image", b""), tile_size)
         metrics = (
             f"P={int(result.get('person_count', 0) or 0)} "
@@ -303,10 +299,9 @@ def build_display_row(
             f"D={str(result.get('person_distance', '') or '-')} "
             f"A={str(result.get('action_level', '') or '-')}"
         )
-        pseudo_tile = label_tile(pseudo_tile, "pseudo current", metrics)
         skeleton_tile = label_tile(skeleton_tile, "skeleton+contour", metrics)
 
-    return np.hstack([input_tile, pseudo_tile, skeleton_tile])
+    return np.hstack([input_tile, skeleton_tile])
 
 
 def show_batch_window(args: argparse.Namespace, batch: list[ReceivedFrame], results: list[dict]) -> bool:

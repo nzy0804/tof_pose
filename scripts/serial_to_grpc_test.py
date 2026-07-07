@@ -60,7 +60,6 @@ def _save_outputs(resp: ai_pb2.InferResponse, outdir: Path) -> dict[str, int]:
         kind = _result_kind_name(item.result_kind)
         frame_prefix = f"{batch_prefix}_{idx:02d}_{kind}_{item.frame_id}"
         mapping = [
-            ("pseudo_color", item.pseudo_color_image),
             ("skeleton_contour", item.skeleton_contour_image),
         ]
         for name, blob in mapping:

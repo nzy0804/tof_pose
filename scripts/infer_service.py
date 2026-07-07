@@ -38,12 +38,10 @@ class ModelService:
 
     def process_single(self, depth_gray: np.ndarray) -> tuple[bytes, bytes]:
         h, w = depth_gray.shape[:2]
-        out_size = (320, 320)
+        out_size = (100, 100)
         depth_up = cv2.resize(depth_gray, out_size, interpolation=cv2.INTER_LINEAR)
 
-        pseudo_color = cv2.applyColorMap(depth_up, cv2.COLORMAP_MAGMA)
-
-        skeleton_contour = np.zeros_like(pseudo_color)
+        skeleton_contour = np.zeros((out_size[1], out_size[0], 3), dtype=np.uint8)
         # simple mock keypoints relative to image
         kp = [
             (int(out_size[0]*0.5), int(out_size[1]*0.2)),
@@ -54,22 +52,21 @@ class ModelService:
             (int(out_size[0]*0.55), int(out_size[1]*0.85)),
         ]
         for p in kp:
-            cv2.circle(skeleton_contour, p, 6, (0, 255, 0), -1)
-        cv2.line(skeleton_contour, kp[0], kp[1], (0, 255, 0), 2)
-        cv2.line(skeleton_contour, kp[1], kp[2], (0, 255, 0), 2)
-        cv2.line(skeleton_contour, kp[1], kp[3], (0, 255, 0), 2)
-        cv2.line(skeleton_contour, kp[2], kp[4], (0, 255, 0), 2)
-        cv2.line(skeleton_contour, kp[3], kp[5], (0, 255, 0), 2)
+            cv2.circle(skeleton_contour, p, 2, (0, 255, 0), -1)
+        cv2.line(skeleton_contour, kp[0], kp[1], (0, 255, 0), 1)
+        cv2.line(skeleton_contour, kp[1], kp[2], (0, 255, 0), 1)
+        cv2.line(skeleton_contour, kp[1], kp[3], (0, 255, 0), 1)
+        cv2.line(skeleton_contour, kp[2], kp[4], (0, 255, 0), 1)
+        cv2.line(skeleton_contour, kp[3], kp[5], (0, 255, 0), 1)
 
         _, thr = cv2.threshold(depth_up, 10, 255, cv2.THRESH_BINARY)
         cnts, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if cnts:
             best = max(cnts, key=cv2.contourArea)
-            cv2.drawContours(skeleton_contour, [best], -1, (255, 255, 255), 2)
+            cv2.drawContours(skeleton_contour, [best], -1, (255, 255, 255), 1)
 
-        _, b1 = cv2.imencode('.png', pseudo_color, [cv2.IMWRITE_PNG_COMPRESSION, 3])
         _, b2 = cv2.imencode('.png', skeleton_contour, [cv2.IMWRITE_PNG_COMPRESSION, 3])
-        return (b1.tobytes(), b2.tobytes())
+        return (b"", b2.tobytes())
 
     def infer(self, frame_id: str, image_bytes: bytes) -> dict:
         start = time.time()
@@ -131,7 +128,6 @@ def main(argv):
         res = svc.infer(frame_id, data)
         # save outputs
         outputs = {
-            'pseudo_color': res.get('pseudo_color_image'),
             'skeleton_contour': res.get('skeleton_contour_image'),
         }
         for name, b in outputs.items():

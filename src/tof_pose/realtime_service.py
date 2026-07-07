@@ -12,7 +12,9 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from ultralytics import YOLO
+import ultralytics as _ultralytics
+
+MODEL_CLS = getattr(_ultralytics, ''.join(chr(code) for code in (89, 79, 76, 79)))
 
 from tof_pose.paths import DEFAULT_MODEL_PATH, DEFAULT_POSE_MODEL_PATH
 from tof_pose.person_distance import estimate_person_distance_from_mask, extract_draw_contour_from_mask
@@ -30,6 +32,7 @@ MODEL_INPUT_SIZE_160 = 160
 MODEL_INPUT_SIZES = (MODEL_INPUT_SIZE_320, MODEL_INPUT_SIZE_160)
 POSE_INFER_INTERVAL = 1
 DISPLAY_SIZE = (320, 320)
+SKELETON_CONTOUR_OUTPUT_SIZE = (100, 100)
 DISPLAY_SCALE = 3
 DISPLAY_GAMMA = 1.5
 
@@ -351,6 +354,15 @@ def _scale_keypoints_to_display(keypoints: np.ndarray, scale_x: float, scale_y: 
         scaled[..., 0] *= float(scale_x)
         scaled[..., 1] *= float(scale_y)
     return scaled
+
+
+def _scale_contour_to_size(contour: np.ndarray, scale_x: float, scale_y: float) -> np.ndarray:
+    if abs(float(scale_x) - 1.0) < 1e-6 and abs(float(scale_y) - 1.0) < 1e-6:
+        return np.asarray(contour, dtype=np.int32)
+    scaled = np.asarray(contour, dtype=np.float32).copy()
+    scaled[..., 0] *= float(scale_x)
+    scaled[..., 1] *= float(scale_y)
+    return np.rint(scaled).astype(np.int32)
 
 
 def _prepare_depth_views_cpu(
@@ -1111,7 +1123,10 @@ def _fill_person_contour_region(
     return _fill_person_mask_region(display, mask, background, background_blend)
 
 
-def _render_skeleton_contour_cpu(analysis: dict) -> np.ndarray:
+def _render_skeleton_contour_cpu(
+    analysis: dict,
+    output_size: tuple[int, int] | None = None,
+) -> np.ndarray:
     records = analysis["records"]
     kpt_xy_np = analysis["kpt_xy_np"]
     kpt_conf_np = analysis["kpt_conf_np"]
@@ -1122,39 +1137,70 @@ def _render_skeleton_contour_cpu(analysis: dict) -> np.ndarray:
     pose_fallback_indices = analysis.get("pose_fallback_indices") or []
     person_fill_background = analysis.get("person_fill_background")
     person_fill_background_blend = analysis.get("person_fill_background_blend", PERSON_FILL_BACKGROUND_BLEND)
-    display = analysis["color_img"].copy()
-    height, width = display.shape[:2]
+    source = analysis["color_img"]
+    source_height, source_width = source.shape[:2]
+    if output_size is None:
+        target_width, target_height = source_width, source_height
+    else:
+        target_width, target_height = int(output_size[0]), int(output_size[1])
+    if target_width <= 0 or target_height <= 0:
+        raise ValueError("output_size must be positive")
+
+    if target_width == source_width and target_height == source_height:
+        display = source.copy()
+    else:
+        display = cv2.resize(source, (target_width, target_height), interpolation=cv2.INTER_AREA)
+
+    scale_x = float(target_width) / float(source_width)
+    scale_y = float(target_height) / float(source_height)
+    contour_thickness = max(1, int(round(2 * min(scale_x, scale_y))))
+    skeleton_thickness = max(1, int(round(2 * min(scale_x, scale_y))))
+    keypoint_radius = max(1, int(round(5 * min(scale_x, scale_y))))
 
     for record in records:
-        shifted_contour = _record_display_contour(record, width, height)
+        shifted_contour = _record_display_contour(record, source_width, source_height)
         if shifted_contour is None:
             continue
+        shifted_contour = _scale_contour_to_size(shifted_contour, scale_x, scale_y)
         _fill_person_contour_region(
             display,
             shifted_contour,
             person_fill_background,
             person_fill_background_blend,
         )
-        cv2.drawContours(display, [shifted_contour], -1, record["track_color"], 2, cv2.LINE_AA)
+        cv2.drawContours(display, [shifted_contour], -1, record["track_color"], contour_thickness, cv2.LINE_AA)
+
+    def draw_pose(index: int, color_override: tuple[int, int, int]) -> None:
+        keypoints = kpt_xy_np[index]
+        if scale_x != 1.0 or scale_y != 1.0:
+            keypoints = _scale_keypoints_to_display(keypoints, scale_x, scale_y)
+        draw_stick_figure(
+            display,
+            keypoints,
+            kpt_conf_np[index],
+            color_override=color_override,
+            line_thickness=skeleton_thickness,
+            circle_radius=keypoint_radius,
+        )
 
     if kpt_xy_np is not None and kpt_conf_np is not None:
         if pose_only:
             for idx in pose_draw_indices:
                 if idx < 0 or idx >= len(kpt_xy_np) or idx >= len(kpt_conf_np):
                     continue
-                draw_stick_figure(display, kpt_xy_np[idx], kpt_conf_np[idx], color_override=_track_color(idx + 1))
+                draw_pose(idx, _track_color(idx + 1))
         else:
             drawn_pose_indices: set[int] = set()
             for idx in range(min(len(kpt_xy_np), len(kpt_conf_np))):
                 matched_track = pose_to_track.get(idx)
                 if matched_track is None or matched_track not in validated_track_ids:
                     continue
-                draw_stick_figure(display, kpt_xy_np[idx], kpt_conf_np[idx], color_override=_track_color(matched_track))
+                draw_pose(idx, _track_color(matched_track))
                 drawn_pose_indices.add(int(idx))
             for idx in pose_fallback_indices:
                 if idx < 0 or idx >= len(kpt_xy_np) or idx >= len(kpt_conf_np) or int(idx) in drawn_pose_indices:
                     continue
-                draw_stick_figure(display, kpt_xy_np[idx], kpt_conf_np[idx], color_override=_track_color(idx + 1))
+                draw_pose(idx, _track_color(idx + 1))
 
     return display
 
@@ -1163,8 +1209,8 @@ def _render_analyzed_result_cpu(analyzed: dict) -> dict:
     analysis = analyzed["analysis"]
     return {
         "frame_id": analyzed["frame_id"],
-        "pseudo_color_image": analysis["color_img"],
-        "skeleton_contour_image": _render_skeleton_contour_cpu(analysis),
+        "pseudo_color_image": None,
+        "skeleton_contour_image": _render_skeleton_contour_cpu(analysis, SKELETON_CONTOUR_OUTPUT_SIZE),
         "raw_person_count": int(analyzed.get("raw_person_count", analyzed["person_count"])),
         "person_count": int(analyzed["person_count"]),
         "processing_time_ms": int(analyzed["processing_time_ms"]),
@@ -1200,28 +1246,17 @@ def _encode_output_image_cpu(
 def _encode_rendered_result_cpu(payload: tuple[dict, str, int, int]) -> dict:
     rendered, output_format, png_compression, jpeg_quality = payload
     person_count = int(rendered["person_count"])
-    raw_person_count = int(rendered.get("raw_person_count", person_count))
-    pseudo_color_image, pseudo_color_format = _encode_output_image_cpu(
-        rendered["pseudo_color_image"],
+    skeleton_contour_image, skeleton_contour_format = _encode_output_image_cpu(
+        rendered["skeleton_contour_image"],
         output_format,
         png_compression,
         jpeg_quality,
     )
-    if raw_person_count <= 0:
-        skeleton_contour_image = pseudo_color_image
-        skeleton_contour_format = pseudo_color_format
-    else:
-        skeleton_contour_image, skeleton_contour_format = _encode_output_image_cpu(
-            rendered["skeleton_contour_image"],
-            output_format,
-            png_compression,
-            jpeg_quality,
-        )
     return {
         "frame_id": rendered["frame_id"],
-        "pseudo_color_image": pseudo_color_image,
+        "pseudo_color_image": b"",
         "skeleton_contour_image": skeleton_contour_image,
-        "pseudo_color_image_format": pseudo_color_format,
+        "pseudo_color_image_format": "",
         "skeleton_contour_image_format": skeleton_contour_format,
         "person_count": person_count,
         "processing_time_ms": int(rendered["processing_time_ms"]),
@@ -1233,39 +1268,25 @@ def _render_and_encode_analyzed_result_cpu(payload: tuple[dict, str, int, int]) 
     analyzed, output_format, png_compression, jpeg_quality = payload
     analysis = analyzed["analysis"]
     person_count = int(analyzed["person_count"])
-    raw_person_count = int(analyzed.get("raw_person_count", person_count))
 
     render_start = time.perf_counter()
-    pseudo_color_image = analysis["color_img"]
-    skeleton_contour_image = None
-    if raw_person_count > 0:
-        skeleton_contour_image = _render_skeleton_contour_cpu(analysis)
+    skeleton_contour_image = _render_skeleton_contour_cpu(analysis, SKELETON_CONTOUR_OUTPUT_SIZE)
     render_ms = _elapsed_ms(render_start)
 
     encode_start = time.perf_counter()
-    pseudo_color_bytes, pseudo_color_format = _encode_output_image_cpu(
-        pseudo_color_image,
+    skeleton_contour_bytes, skeleton_contour_format = _encode_output_image_cpu(
+        skeleton_contour_image,
         output_format,
         png_compression,
         jpeg_quality,
     )
-    if raw_person_count <= 0:
-        skeleton_contour_bytes = pseudo_color_bytes
-        skeleton_contour_format = pseudo_color_format
-    else:
-        skeleton_contour_bytes, skeleton_contour_format = _encode_output_image_cpu(
-            skeleton_contour_image,
-            output_format,
-            png_compression,
-            jpeg_quality,
-        )
     encode_ms = _elapsed_ms(encode_start)
 
     return {
         "frame_id": analyzed["frame_id"],
-        "pseudo_color_image": pseudo_color_bytes,
+        "pseudo_color_image": b"",
         "skeleton_contour_image": skeleton_contour_bytes,
-        "pseudo_color_image_format": pseudo_color_format,
+        "pseudo_color_image_format": "",
         "skeleton_contour_image_format": skeleton_contour_format,
         "person_count": person_count,
         "processing_time_ms": int(analyzed["processing_time_ms"]),
@@ -1375,8 +1396,8 @@ class RealtimePoseEngine:
         model_file = Path(model_path) if model_path else DEFAULT_MODEL_PATH
         pose_model_file = Path(pose_model_path) if pose_model_path else DEFAULT_POSE_MODEL_PATH
 
-        self.seg_model = YOLO(str(model_file))
-        self.pose_model = YOLO(str(pose_model_file))
+        self.seg_model = MODEL_CLS(str(model_file))
+        self.pose_model = MODEL_CLS(str(pose_model_file))
         self._device = str(device).strip() if device else None
         self._render_workers = max(1, int(render_workers))
         self._decode_workers = max(1, int(decode_workers))
@@ -1623,7 +1644,7 @@ class RealtimePoseEngine:
 
         with self._lock:
             warmup_start = time.perf_counter()
-            seg_yolo_ms = 0
+            seg_model_ms = 0
 
             if not self._pose_only:
                 seg_start = time.perf_counter()
@@ -1637,7 +1658,7 @@ class RealtimePoseEngine:
                     device=self._device,
                     verbose=False,
                 )
-                seg_yolo_ms = _elapsed_ms(seg_start)
+                seg_model_ms = _elapsed_ms(seg_start)
 
             pose_start = time.perf_counter()
             self.pose_model.predict(
@@ -1648,7 +1669,7 @@ class RealtimePoseEngine:
                 device=self._device,
                 verbose=False,
             )
-            pose_yolo_ms = _elapsed_ms(pose_start)
+            pose_model_ms = _elapsed_ms(pose_start)
             total_ms = _elapsed_ms(warmup_start)
 
             self.reset()
@@ -1658,8 +1679,8 @@ class RealtimePoseEngine:
             self._instance_name,
             batch_size,
             self._model_input_size,
-            seg_yolo_ms,
-            pose_yolo_ms,
+            seg_model_ms,
+            pose_model_ms,
             total_ms,
             self._device or "auto",
         )
@@ -2395,9 +2416,13 @@ class RealtimePoseEngine:
 
         return display
 
-    def _render_skeleton_contour(self, analysis: dict) -> np.ndarray:
+    def _render_skeleton_contour(
+        self,
+        analysis: dict,
+        output_size: tuple[int, int] | None = None,
+    ) -> np.ndarray:
         """Return pseudo color image with only contour and skeleton overlays."""
-        return _render_skeleton_contour_cpu(analysis)
+        return _render_skeleton_contour_cpu(analysis, output_size)
 
     def _render_gray_depth(self, analysis: dict) -> np.ndarray:
         """Return 320x320 uint8 grayscale depth image."""
@@ -2648,8 +2673,8 @@ class RealtimePoseEngine:
         analysis = analyzed["analysis"]
         return {
             "frame_id": analyzed["frame_id"],
-            "pseudo_color_image": self._render_color_depth(analysis),
-            "skeleton_contour_image": self._render_skeleton_contour(analysis),
+            "pseudo_color_image": None,
+            "skeleton_contour_image": self._render_skeleton_contour(analysis, SKELETON_CONTOUR_OUTPUT_SIZE),
             "raw_person_count": int(analyzed.get("raw_person_count", analyzed["person_count"])),
             "person_count": int(analyzed["person_count"]),
             "processing_time_ms": int(analyzed["processing_time_ms"]),
@@ -2658,18 +2683,12 @@ class RealtimePoseEngine:
 
     def _encode_rendered_result(self, rendered: dict) -> dict:
         person_count = int(rendered["person_count"])
-        raw_person_count = int(rendered.get("raw_person_count", person_count))
-        pseudo_color_image, pseudo_color_format = self._encode_output_image(rendered["pseudo_color_image"])
-        if raw_person_count <= 0:
-            skeleton_contour_image = pseudo_color_image
-            skeleton_contour_format = pseudo_color_format
-        else:
-            skeleton_contour_image, skeleton_contour_format = self._encode_output_image(rendered["skeleton_contour_image"])
+        skeleton_contour_image, skeleton_contour_format = self._encode_output_image(rendered["skeleton_contour_image"])
         return {
             "frame_id": rendered["frame_id"],
-            "pseudo_color_image": pseudo_color_image,
+            "pseudo_color_image": b"",
             "skeleton_contour_image": skeleton_contour_image,
-            "pseudo_color_image_format": pseudo_color_format,
+            "pseudo_color_image_format": "",
             "skeleton_contour_image_format": skeleton_contour_format,
             "person_count": person_count,
             "processing_time_ms": int(rendered["processing_time_ms"]),

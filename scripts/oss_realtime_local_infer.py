@@ -198,12 +198,8 @@ def write_result_images(output_dir: Path, batch_index: int, results: list[dict])
     batch_dir = output_dir / f"batch_{batch_index:06d}"
     batch_dir.mkdir(parents=True, exist_ok=True)
     for idx, result in enumerate(results):
-        pseudo_format = str(result.get("pseudo_color_image_format") or "png")
         skeleton_format = str(result.get("skeleton_contour_image_format") or "png")
         frame_id = str(result.get("frame_id") or f"result_{idx:04d}").replace("/", "_")
-        (batch_dir / f"{idx:04d}_{frame_id}_pseudo.{pseudo_format}").write_bytes(
-            result.get("pseudo_color_image", b"")
-        )
         (batch_dir / f"{idx:04d}_{frame_id}_skeleton_contour.{skeleton_format}").write_bytes(
             result.get("skeleton_contour_image", b"")
         )

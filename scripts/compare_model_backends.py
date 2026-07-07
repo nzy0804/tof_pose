@@ -137,13 +137,8 @@ def _write_pipeline_images(output_dir: Path, backend_name: str, results: list[di
     backend_dir.mkdir(parents=True, exist_ok=True)
     for index, result in enumerate(results):
         frame_id = str(result.get("frame_id", f"frame_{index:04d}"))
-        pseudo_format = str(result.get("pseudo_color_image_format") or "png")
         skeleton_format = str(result.get("skeleton_contour_image_format") or "png")
-        pseudo_suffix = _suffix_for_format(pseudo_format)
         skeleton_suffix = _suffix_for_format(skeleton_format)
-        (backend_dir / f"{index:04d}_{frame_id}_pseudo.{pseudo_suffix}").write_bytes(
-            bytes(result.get("pseudo_color_image") or b"")
-        )
         (backend_dir / f"{index:04d}_{frame_id}_skeleton_contour.{skeleton_suffix}").write_bytes(
             bytes(result.get("skeleton_contour_image") or b"")
         )

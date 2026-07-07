@@ -39,12 +39,34 @@ class ModelServiceStub(object):
                 request_serializer=ai__pb2.InferRequest.SerializeToString,
                 response_deserializer=ai__pb2.InferResponse.FromString,
                 _registered_method=True)
+        self.SubmitFrames = channel.unary_unary(
+                '/ai.ModelService/SubmitFrames',
+                request_serializer=ai__pb2.SubmitFramesRequest.SerializeToString,
+                response_deserializer=ai__pb2.SubmitFramesResponse.FromString,
+                _registered_method=True)
+        self.SubscribeResults = channel.unary_stream(
+                '/ai.ModelService/SubscribeResults',
+                request_serializer=ai__pb2.ResultSubscribeRequest.SerializeToString,
+                response_deserializer=ai__pb2.InferResultEvent.FromString,
+                _registered_method=True)
 
 
 class ModelServiceServicer(object):
     """Missing associated documentation comment in .proto file."""
 
     def Infer(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def SubmitFrames(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def SubscribeResults(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -57,6 +79,16 @@ def add_ModelServiceServicer_to_server(servicer, server):
                     servicer.Infer,
                     request_deserializer=ai__pb2.InferRequest.FromString,
                     response_serializer=ai__pb2.InferResponse.SerializeToString,
+            ),
+            'SubmitFrames': grpc.unary_unary_rpc_method_handler(
+                    servicer.SubmitFrames,
+                    request_deserializer=ai__pb2.SubmitFramesRequest.FromString,
+                    response_serializer=ai__pb2.SubmitFramesResponse.SerializeToString,
+            ),
+            'SubscribeResults': grpc.unary_stream_rpc_method_handler(
+                    servicer.SubscribeResults,
+                    request_deserializer=ai__pb2.ResultSubscribeRequest.FromString,
+                    response_serializer=ai__pb2.InferResultEvent.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -86,6 +118,60 @@ class ModelService(object):
             '/ai.ModelService/Infer',
             ai__pb2.InferRequest.SerializeToString,
             ai__pb2.InferResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SubmitFrames(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/ai.ModelService/SubmitFrames',
+            ai__pb2.SubmitFramesRequest.SerializeToString,
+            ai__pb2.SubmitFramesResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SubscribeResults(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/ai.ModelService/SubscribeResults',
+            ai__pb2.ResultSubscribeRequest.SerializeToString,
+            ai__pb2.InferResultEvent.FromString,
             options,
             channel_credentials,
             insecure,

@@ -11,7 +11,7 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import grpc
@@ -177,10 +177,20 @@ class _DynamicInferBatcher:
             self._closed = True
             self._condition.notify_all()
 
-    def submit(self, *, stream_key: str, frames: list[tuple[str, bytes]]) -> list[dict]:
-        if not frames:
-            return []
+    @staticmethod
+    def _normalize_request_results(results: list[dict]) -> list[dict]:
+        for output_index, result in enumerate(results):
+            result["input_index"] = output_index
+            result["output_index"] = output_index
+        return results
 
+    def submit_async(self, *, stream_key: str, frames: list[tuple[str, bytes]]) -> Future:
+        request_future: Future = Future()
+        if not frames:
+            request_future.set_result([])
+            return request_future
+
+        jobs: list[_DynamicInferJob] = []
         with self._condition:
             if self._closed:
                 raise RuntimeError(f"dynamic batcher {self._instance_name} is closed")
@@ -209,11 +219,27 @@ class _DynamicInferBatcher:
             self._queue.extend(jobs)
             self._condition.notify_all()
 
-        results = [job.future.result() for job in jobs]
-        for output_index, result in enumerate(results):
-            result["input_index"] = output_index
-            result["output_index"] = output_index
-        return results
+        remaining = len(jobs)
+        aggregate_lock = threading.Lock()
+
+        def complete_request(_completed: Future) -> None:
+            nonlocal remaining
+            with aggregate_lock:
+                remaining -= 1
+                if remaining > 0 or request_future.done():
+                    return
+                try:
+                    results = [job.future.result() for job in jobs]
+                    request_future.set_result(self._normalize_request_results(results))
+                except Exception as exc:
+                    request_future.set_exception(exc)
+
+        for job in jobs:
+            job.future.add_done_callback(complete_request)
+        return request_future
+
+    def submit(self, *, stream_key: str, frames: list[tuple[str, bytes]]) -> list[dict]:
+        return self.submit_async(stream_key=stream_key, frames=frames).result()
 
     def _take_batch(self) -> tuple[list[_DynamicInferJob], int] | None:
         with self._condition:
@@ -287,6 +313,415 @@ class _DynamicInferBatcher:
                         job.future.set_exception(exc)
 
 
+@dataclass
+class _AsyncInferJob:
+    device_id: str
+    batch_id: str
+    sequence_id: int
+    images: list
+    accepted_at: float
+
+
+@dataclass
+class _AsyncDeviceState:
+    inflight_batches: int = 0
+    model_active: bool = False
+    last_accepted_sequence_id: int | None = None
+    pending: deque[_AsyncInferJob] = field(default_factory=deque)
+
+
+class _ResultEventHub:
+    def __init__(self, max_events: int) -> None:
+        self._max_events = max(1, int(max_events))
+        self._condition = threading.Condition()
+        self._events: deque[tuple[int, ai_pb2.InferResultEvent]] = deque(maxlen=self._max_events)
+        self._next_index = 0
+
+    def publish(self, event: ai_pb2.InferResultEvent) -> None:
+        with self._condition:
+            self._events.append((self._next_index, event))
+            self._next_index += 1
+            self._condition.notify_all()
+
+    def subscribe(self, *, device_ids: set[str], context):
+        with self._condition:
+            cursor = self._next_index
+        while context.is_active():
+            selected: list[ai_pb2.InferResultEvent] = []
+            with self._condition:
+                while context.is_active():
+                    if self._events and cursor < self._events[0][0]:
+                        cursor = self._events[0][0]
+                    has_new = bool(self._events and self._events[-1][0] >= cursor)
+                    if has_new:
+                        break
+                    self._condition.wait(timeout=1.0)
+                if not context.is_active():
+                    return
+                for index, event in list(self._events):
+                    if index < cursor:
+                        continue
+                    cursor = index + 1
+                    if not device_ids or event.device_id in device_ids:
+                        selected.append(event)
+            for event in selected:
+                yield event
+
+
+class _AsyncInferenceManager:
+    def __init__(
+        self,
+        *,
+        servicer,
+        device_window: int,
+        result_buffer_size: int,
+        prepare_workers: int,
+        result_workers: int,
+        retry_after_ms: int = 100,
+    ) -> None:
+        self._servicer = servicer
+        self._device_window = max(1, int(device_window))
+        self._retry_after_ms = max(0, int(retry_after_ms))
+        self._lock = threading.Lock()
+        self._device_states: dict[str, _AsyncDeviceState] = {}
+        self._prepare_executor = ThreadPoolExecutor(
+            max_workers=max(1, int(prepare_workers)),
+            thread_name_prefix="async-infer-prepare",
+        )
+        self._result_executor = ThreadPoolExecutor(
+            max_workers=max(1, int(result_workers)),
+            thread_name_prefix="async-infer-result",
+        )
+        self.result_hub = _ResultEventHub(result_buffer_size)
+
+    @property
+    def device_window(self) -> int:
+        return self._device_window
+
+    def submit(self, request) -> ai_pb2.SubmitFramesResponse:
+        device_id = str(getattr(request, "device_id", "") or "").strip()
+        if not device_id:
+            raise ValueError("device_id must not be empty")
+        batch_id = str(getattr(request, "batch_id", "") or "").strip()
+        try:
+            sequence_id = int(getattr(request, "sequence_id", 0) or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("sequence_id must be an integer") from exc
+        if sequence_id < 0:
+            raise ValueError("sequence_id must be >= 0")
+
+        images = list(getattr(request, "images", []))
+        batch_size = int(getattr(request, "batch_size", 0) or 0)
+        if not images:
+            raise ValueError("images must not be empty")
+        if batch_size and batch_size != len(images):
+            raise ValueError(f"batch_size={batch_size} does not match images count={len(images)}")
+
+        copied_images = []
+        for index, image in enumerate(images):
+            frame_id = str(getattr(image, "frame_id", "") or "")
+            image_data = bytes(getattr(image, "image_data", b"") or b"")
+            object_key = str(getattr(image, "object_key", "") or "").strip()
+            if not image_data and not object_key:
+                raise ValueError(f"image {index} missing image_data/object_key")
+            try:
+                capture_timestamp_ms = max(0, int(getattr(image, "capture_timestamp_ms", 0) or 0))
+            except (TypeError, ValueError):
+                capture_timestamp_ms = 0
+            copied_images.append(
+                ai_pb2.InferImage(
+                    frame_id=frame_id,
+                    capture_timestamp_ms=capture_timestamp_ms,
+                    image_data=image_data,
+                    object_key=object_key,
+                )
+            )
+
+        batch_id = batch_id or f"{device_id}-{sequence_id}"
+        with self._lock:
+            state = self._device_states.setdefault(device_id, _AsyncDeviceState())
+            if state.inflight_batches >= self._device_window:
+                return ai_pb2.SubmitFramesResponse(
+                    device_id=device_id,
+                    batch_id=batch_id,
+                    sequence_id=sequence_id,
+                    accepted=False,
+                    accepted_count=0,
+                    device_inflight_batches=state.inflight_batches,
+                    retry_after_ms=self._retry_after_ms,
+                    message="device_inflight_window_full",
+                )
+            if (
+                state.last_accepted_sequence_id is not None
+                and sequence_id <= state.last_accepted_sequence_id
+            ):
+                return ai_pb2.SubmitFramesResponse(
+                    device_id=device_id,
+                    batch_id=batch_id,
+                    sequence_id=sequence_id,
+                    accepted=False,
+                    accepted_count=0,
+                    device_inflight_batches=state.inflight_batches,
+                    retry_after_ms=0,
+                    message="sequence_id_must_increase_per_device",
+                )
+
+            job = _AsyncInferJob(
+                device_id=device_id,
+                batch_id=batch_id,
+                sequence_id=sequence_id,
+                images=copied_images,
+                accepted_at=time.perf_counter(),
+            )
+            state.last_accepted_sequence_id = sequence_id
+            state.inflight_batches += 1
+            state.pending.append(job)
+            inflight_batches = state.inflight_batches
+            self._dispatch_next_locked(device_id, state)
+
+        logging.info(
+            "Async infer accepted: device_id=%s batch_id=%s sequence_id=%d images=%d inflight=%d window=%d",
+            device_id,
+            batch_id,
+            sequence_id,
+            len(copied_images),
+            inflight_batches,
+            self._device_window,
+        )
+        return ai_pb2.SubmitFramesResponse(
+            device_id=device_id,
+            batch_id=batch_id,
+            sequence_id=sequence_id,
+            accepted=True,
+            accepted_count=len(copied_images),
+            device_inflight_batches=inflight_batches,
+            retry_after_ms=0,
+            message="accepted",
+        )
+
+    def _dispatch_next_locked(self, device_id: str, state: _AsyncDeviceState) -> None:
+        if state.model_active or not state.pending:
+            return
+        job = state.pending.popleft()
+        state.model_active = True
+        self._prepare_executor.submit(self._run_model_stage, job)
+
+    def _mark_model_stage_done(self, job: _AsyncInferJob) -> None:
+        with self._lock:
+            state = self._device_states.get(job.device_id)
+            if state is None:
+                return
+            state.model_active = False
+            self._dispatch_next_locked(job.device_id, state)
+
+    def _mark_result_done(self, job: _AsyncInferJob) -> None:
+        with self._lock:
+            state = self._device_states.get(job.device_id)
+            if state is None:
+                return
+            state.inflight_batches = max(0, state.inflight_batches - 1)
+
+    def _run_model_stage(self, job: _AsyncInferJob) -> None:
+        try:
+            frames, oss_download_ms, oss_download_stats = self._servicer._download_request_images(
+                job.images,
+                device_id=job.device_id,
+                batch_id=job.batch_id,
+            )
+            if len(frames) != len(job.images):
+                raise RuntimeError(f"expected {len(job.images)} downloaded frames, got {len(frames)}")
+
+            engine_index, engine, stream_key, engine_inflight = self._servicer._acquire_engine(
+                job.device_id,
+                job.batch_id,
+            )
+            engine_start = time.perf_counter()
+            try:
+                if self._servicer._dynamic_batching:
+                    if not (0 <= engine_index < len(self._servicer._dynamic_batchers)):
+                        raise RuntimeError(f"dynamic batcher missing for model-{engine_index}")
+                    model_future = self._servicer._dynamic_batchers[engine_index].submit_async(
+                        stream_key=stream_key,
+                        frames=frames,
+                    )
+                else:
+                    model_future = Future()
+                    try:
+                        model_future.set_result(engine.infer_batch(frames))
+                    except Exception as exc:
+                        model_future.set_exception(exc)
+                model_future.add_done_callback(
+                    lambda completed: self._on_model_done(
+                        job=job,
+                        images=job.images,
+                        model_future=completed,
+                        engine_index=engine_index,
+                        engine_inflight=engine_inflight,
+                        engine_start=engine_start,
+                        oss_download_ms=oss_download_ms,
+                        oss_download_stats=oss_download_stats,
+                    )
+                )
+            except Exception:
+                self._servicer._release_engine(engine_index)
+                raise
+        except Exception as exc:
+            logging.exception(
+                "Async infer model stage failed before dispatch: device_id=%s batch_id=%s sequence_id=%d",
+                job.device_id,
+                job.batch_id,
+                job.sequence_id,
+            )
+            self._mark_model_stage_done(job)
+            self._publish_error_and_complete(job, str(exc))
+
+    def _on_model_done(
+        self,
+        *,
+        job: _AsyncInferJob,
+        images: list,
+        model_future: Future,
+        engine_index: int,
+        engine_inflight: str,
+        engine_start: float,
+        oss_download_ms: int,
+        oss_download_stats: dict[str, int],
+    ) -> None:
+        engine_infer_ms = int((time.perf_counter() - engine_start) * 1000)
+        try:
+            results = model_future.result()
+            if len(results) != len(images):
+                raise RuntimeError(f"expected {len(images)} results for {len(images)} inputs, got {len(results)}")
+            self._servicer._annotate_result_capture_timestamps(job.device_id, images, results)
+        except Exception as exc:
+            logging.exception(
+                "Async infer model stage failed: device_id=%s batch_id=%s sequence_id=%d instance=%d",
+                job.device_id,
+                job.batch_id,
+                job.sequence_id,
+                engine_index,
+            )
+            self._servicer._release_engine(engine_index)
+            self._mark_model_stage_done(job)
+            self._publish_error_and_complete(job, str(exc))
+            return
+
+        self._servicer._release_engine(engine_index)
+        self._mark_model_stage_done(job)
+        self._result_executor.submit(
+            self._upload_and_publish,
+            job,
+            results,
+            oss_download_ms,
+            oss_download_stats,
+            engine_infer_ms,
+            engine_inflight,
+        )
+
+    def _result_message_from_dict(self, result: dict, fallback_output_index: int) -> ai_pb2.InferResult:
+        kind_map = {
+            "interpolated": ai_pb2.RESULT_KIND_INTERPOLATED,
+            "current": ai_pb2.RESULT_KIND_CURRENT,
+        }
+        try:
+            input_index = int(result.get("input_index", -1))
+        except (TypeError, ValueError):
+            input_index = -1
+        try:
+            capture_timestamp_ms = max(0, int(result.get("capture_timestamp_ms", 0) or 0))
+        except (TypeError, ValueError):
+            capture_timestamp_ms = 0
+        result_message = ai_pb2.InferResult(
+            frame_id=result.get("frame_id", ""),
+            capture_timestamp_ms=capture_timestamp_ms,
+            pseudo_color_image=result.get("pseudo_color_image", b""),
+            skeleton_contour_image=result.get("skeleton_contour_image", b""),
+            pseudo_color_image_format=result.get("pseudo_color_image_format", ""),
+            skeleton_contour_image_format=result.get("skeleton_contour_image_format", "png"),
+            pseudo_color_object_key=result.get("pseudo_color_object_key", ""),
+            skeleton_contour_object_key=result.get("skeleton_contour_object_key", ""),
+            person_count=int(result.get("person_count", 0)),
+            processing_time_ms=int(result.get("processing_time_ms", 0)),
+            result_kind=kind_map.get(result.get("result_kind"), ai_pb2.RESULT_KIND_UNSPECIFIED),
+            input_index=input_index,
+            output_index=int(result.get("output_index", fallback_output_index)),
+        )
+        if not self._servicer._null_qualitative_results:
+            result_message.person_status = str(result.get("person_status", "") or "")
+            result_message.person_distance = str(result.get("person_distance", "") or "")
+            result_message.action_level = str(result.get("action_level", "") or "")
+        return result_message
+
+    def _upload_and_publish(
+        self,
+        job: _AsyncInferJob,
+        results: list[dict],
+        oss_download_ms: int,
+        oss_download_stats: dict[str, int],
+        engine_infer_ms: int,
+        engine_inflight: str,
+    ) -> None:
+        try:
+            oss_upload_ms, oss_upload_stats = self._servicer._upload_result_images(
+                device_id=job.device_id,
+                batch_id=job.batch_id,
+                results=results,
+            )
+            event = ai_pb2.InferResultEvent(
+                device_id=job.device_id,
+                batch_id=job.batch_id,
+                sequence_id=job.sequence_id,
+                processing_time_ms=int((time.perf_counter() - job.accepted_at) * 1000),
+            )
+            for output_index, result in enumerate(results):
+                event.results.append(self._result_message_from_dict(result, output_index))
+            self.result_hub.publish(event)
+            logging.info(
+                (
+                    "Async infer result published: device_id=%s batch_id=%s sequence_id=%d "
+                    "inputs=%d results=%d oss_download_ms=%d oss_download_count=%d "
+                    "engine_infer_ms=%d oss_upload_ms=%d oss_upload_count=%d "
+                    "processing_time_ms=%d engine_inflight=%s"
+                ),
+                job.device_id,
+                job.batch_id,
+                job.sequence_id,
+                len(job.images),
+                len(results),
+                oss_download_ms,
+                oss_download_stats.get("count", 0),
+                engine_infer_ms,
+                oss_upload_ms,
+                oss_upload_stats.get("count", 0),
+                event.processing_time_ms,
+                engine_inflight,
+            )
+        except Exception as exc:
+            logging.exception(
+                "Async infer output upload failed: device_id=%s batch_id=%s sequence_id=%d",
+                job.device_id,
+                job.batch_id,
+                job.sequence_id,
+            )
+            self._publish_error(job, str(exc))
+        finally:
+            self._mark_result_done(job)
+
+    def _publish_error(self, job: _AsyncInferJob, error_message: str) -> None:
+        event = ai_pb2.InferResultEvent(
+            device_id=job.device_id,
+            batch_id=job.batch_id,
+            sequence_id=job.sequence_id,
+            processing_time_ms=int((time.perf_counter() - job.accepted_at) * 1000),
+            error_message=error_message,
+        )
+        self.result_hub.publish(event)
+
+    def _publish_error_and_complete(self, job: _AsyncInferJob, error_message: str) -> None:
+        self._publish_error(job, error_message)
+        self._mark_result_done(job)
+
+
 class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
     def __init__(
         self,
@@ -333,6 +768,11 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         dynamic_max_batch_size: int = 80,
         dynamic_max_wait_ms: int = 300,
         dynamic_max_queue_size: int = 2000,
+        async_infer: bool = False,
+        async_device_window: int = 3,
+        async_result_buffer_size: int = 1000,
+        async_prepare_workers: int = 8,
+        async_result_workers: int = 8,
         oss_config: ObjectStorageConfig | None = None,
         oss_workers: int | None = 4,
         oss_download_workers: int | None = None,
@@ -355,6 +795,12 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         self._dynamic_max_wait_ms = max(0, int(dynamic_max_wait_ms))
         self._dynamic_max_queue_size = max(1, int(dynamic_max_queue_size))
         self._dynamic_batchers: list[_DynamicInferBatcher] = []
+        self._async_infer = bool(async_infer)
+        self._async_device_window = max(1, int(async_device_window))
+        self._async_result_buffer_size = max(1, int(async_result_buffer_size))
+        self._async_prepare_workers = max(1, int(async_prepare_workers))
+        self._async_result_workers = max(1, int(async_result_workers))
+        self._async_manager: _AsyncInferenceManager | None = None
         self._capture_timestamp_lock = threading.Lock()
         self._last_capture_timestamp_by_device: dict[str, int] = {}
         self._oss_config = oss_config
@@ -470,6 +916,26 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
                 self._dynamic_max_batch_size,
                 self._dynamic_max_wait_ms,
                 self._dynamic_max_queue_size,
+            )
+        if self._async_infer:
+            if not self._dynamic_batching:
+                logging.warning("Async inference enabled without dynamic batching; throughput benefit may be limited")
+            self._async_manager = _AsyncInferenceManager(
+                servicer=self,
+                device_window=self._async_device_window,
+                result_buffer_size=self._async_result_buffer_size,
+                prepare_workers=self._async_prepare_workers,
+                result_workers=self._async_result_workers,
+            )
+            logging.info(
+                (
+                    "Async inference enabled: device_window=%d result_buffer_size=%d "
+                    "prepare_workers=%d result_workers=%d"
+                ),
+                self._async_device_window,
+                self._async_result_buffer_size,
+                self._async_prepare_workers,
+                self._async_result_workers,
             )
 
     def _prune_stale_device_bindings(self, now: float) -> None:
@@ -683,6 +1149,11 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         batch_id: str,
         results: list[dict],
     ) -> tuple[int, dict[str, int]]:
+        for result in results:
+            result["pseudo_color_image"] = b""
+            result["pseudo_color_image_format"] = ""
+            result["pseudo_color_object_key"] = ""
+
         if self._oss_client is None or self._oss_config is None:
             return 0, _ObjectStorageStageStats().summary()
 
@@ -692,7 +1163,7 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
 
         def build_upload_task(result_index: int, image_name: str) -> dict:
             result = results[result_index]
-            data_key = "pseudo_color_image" if image_name == "pseudo_color" else "skeleton_contour_image"
+            data_key = "skeleton_contour_image"
             format_key = f"{data_key}_format"
             object_key_field = f"{image_name}_object_key"
             image_data = bytes(result.get(data_key, b"") or b"")
@@ -769,10 +1240,11 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
 
         futures = []
         future_tasks = {}
-        executor = ThreadPoolExecutor(max_workers=self._oss_concurrency(len(results) * 2, self._oss_upload_workers))
+        upload_image_names = ("skeleton_contour",)
+        executor = ThreadPoolExecutor(max_workers=self._oss_concurrency(len(results), self._oss_upload_workers))
         try:
             for result_index in range(len(results)):
-                for image_name in ("pseudo_color", "skeleton_contour"):
+                for image_name in upload_image_names:
                     task = build_upload_task(result_index, image_name)
                     results[result_index][task["object_key_field"]] = task["object_key"]
                     results[result_index][task["data_key"]] = b""
@@ -818,6 +1290,70 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
             return int((time.perf_counter() - upload_start) * 1000), summary
         finally:
             executor.shutdown(wait=self._oss_upload_wait_timeout_ms <= 0, cancel_futures=False)
+
+    def SubmitFrames(self, request, context):
+        device_id = getattr(request, "device_id", "")
+        batch_id = getattr(request, "batch_id", "")
+        sequence_id = int(getattr(request, "sequence_id", 0) or 0)
+        if self._async_manager is None:
+            context.set_details("async inference is disabled; start server with --async-infer")
+            context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+            return ai_pb2.SubmitFramesResponse(
+                device_id=device_id,
+                batch_id=batch_id,
+                sequence_id=sequence_id,
+                accepted=False,
+                message="async_infer_disabled",
+            )
+        try:
+            return self._async_manager.submit(request)
+        except ValueError as exc:
+            context.set_details(str(exc))
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            return ai_pb2.SubmitFramesResponse(
+                device_id=device_id,
+                batch_id=batch_id,
+                sequence_id=sequence_id,
+                accepted=False,
+                message=str(exc),
+            )
+        except Exception as exc:
+            logging.exception("SubmitFrames failed: device_id=%s batch_id=%s sequence_id=%s", device_id, batch_id, sequence_id)
+            context.set_details(str(exc))
+            context.set_code(grpc.StatusCode.INTERNAL)
+            return ai_pb2.SubmitFramesResponse(
+                device_id=device_id,
+                batch_id=batch_id,
+                sequence_id=sequence_id,
+                accepted=False,
+                message=str(exc),
+            )
+
+    def SubscribeResults(self, request, context):
+        if self._async_manager is None:
+            context.set_details("async inference is disabled; start server with --async-infer")
+            context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+            return
+
+        device_ids = {
+            str(device_id or "").strip()
+            for device_id in getattr(request, "device_ids", [])
+            if str(device_id or "").strip()
+        }
+        consumer_id = str(getattr(request, "consumer_id", "") or "").strip() or "anonymous"
+        logging.info(
+            "Result subscriber connected: consumer_id=%s device_filter=%s",
+            consumer_id,
+            ",".join(sorted(device_ids)) if device_ids else "*",
+        )
+        try:
+            for event in self._async_manager.result_hub.subscribe(device_ids=device_ids, context=context):
+                yield event
+        except Exception:
+            logging.exception("Result subscriber failed: consumer_id=%s", consumer_id)
+            raise
+        finally:
+            logging.info("Result subscriber disconnected: consumer_id=%s", consumer_id)
 
     def Infer(self, request, context):
         device_id = getattr(request, 'device_id', '')
@@ -908,7 +1444,7 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
                 capture_timestamp_ms=capture_timestamp_ms,
                 pseudo_color_image=result.get('pseudo_color_image', b''),
                 skeleton_contour_image=result.get('skeleton_contour_image', b''),
-                pseudo_color_image_format=result.get('pseudo_color_image_format', 'png'),
+                pseudo_color_image_format=result.get('pseudo_color_image_format', ''),
                 skeleton_contour_image_format=result.get('skeleton_contour_image_format', 'png'),
                 pseudo_color_object_key=result.get('pseudo_color_object_key', ''),
                 skeleton_contour_object_key=result.get('skeleton_contour_object_key', ''),
@@ -1016,6 +1552,11 @@ def serve(
     dynamic_max_batch_size: int = 80,
     dynamic_max_wait_ms: int = 300,
     dynamic_max_queue_size: int = 2000,
+    async_infer: bool = False,
+    async_device_window: int = 3,
+    async_result_buffer_size: int = 1000,
+    async_prepare_workers: int = 8,
+    async_result_workers: int = 8,
     oss_config: ObjectStorageConfig | None = None,
     oss_workers: int | None = 4,
     oss_download_workers: int | None = None,
@@ -1075,6 +1616,11 @@ def serve(
             dynamic_max_batch_size=dynamic_max_batch_size,
             dynamic_max_wait_ms=dynamic_max_wait_ms,
             dynamic_max_queue_size=dynamic_max_queue_size,
+            async_infer=async_infer,
+            async_device_window=async_device_window,
+            async_result_buffer_size=async_result_buffer_size,
+            async_prepare_workers=async_prepare_workers,
+            async_result_workers=async_result_workers,
             oss_config=oss_config,
             oss_workers=oss_workers,
             oss_download_workers=oss_download_workers,
@@ -1120,7 +1666,9 @@ def serve(
             'ir_preprocess=%s, model_input_size=%d, person_fill_background=%s, person_fill_background_blend=%.3f, '
             'pose_status_thigh_torso_ratio_threshold=%.3f, depth_distance_close_threshold=%.3f, ir_distance_close_gap_ratio=%.3f, '
             'ir_distance_close_center_ratio=%.3f, dynamic_batching=%s, dynamic_max_batch_size=%d, '
-            'dynamic_max_wait_ms=%d, dynamic_max_queue_size=%d)'
+            'dynamic_max_wait_ms=%d, dynamic_max_queue_size=%d, async_infer=%s, '
+            'async_device_window=%d, async_result_buffer_size=%d, async_prepare_workers=%d, '
+            'async_result_workers=%d)'
         ),
         bound_address,
         max_msg_mb,
@@ -1142,6 +1690,11 @@ def serve(
         dynamic_max_batch_size,
         dynamic_max_wait_ms,
         dynamic_max_queue_size,
+        "true" if async_infer else "false",
+        async_device_window,
+        async_result_buffer_size,
+        async_prepare_workers,
+        async_result_workers,
     )
     server.start()
     try:
@@ -1340,6 +1893,35 @@ def main():
         help='maximum queued frames per model instance before rejecting new requests',
     )
     parser.add_argument(
+        '--async-infer',
+        action='store_true',
+        help='enable SubmitFrames/SubscribeResults asynchronous inference RPCs',
+    )
+    parser.add_argument(
+        '--async-device-window',
+        default=3,
+        type=int,
+        help='maximum accepted but unfinished batches per device_id for async inference',
+    )
+    parser.add_argument(
+        '--async-result-buffer-size',
+        default=1000,
+        type=int,
+        help='maximum recent async result events retained for active subscribers',
+    )
+    parser.add_argument(
+        '--async-prepare-workers',
+        default=8,
+        type=int,
+        help='background workers for async input download and model dispatch',
+    )
+    parser.add_argument(
+        '--async-result-workers',
+        default=8,
+        type=int,
+        help='background workers for async output upload and result publication',
+    )
+    parser.add_argument(
         '--null-qualitative-results',
         action='store_true',
         help='omit unvalidated qualitative fields: person_status, person_distance, and action_level',
@@ -1459,6 +2041,11 @@ def main():
         dynamic_max_batch_size=args.dynamic_max_batch_size,
         dynamic_max_wait_ms=args.dynamic_max_wait_ms,
         dynamic_max_queue_size=args.dynamic_max_queue_size,
+        async_infer=args.async_infer,
+        async_device_window=args.async_device_window,
+        async_result_buffer_size=args.async_result_buffer_size,
+        async_prepare_workers=args.async_prepare_workers,
+        async_result_workers=args.async_result_workers,
         oss_config=oss_config,
         oss_workers=args.oss_workers,
         oss_download_workers=args.oss_download_workers,

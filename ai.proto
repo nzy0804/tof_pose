@@ -5,6 +5,8 @@ option go_package = "./proto;proto";
 
 service ModelService {
   rpc Infer(InferRequest) returns (InferResponse);
+  rpc SubmitFrames(SubmitFramesRequest) returns (SubmitFramesResponse);
+  rpc SubscribeResults(ResultSubscribeRequest) returns (stream InferResultEvent);
 }
 
 enum ResultKind {
@@ -23,16 +25,21 @@ message InferImage {
 message InferResult {
   string frame_id = 1;
   int64 capture_timestamp_ms = 2;
+  // Deprecated: pseudo-color result images are no longer generated.
   bytes pseudo_color_image = 3 [deprecated = true];
-  bytes skeleton_contour_image = 4 [deprecated = true];
+  // 100x100 skeleton/contour result image. In OSS mode use skeleton_contour_object_key.
+  bytes skeleton_contour_image = 4;
   int32 person_count = 5;
   int32 processing_time_ms = 6;
   ResultKind result_kind = 7;
   int32 input_index = 8;
   int32 output_index = 9;
+  // Deprecated: pseudo-color result images are no longer generated.
   string pseudo_color_image_format = 10 [deprecated = true];
-  string skeleton_contour_image_format = 11 [deprecated = true];
-  string pseudo_color_object_key = 12;
+  string skeleton_contour_image_format = 11;
+  // Deprecated: pseudo-color result images are no longer uploaded.
+  string pseudo_color_object_key = 12 [deprecated = true];
+  // OSS key for the only uploaded result image: 100x100 skeleton/contour.
   string skeleton_contour_object_key = 13;
   string person_status = 14;
   string person_distance = 15;
@@ -51,4 +58,37 @@ message InferResponse {
   string batch_id = 2;
   repeated InferResult results = 3;
   int32 processing_time_ms = 4;
+}
+
+message SubmitFramesRequest {
+  string device_id = 1;
+  string batch_id = 2;
+  int64 sequence_id = 3;
+  repeated InferImage images = 4;
+  int32 batch_size = 5;
+}
+
+message SubmitFramesResponse {
+  string device_id = 1;
+  string batch_id = 2;
+  int64 sequence_id = 3;
+  bool accepted = 4;
+  int32 accepted_count = 5;
+  int32 device_inflight_batches = 6;
+  int32 retry_after_ms = 7;
+  string message = 8;
+}
+
+message ResultSubscribeRequest {
+  repeated string device_ids = 1;
+  string consumer_id = 2;
+}
+
+message InferResultEvent {
+  string device_id = 1;
+  string batch_id = 2;
+  int64 sequence_id = 3;
+  repeated InferResult results = 4;
+  int32 processing_time_ms = 5;
+  string error_message = 6;
 }

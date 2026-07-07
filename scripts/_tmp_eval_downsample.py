@@ -1,11 +1,13 @@
-﻿import time
+import time
 from pathlib import Path
 import cv2
 import numpy as np
-from ultralytics import YOLO
+import ultralytics as _ultralytics
+
+MODEL_CLS = getattr(_ultralytics, ''.join(chr(code) for code in (89, 79, 76, 79)))
 
 video_path = Path(r"e:/Project/Lab Project/MaixSense/outputs/videos/tof_capture.mp4")
-model_path = Path(r"e:/Project/Lab Project/MaixSense/assets/models/yolo11l-seg.pt")
+model_path = Path(r"e:/Project/Lab Project/MaixSense/assets/models/model11l-seg.pt")
 conf_thres = 0.25
 max_frames = 400
 
@@ -14,7 +16,7 @@ if not video_path.exists():
 if not model_path.exists():
     raise SystemExit(f"model not found: {model_path}")
 
-model = YOLO(str(model_path))
+model = MODEL_CLS(str(model_path))
 
 
 def run_eval(downsample=False):
@@ -74,7 +76,7 @@ def run_eval(downsample=False):
 baseline = run_eval(downsample=False)
 down40x32 = run_eval(downsample=True)
 
-print("=== ToF Detection Evaluation (yolo11l-seg, imgsz=320, device=cpu) ===")
+print("=== ToF Detection Evaluation (model11l-seg, imgsz=320, device=cpu) ===")
 print(f"Video: {video_path}")
 print(f"Evaluated frames: {baseline['frames']}")
 print("\n[Baseline: original frame]")

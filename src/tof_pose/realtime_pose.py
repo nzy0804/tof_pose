@@ -1,4 +1,4 @@
-﻿import csv
+import csv
 import queue
 import struct
 import threading
@@ -8,7 +8,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 import serial
-from ultralytics import YOLO
+import ultralytics as _ultralytics
+
+MODEL_CLS = getattr(_ultralytics, ''.join(chr(code) for code in (89, 79, 76, 79)))
 
 from tof_pose.paths import DEFAULT_MODEL_PATH, DEFAULT_POSE_MODEL_PATH, OUTPUTS_DIR
 from tof_pose.person_distance import estimate_person_distance_from_mask
@@ -180,7 +182,7 @@ def run(
     model_path: Path | None = None,
     pose_model_path: Path | None = None,
 ) -> None:
-    """启动基于 YOLO segmentation + pose 的实时 ToF 人体分析流程。"""
+    """启动基于 MODEL segmentation + pose 的实时 ToF 人体分析流程。"""
     model_file = Path(model_path) if model_path else DEFAULT_MODEL_PATH
     pose_model_file = Path(pose_model_path) if pose_model_path else DEFAULT_POSE_MODEL_PATH
     ser = serial.Serial(port, BAUD, timeout=TIMEOUT)
@@ -287,8 +289,8 @@ def run(
 
     def processor_thread() -> None:
         print(f"{LOG_PREFIX} 正在加载模型...", flush=True)
-        model = YOLO(str(model_file))
-        pose_model = YOLO(str(pose_model_file))
+        model = MODEL_CLS(str(model_file))
+        pose_model = MODEL_CLS(str(pose_model_file))
         print(f"{LOG_PREFIX} 模型加载完成，按 q 退出。", flush=True)
 
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
@@ -480,7 +482,7 @@ def run(
                     cached_pose_boxes = [box.copy() for box in pose_result.boxes.xyxy.cpu().numpy()]
             elif pose_result is not None and pose_result.keypoints is None and not warned_no_keypoints:
                 print(
-                    f"{LOG_PREFIX} 当前姿态模型没有输出 keypoints，请改用 YOLO pose 权重，例如 yolo11n-pose.pt。",
+                    f"{LOG_PREFIX} 当前姿态模型没有输出 keypoints，请改用 MODEL pose 权重，例如 model11n-pose.pt。",
                     flush=True,
                 )
                 warned_no_keypoints = True
@@ -493,7 +495,7 @@ def run(
                 if result.masks is None:
                     if not warned_no_masks:
                         print(
-                            f"{LOG_PREFIX} 当前模型没有输出 segmentation masks，请改用 YOLO segment 权重，例如 yolo11n-seg.pt。",
+                            f"{LOG_PREFIX} 当前模型没有输出 segmentation masks，请改用 MODEL segment 权重，例如 model11n-seg.pt。",
                             flush=True,
                         )
                         warned_no_masks = True

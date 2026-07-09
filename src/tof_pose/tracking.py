@@ -123,6 +123,13 @@ class KalmanFilterBoxDistance:
             return None
         return float(self.state[4])
 
+    def copy(self) -> "KalmanFilterBoxDistance":
+        copied = object.__new__(KalmanFilterBoxDistance)
+        copied.state = self.state.copy()
+        copied.covariance = self.covariance.copy()
+        copied.has_distance = bool(self.has_distance)
+        return copied
+
 
 @dataclass
 class Track:
@@ -141,6 +148,23 @@ class Track:
     missed_frames: int = 0
     last_timestamp: float | None = None
     hits: int = 1
+
+    def copy(self) -> "Track":
+        return Track(
+            track_id=int(self.track_id),
+            kf=self.kf.copy(),
+            box=self.box.copy(),
+            keypoints=self.keypoints.copy(),
+            kpt_conf=self.kpt_conf.copy(),
+            smoothed_keypoints=self.smoothed_keypoints.copy(),
+            smoothed_kpt_conf=self.smoothed_kpt_conf.copy(),
+            distance=self.distance,
+            predicted_box=self.predicted_box.copy(),
+            predicted_distance=self.predicted_distance,
+            missed_frames=int(self.missed_frames),
+            last_timestamp=self.last_timestamp,
+            hits=int(self.hits),
+        )
 
 
 def box_to_measurement(box: np.ndarray) -> tuple[float, float, float, float]:
@@ -244,6 +268,19 @@ class PersonTracker:
         self.next_track_id = 1
         self.tracks: list[Track] = []
 
+    def copy(self) -> "PersonTracker":
+        copied = PersonTracker(
+            max_missed_frames=self.max_missed_frames,
+            min_iou=self.min_iou,
+            max_center_distance=self.max_center_distance,
+            max_keypoint_distance=self.max_keypoint_distance,
+            max_distance_gap=self.max_distance_gap,
+            max_match_cost=self.max_match_cost,
+        )
+        copied.next_track_id = int(self.next_track_id)
+        copied.tracks = [track.copy() for track in self.tracks]
+        return copied
+
     def update(self, detections: list[Detection], timestamp: float | None = None) -> list[int]:
         """用当前帧人体观测更新追踪器状态，并返回稳定的人体 ID。"""
         current_time = timestamp
@@ -264,8 +301,8 @@ class PersonTracker:
                 iou = compute_iou(track.predicted_box, detection.box)
                 center_distance = compute_center_distance(track.predicted_box, detection.box)
                 keypoint_distance = compute_keypoint_distance(
-                    track.keypoints,
-                    track.kpt_conf,
+                    track.smoothed_keypoints,
+                    track.smoothed_kpt_conf,
                     detection.keypoints,
                     detection.kpt_conf,
                 )

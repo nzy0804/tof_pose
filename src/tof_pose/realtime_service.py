@@ -19,6 +19,7 @@ MODEL_CLS = getattr(_ultralytics, ''.join(chr(code) for code in (89, 79, 76, 79)
 from tof_pose.paths import DEFAULT_MODEL_PATH, DEFAULT_POSE_MODEL_PATH
 from tof_pose.person_distance import estimate_person_distance_from_mask, extract_draw_contour_from_mask
 from tof_pose.pose_drawing import draw_stick_figure
+from tof_pose.tracking import Detection, PersonTracker
 
 
 LOGGER = logging.getLogger(__name__)
@@ -65,27 +66,34 @@ MASK_MIN_AREA_RATIO = 0.003
 MASK_MAX_AREA_RATIO = 0.9
 MASK_AREA_JUMP_RATIO = 1.5
 MASK_JUMP_HOLD_FRAMES = 2
-DEPTH_PERSON_DISTANCE_CLOSE_THRESHOLD = 150.0
-PERSON_DISTANCE_CLOSE_GAP_RATIO = 0.15
-PERSON_DISTANCE_CLOSE_CENTER_RATIO = 0.50
+DEPTH_PERSON_DISTANCE_CLOSE_THRESHOLD = 100.0
+PERSON_DISTANCE_CLOSE_GAP_RATIO = 0.06
+PERSON_DISTANCE_CLOSE_CENTER_RATIO = 0.30
 QUALITATIVE_KPT_CONF_THRESHOLD = 0.35
 POSE_STATUS_MIN_TORSO_Y_PX = 20.0
 POSE_STATUS_MIN_THIGH_Y_PX = 12.0
 POSE_STATUS_THIGH_TORSO_RATIO_THRESHOLD = 0.65
 POSE_BATCH_REUSE_MIN_VALID_RATIO = 0.45
 POSE_BATCH_REUSE_MAX_GAP = 1
-ACTION_KEYPOINT_SHIFT_HIGH_RATIO = 0.056
-ACTION_KEYPOINT_SHIFT_PEAK_HIGH_RATIO = 0.088
-ACTION_BOX_CENTER_SHIFT_HIGH_RATIO = 0.056
-ACTION_BOX_AREA_SHIFT_HIGH_RATIO = 0.05
+ACTION_KEYPOINT_SHIFT_HIGH_RATIO = 0.025
+ACTION_KEYPOINT_SHIFT_PEAK_HIGH_RATIO = 0.045
+ACTION_BOX_CENTER_SHIFT_HIGH_RATIO = 0.025
+ACTION_BOX_AREA_SHIFT_HIGH_RATIO = 0.025
 ACTION_MOTION_WINDOW_FRAMES = 8
-ACTION_MOTION_WINDOW_HIGH_RATIO = 0.40
+ACTION_MOTION_WINDOW_HIGH_RATIO = 0.25
 ACTION_HIGH_CONFIRM_FRAMES = 2
 QUALITATIVE_STABILITY_WINDOW_FRAMES = 8
 QUALITATIVE_STABILITY_MIN_CONFIRM_FRAMES = 3
 QUALITATIVE_STABILITY_SWITCH_RATIO = 0.60
 POSE_FALLBACK_KPT_CONF_THRESHOLD = 0.45
 POSE_FALLBACK_MIN_POINTS = 7
+PERSON_DUPLICATE_KPT_CLOSE_COUNT = 4
+PERSON_DUPLICATE_KPT_CLOSE_RATIO = 0.03
+PERSON_DUPLICATE_KPT_CLOSE_MIN_PX = 3.0
+PERSON_DUPLICATE_MASK_CONTAIN_RATIO = 0.85
+PERSON_DUPLICATE_MASK_MIN_AREA_RATIO = 0.15
+PERSON_DUPLICATE_MASK_CENTER_RATIO = 0.25
+PERSON_DUPLICATE_MASK_CENTER_MIN_PX = 8.0
 QUALITATIVE_RESULT_KEYS = ("person_status", "person_distance", "action_level")
 PERSON_FILL_BACKGROUND_DEFAULT = "bg_08_dark_frost_reference.png"
 PERSON_FILL_BACKGROUND_NAMES = (
@@ -119,6 +127,7 @@ _CPU_PROCESS_POOLS: dict[tuple[int, str], ProcessPoolExecutor] = {}
 _CPU_PROCESS_POOLS_LOCK = threading.Lock()
 _WORKER_CLAHE = None
 _PERSON_FILL_BACKGROUND_CACHE: dict[str, np.ndarray] = {}
+_PERSON_FILL_BACKGROUND_GRAY_CACHE: dict[tuple[str, int, int], np.ndarray] = {}
 
 
 def _elapsed_ms(start: float) -> int:
@@ -522,6 +531,200 @@ def _match_pose_to_seg_tracks(
     return matched
 
 
+def _empty_keypoint_arrays(
+    kpt_xy_np: np.ndarray | None,
+    kpt_conf_np: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    if kpt_xy_np is not None and kpt_conf_np is not None and len(kpt_xy_np) > 0 and len(kpt_conf_np) > 0:
+        return np.zeros_like(kpt_xy_np[0], dtype=np.float32), np.zeros_like(kpt_conf_np[0], dtype=np.float32)
+    return np.zeros((0, 2), dtype=np.float32), np.zeros((0,), dtype=np.float32)
+
+
+def _person_duplicate_kpt_threshold(width: int, height: int) -> float:
+    base = max(1.0, float(min(int(width), int(height))))
+    return max(PERSON_DUPLICATE_KPT_CLOSE_MIN_PX, base * PERSON_DUPLICATE_KPT_CLOSE_RATIO)
+
+
+def _same_keypoint_close_count(
+    kpt_xy_a: np.ndarray | None,
+    kpt_conf_a: np.ndarray | None,
+    kpt_xy_b: np.ndarray | None,
+    kpt_conf_b: np.ndarray | None,
+    *,
+    threshold_px: float,
+    conf_threshold: float,
+    required_count: int = PERSON_DUPLICATE_KPT_CLOSE_COUNT,
+) -> int:
+    if kpt_xy_a is None or kpt_conf_a is None or kpt_xy_b is None or kpt_conf_b is None:
+        return 0
+
+    xy_a = np.asarray(kpt_xy_a, dtype=np.float32)
+    xy_b = np.asarray(kpt_xy_b, dtype=np.float32)
+    conf_a = np.asarray(kpt_conf_a, dtype=np.float32)
+    conf_b = np.asarray(kpt_conf_b, dtype=np.float32)
+    usable = min(len(xy_a), len(xy_b), len(conf_a), len(conf_b))
+    if usable <= 0:
+        return 0
+
+    close_count = 0
+    for idx in range(usable):
+        if float(conf_a[idx]) < conf_threshold or float(conf_b[idx]) < conf_threshold:
+            continue
+        point_a = xy_a[idx]
+        point_b = xy_b[idx]
+        if point_a.shape[0] < 2 or point_b.shape[0] < 2:
+            continue
+        if not (np.isfinite(point_a[:2]).all() and np.isfinite(point_b[:2]).all()):
+            continue
+        if float(np.linalg.norm(point_a[:2] - point_b[:2])) <= threshold_px:
+            close_count += 1
+            if close_count >= required_count:
+                return close_count
+    return close_count
+
+
+def _record_mask_area(record: dict) -> int:
+    mask = record.get("mask")
+    if isinstance(mask, np.ndarray):
+        return int(np.count_nonzero(mask))
+    return 0
+
+
+def _prefer_duplicate_record(candidate: dict, incumbent: dict) -> bool:
+    candidate_area = _record_mask_area(candidate)
+    incumbent_area = _record_mask_area(incumbent)
+    if candidate_area != incumbent_area:
+        return candidate_area > incumbent_area
+    return float(candidate.get("person_conf") or 0.0) > float(incumbent.get("person_conf") or 0.0)
+
+
+def _mask_containment_duplicate_stats(record_a: dict, record_b: dict) -> tuple[bool, float, float]:
+    mask_a = record_a.get("mask")
+    mask_b = record_b.get("mask")
+    if not isinstance(mask_a, np.ndarray) or not isinstance(mask_b, np.ndarray):
+        return False, 0.0, 0.0
+    if mask_a.shape[:2] != mask_b.shape[:2]:
+        return False, 0.0, 0.0
+
+    area_a = _record_mask_area(record_a)
+    area_b = _record_mask_area(record_b)
+    if area_a <= 0 or area_b <= 0:
+        return False, 0.0, 0.0
+
+    if area_a >= area_b:
+        big_record, small_record = record_a, record_b
+        big_area, small_area = area_a, area_b
+    else:
+        big_record, small_record = record_b, record_a
+        big_area, small_area = area_b, area_a
+
+    area_ratio = float(small_area) / max(float(big_area), 1.0)
+    if area_ratio < PERSON_DUPLICATE_MASK_MIN_AREA_RATIO:
+        return False, 0.0, area_ratio
+
+    big_mask = np.asarray(big_record["mask"]) > 0
+    small_mask = np.asarray(small_record["mask"]) > 0
+    contained_ratio = float(np.count_nonzero(big_mask & small_mask)) / max(float(small_area), 1.0)
+    if contained_ratio < PERSON_DUPLICATE_MASK_CONTAIN_RATIO:
+        return False, contained_ratio, area_ratio
+
+    big_box = np.asarray(big_record.get("box"), dtype=np.float32)
+    small_box = np.asarray(small_record.get("box"), dtype=np.float32)
+    if big_box.size < 4 or small_box.size < 4:
+        return False, contained_ratio, area_ratio
+    center_limit = max(
+        PERSON_DUPLICATE_MASK_CENTER_MIN_PX,
+        _box_extent(big_box) * PERSON_DUPLICATE_MASK_CENTER_RATIO,
+    )
+    if _box_center_distance(big_box, small_box) > center_limit:
+        return False, contained_ratio, area_ratio
+
+    return True, contained_ratio, area_ratio
+
+
+def _dedupe_person_records(
+    records: list[dict],
+    *,
+    width: int,
+    height: int,
+    conf_threshold: float,
+) -> tuple[list[dict], list[str], list[str]]:
+    if len(records) <= 1:
+        return records, [], []
+
+    threshold_px = _person_duplicate_kpt_threshold(width, height)
+    kept: list[dict] = []
+    reject_reasons: list[str] = []
+    debug_summary: list[str] = []
+
+    for record in records:
+        duplicate_index: int | None = None
+        duplicate_close_count = 0
+        duplicate_reason = ""
+        duplicate_contained_ratio = 0.0
+        duplicate_area_ratio = 0.0
+        for kept_index, kept_record in enumerate(kept):
+            close_count = _same_keypoint_close_count(
+                kept_record.get("keypoints"),
+                kept_record.get("kpt_conf"),
+                record.get("keypoints"),
+                record.get("kpt_conf"),
+                threshold_px=threshold_px,
+                conf_threshold=conf_threshold,
+            )
+            if close_count >= PERSON_DUPLICATE_KPT_CLOSE_COUNT:
+                duplicate_index = kept_index
+                duplicate_close_count = close_count
+                duplicate_reason = "duplicate_kpt"
+                break
+
+            contained, contained_ratio, area_ratio = _mask_containment_duplicate_stats(kept_record, record)
+            if contained:
+                duplicate_index = kept_index
+                duplicate_reason = "duplicate_mask_contained"
+                duplicate_contained_ratio = contained_ratio
+                duplicate_area_ratio = area_ratio
+                break
+
+        if duplicate_index is None:
+            kept.append(record)
+            continue
+
+        reject_reasons.append(duplicate_reason)
+        incumbent = kept[duplicate_index]
+        kept_track_id = int(incumbent.get("track_id", -1))
+        dropped_track_id = int(record.get("track_id", -1))
+        if _prefer_duplicate_record(record, incumbent):
+            kept[duplicate_index] = record
+            kept_track_id, dropped_track_id = dropped_track_id, kept_track_id
+        if len(debug_summary) < 8:
+            if duplicate_reason == "duplicate_kpt":
+                debug_summary.append(
+                    f"duplicate_kpt:keep{kept_track_id}:drop{dropped_track_id}:n{duplicate_close_count}:thr{threshold_px:.1f}"
+                )
+            else:
+                debug_summary.append(
+                    f"duplicate_mask:keep{kept_track_id}:drop{dropped_track_id}:contain{duplicate_contained_ratio:.2f}:area{duplicate_area_ratio:.2f}"
+                )
+
+    return kept, reject_reasons, debug_summary
+
+
+def _rebuild_person_record_summaries(records: list[dict]) -> tuple[list[str], list[tuple[int, np.ndarray, float | None]]]:
+    tracked_labels: list[str] = []
+    pair_records: list[tuple[int, np.ndarray, float | None]] = []
+    for record in records:
+        track_id = int(record["track_id"])
+        box = np.asarray(record["box"], dtype=np.float32).copy()
+        distance = record.get("distance")
+        if distance is None:
+            tracked_labels.append(f"{track_id}:N/A")
+        else:
+            tracked_labels.append(f"{track_id}:{float(distance):.1f}")
+        pair_records.append((track_id, box, distance))
+    return tracked_labels, pair_records
+
+
 def _compute_pairwise_distances(
     records: list[tuple[int, np.ndarray, float | None]],
     frame_width: int,
@@ -828,7 +1031,7 @@ def _compute_person_distance_ir(
             separated_gap = float(np.hypot(horizontal_gap, vertical_gap))
             center_distance = _box_center_distance(box_a, box_b)
             avg_extent = (_box_extent(box_a) + _box_extent(box_b)) * 0.5
-            close_gap_px = max(float(width) * close_gap_ratio, avg_extent * 0.35)
+            close_gap_px = max(float(width) * close_gap_ratio, avg_extent * 0.20)
             if separated_gap <= close_gap_px or center_distance <= avg_extent * close_center_ratio:
                 return "close"
     return "far"
@@ -994,7 +1197,7 @@ def _resolve_person_fill_background_path(background: str | None) -> Path:
     return Path(__file__).resolve().parent / "assets" / path.name
 
 
-def _get_person_fill_background(width: int, height: int, background: str | None = None) -> np.ndarray:
+def _get_person_fill_background_gray(width: int, height: int, background: str | None = None) -> np.ndarray:
     normalized = _normalize_person_fill_background(background)
     cache_key = str(_resolve_person_fill_background_path(normalized))
     if cache_key not in _PERSON_FILL_BACKGROUND_CACHE:
@@ -1004,10 +1207,13 @@ def _get_person_fill_background(width: int, height: int, background: str | None 
             background = np.full((DISPLAY_SIZE[1], DISPLAY_SIZE[0], 3), PERSON_FILL_FALLBACK_GRAY, dtype=np.uint8)
         _PERSON_FILL_BACKGROUND_CACHE[cache_key] = background
 
-    background = _PERSON_FILL_BACKGROUND_CACHE[cache_key]
-    if background.shape[:2] != (height, width):
-        return cv2.resize(background, (width, height), interpolation=cv2.INTER_LINEAR)
-    return background
+    gray_key = (cache_key, int(width), int(height))
+    if gray_key not in _PERSON_FILL_BACKGROUND_GRAY_CACHE:
+        background = _PERSON_FILL_BACKGROUND_CACHE[cache_key]
+        if background.shape[:2] != (height, width):
+            background = cv2.resize(background, (width, height), interpolation=cv2.INTER_LINEAR)
+        _PERSON_FILL_BACKGROUND_GRAY_CACHE[gray_key] = cv2.cvtColor(background, cv2.COLOR_BGR2GRAY)
+    return _PERSON_FILL_BACKGROUND_GRAY_CACHE[gray_key]
 
 
 def _fill_person_mask_region(
@@ -1020,12 +1226,49 @@ def _fill_person_mask_region(
         return False
     if mask.shape[:2] != display.shape[:2]:
         mask = cv2.resize(mask, (display.shape[1], display.shape[0]), interpolation=cv2.INTER_NEAREST)
-    selected = mask > 0
+    ys, xs = np.nonzero(mask > 0)
+    if ys.size <= 0 or xs.size <= 0:
+        return False
+    x1 = int(xs.min())
+    x2 = int(xs.max()) + 1
+    y1 = int(ys.min())
+    y2 = int(ys.max()) + 1
+    return _fill_person_mask_region_roi(
+        display,
+        mask[y1:y2, x1:x2],
+        x1,
+        y1,
+        background,
+        background_blend,
+    )
+
+
+def _fill_person_mask_region_roi(
+    display: np.ndarray,
+    mask_roi: np.ndarray,
+    x: int,
+    y: int,
+    background: str | None = None,
+    background_blend: float | None = None,
+) -> bool:
+    if display.ndim != 3 or display.shape[2] != 3:
+        return False
+    height, width = display.shape[:2]
+    x1 = max(0, min(int(x), width))
+    y1 = max(0, min(int(y), height))
+    x2 = max(x1, min(x1 + int(mask_roi.shape[1]), width))
+    y2 = max(y1, min(y1 + int(mask_roi.shape[0]), height))
+    if x2 <= x1 or y2 <= y1:
+        return False
+    if mask_roi.shape[:2] != (y2 - y1, x2 - x1):
+        mask_roi = cv2.resize(mask_roi, (x2 - x1, y2 - y1), interpolation=cv2.INTER_NEAREST)
+    selected = mask_roi > 0
     if not np.any(selected):
         return False
-    fill_background = _get_person_fill_background(display.shape[1], display.shape[0], background)
-    original_gray = cv2.cvtColor(display, cv2.COLOR_BGR2GRAY)
-    background_gray = cv2.cvtColor(fill_background, cv2.COLOR_BGR2GRAY)
+
+    display_roi = display[y1:y2, x1:x2]
+    original_gray = cv2.cvtColor(display_roi, cv2.COLOR_BGR2GRAY)
+    background_gray = _get_person_fill_background_gray(width, height, background)[y1:y2, x1:x2]
     background_weight = _normalize_person_fill_background_blend(background_blend)
     blended_gray = cv2.addWeighted(
         background_gray,
@@ -1034,8 +1277,7 @@ def _fill_person_mask_region(
         1.0 - background_weight,
         0,
     )
-    blended_bgr = cv2.cvtColor(blended_gray, cv2.COLOR_GRAY2BGR)
-    display[selected] = blended_bgr[selected]
+    display_roi[selected] = blended_gray[selected][:, np.newaxis]
     return True
 
 
@@ -1056,36 +1298,39 @@ def _lift_display_contour_head(contour: np.ndarray, width: int, height: int) -> 
         return contour.astype(np.int32)
 
     upper_points = points[upper_mask]
-    row_bounds: dict[int, tuple[float, float]] = {}
-    for row in np.unique(np.rint(upper_points[:, 1]).astype(np.int32)):
-        row_points = upper_points[np.rint(upper_points[:, 1]).astype(np.int32) == row]
-        if row_points.size:
-            row_bounds[int(row)] = (float(np.min(row_points[:, 0])), float(np.max(row_points[:, 0])))
+    upper_rows = np.rint(upper_points[:, 1]).astype(np.int32)
+    _unique_rows, row_inverse = np.unique(upper_rows, return_inverse=True)
+    row_mins = np.full(len(_unique_rows), np.inf, dtype=np.float32)
+    row_maxs = np.full(len(_unique_rows), -np.inf, dtype=np.float32)
+    np.minimum.at(row_mins, row_inverse, upper_points[:, 0])
+    np.maximum.at(row_maxs, row_inverse, upper_points[:, 0])
 
-    x_min = float(np.min(upper_points[:, 0]))
-    x_max = float(np.max(upper_points[:, 0]))
-    global_center = (x_min + x_max) * 0.5
-    global_half_width = max(1.0, (x_max - x_min) * 0.5)
+    centers = (row_mins[row_inverse] + row_maxs[row_inverse]) * 0.5
+    half_widths = np.maximum(1.0, (row_maxs[row_inverse] - row_mins[row_inverse]) * 0.5)
     lift_ratio = max(0.0, DISPLAY_CONTOUR_HEAD_MAX_SCALE - 1.0)
     adjusted = points.copy()
 
-    for idx in np.flatnonzero(upper_mask):
-        x, y = adjusted[idx]
-        row = int(round(float(y)))
-        row_min, row_max = row_bounds.get(row, (global_center - global_half_width, global_center + global_half_width))
-        center = (row_min + row_max) * 0.5
-        half_width = max(1.0, (row_max - row_min) * 0.5)
-        distance_ratio = min(1.0, abs(float(x) - center) / half_width)
-        lateral_weight = max(0.0, 1.0 - distance_ratio * distance_ratio)
-        vertical_distance = max(0.0, head_bottom - float(y))
-        adjusted[idx, 1] = float(y) - vertical_distance * lift_ratio * lateral_weight
+    upper_indices = np.flatnonzero(upper_mask)
+    upper_x = upper_points[:, 0]
+    upper_y = upper_points[:, 1]
+    distance_ratio = np.minimum(1.0, np.abs(upper_x - centers) / half_widths)
+    lateral_weight = np.maximum(0.0, 1.0 - distance_ratio * distance_ratio)
+    vertical_distance = np.maximum(0.0, head_bottom - upper_y)
+    adjusted[upper_indices, 1] = upper_y - vertical_distance * lift_ratio * lateral_weight
 
     adjusted[:, 0] = np.clip(np.rint(adjusted[:, 0]), 0, max(0, width - 1))
     adjusted[:, 1] = np.clip(np.rint(adjusted[:, 1]), 0, max(0, height - 1))
     return adjusted.astype(np.int32).reshape(-1, 1, 2)
 
 
-def _record_display_contour(record: dict, width: int, height: int) -> np.ndarray | None:
+def _record_display_contour(
+    record: dict,
+    width: int,
+    height: int,
+    *,
+    target_width: int | None = None,
+    target_height: int | None = None,
+) -> np.ndarray | None:
     contour = record.get("draw_contour")
     if contour is None:
         mask = record.get("mask")
@@ -1109,6 +1354,19 @@ def _record_display_contour(record: dict, width: int, height: int) -> np.ndarray
             offset_x, offset_y = int(round(box[0])), int(round(box[1]))
         shifted_contour = contour + np.array([[[offset_x, offset_y]]])
 
+    if target_width is not None and target_height is not None:
+        target_width = int(target_width)
+        target_height = int(target_height)
+        if target_width <= 0 or target_height <= 0:
+            raise ValueError("target contour size must be positive")
+        if target_width != width or target_height != height:
+            shifted_contour = _scale_contour_to_size(
+                shifted_contour,
+                float(target_width) / float(width),
+                float(target_height) / float(height),
+            )
+            return _lift_display_contour_head(shifted_contour, target_width, target_height)
+
     return _lift_display_contour_head(shifted_contour, width, height)
 
 
@@ -1118,9 +1376,24 @@ def _fill_person_contour_region(
     background: str | None = None,
     background_blend: float | None = None,
 ) -> bool:
-    mask = np.zeros(display.shape[:2], dtype=np.uint8)
-    cv2.drawContours(mask, [contour], -1, 255, thickness=cv2.FILLED)
-    return _fill_person_mask_region(display, mask, background, background_blend)
+    if display.ndim != 3 or display.shape[2] != 3:
+        return False
+    contour = np.asarray(contour, dtype=np.int32)
+    if contour.size <= 0:
+        return False
+    height, width = display.shape[:2]
+    x, y, w, h = cv2.boundingRect(contour)
+    x1 = max(0, min(int(x), width))
+    y1 = max(0, min(int(y), height))
+    x2 = max(x1, min(int(x + w), width))
+    y2 = max(y1, min(int(y + h), height))
+    if x2 <= x1 or y2 <= y1:
+        return False
+
+    mask = np.zeros((y2 - y1, x2 - x1), dtype=np.uint8)
+    shifted_contour = contour - np.array([[[x1, y1]]], dtype=np.int32)
+    cv2.drawContours(mask, [shifted_contour], -1, 255, thickness=cv2.FILLED)
+    return _fill_person_mask_region_roi(display, mask, x1, y1, background, background_blend)
 
 
 def _render_skeleton_contour_cpu(
@@ -1149,7 +1422,17 @@ def _render_skeleton_contour_cpu(
     if target_width == source_width and target_height == source_height:
         display = source.copy()
     else:
-        display = cv2.resize(source, (target_width, target_height), interpolation=cv2.INTER_AREA)
+        depth_up = analysis.get("depth_up")
+        if (
+            analysis.get("input_modality") == INPUT_MODALITY_IR
+            and isinstance(depth_up, np.ndarray)
+            and depth_up.ndim == 2
+            and depth_up.shape[:2] == (source_height, source_width)
+        ):
+            display_gray = cv2.resize(depth_up, (target_width, target_height), interpolation=cv2.INTER_AREA)
+            display = _gray_to_bgr(display_gray)
+        else:
+            display = cv2.resize(source, (target_width, target_height), interpolation=cv2.INTER_AREA)
 
     scale_x = float(target_width) / float(source_width)
     scale_y = float(target_height) / float(source_height)
@@ -1158,10 +1441,15 @@ def _render_skeleton_contour_cpu(
     keypoint_radius = max(1, int(round(5 * min(scale_x, scale_y))))
 
     for record in records:
-        shifted_contour = _record_display_contour(record, source_width, source_height)
+        shifted_contour = _record_display_contour(
+            record,
+            source_width,
+            source_height,
+            target_width=target_width,
+            target_height=target_height,
+        )
         if shifted_contour is None:
             continue
-        shifted_contour = _scale_contour_to_size(shifted_contour, scale_x, scale_y)
         _fill_person_contour_region(
             display,
             shifted_contour,
@@ -1336,6 +1624,7 @@ class _StableValueState:
 @dataclass
 class _RealtimeStreamState:
     frame_idx: int = 0
+    person_tracker: PersonTracker = field(default_factory=PersonTracker)
     cached_pose_boxes: list[np.ndarray] = field(default_factory=list)
     cached_kpt_xy: np.ndarray | None = None
     cached_kpt_conf: np.ndarray | None = None
@@ -1506,6 +1795,7 @@ class RealtimePoseEngine:
             else float(CONTOUR_EXISTING_TRACK_CONF_THRESHOLD)
         )
         self._frame_idx = 0
+        self._person_tracker = PersonTracker()
         self._cached_pose_boxes: list[np.ndarray] = []
         self._cached_kpt_xy: np.ndarray | None = None
         self._cached_kpt_conf: np.ndarray | None = None
@@ -1526,6 +1816,7 @@ class RealtimePoseEngine:
     def reset(self) -> None:
         """Reset per-stream caches so next infer behaves like the first frame."""
         self._frame_idx = 0
+        self._person_tracker = PersonTracker()
         self._cached_pose_boxes = []
         self._cached_kpt_xy = None
         self._cached_kpt_conf = None
@@ -1583,6 +1874,7 @@ class RealtimePoseEngine:
     def _capture_stream_state(self) -> _RealtimeStreamState:
         return _RealtimeStreamState(
             frame_idx=int(self._frame_idx),
+            person_tracker=self._person_tracker.copy(),
             cached_pose_boxes=[box.copy() for box in self._cached_pose_boxes],
             cached_kpt_xy=None if self._cached_kpt_xy is None else self._cached_kpt_xy.copy(),
             cached_kpt_conf=None if self._cached_kpt_conf is None else self._cached_kpt_conf.copy(),
@@ -1603,6 +1895,7 @@ class RealtimePoseEngine:
     def _restore_stream_state(self, state: _RealtimeStreamState | None) -> None:
         state = state or _RealtimeStreamState()
         self._frame_idx = int(state.frame_idx)
+        self._person_tracker = state.person_tracker.copy()
         self._cached_pose_boxes = [box.copy() for box in state.cached_pose_boxes]
         self._cached_kpt_xy = None if state.cached_kpt_xy is None else state.cached_kpt_xy.copy()
         self._cached_kpt_conf = None if state.cached_kpt_conf is None else state.cached_kpt_conf.copy()
@@ -1954,6 +2247,7 @@ class RealtimePoseEngine:
                 "person_fill_background": self._person_fill_background,
                 "person_fill_background_blend": self._person_fill_background_blend,
                 "pose_status_thigh_torso_ratio_threshold": self._pose_status_thigh_torso_ratio_threshold,
+                "input_modality": self._input_modality,
                 "width": width,
                 "height": height,
             }
@@ -2031,6 +2325,7 @@ class RealtimePoseEngine:
         contour_reject_reasons: list[str] = []
         contour_debug_summary: list[str] = []
         pending_distance_records: list[dict] = []
+        tracker_updated = False
 
         def add_contour_debug(*parts: object) -> None:
             if len(contour_debug_summary) >= 8:
@@ -2074,6 +2369,47 @@ class RealtimePoseEngine:
             if match_count <= 0:
                 contour_reject_reasons.append("candidate_mismatch")
             seg_boxes_for_match = [boxes_xyxy[idx].copy() for idx in range(match_count)]
+            pose_to_seg_index = (
+                _match_pose_to_seg_tracks(seg_boxes_for_match, list(range(match_count)), pose_boxes_np)
+                if pose_boxes_np
+                else {}
+            )
+            seg_index_to_pose = {int(seg_idx): int(pose_idx) for pose_idx, seg_idx in pose_to_seg_index.items()}
+
+            if match_count > 0:
+                detections: list[Detection] = []
+                empty_kpt_xy, empty_kpt_conf = _empty_keypoint_arrays(kpt_xy_np, kpt_conf_np)
+                for idx in range(match_count):
+                    pose_idx = seg_index_to_pose.get(int(idx))
+                    if (
+                        pose_idx is not None
+                        and kpt_xy_np is not None
+                        and kpt_conf_np is not None
+                        and 0 <= pose_idx < len(kpt_xy_np)
+                        and pose_idx < len(kpt_conf_np)
+                    ):
+                        keypoints = kpt_xy_np[pose_idx].astype(np.float32, copy=True)
+                        keypoint_conf = kpt_conf_np[pose_idx].astype(np.float32, copy=True)
+                    else:
+                        keypoints = empty_kpt_xy.copy()
+                        keypoint_conf = empty_kpt_conf.copy()
+                    detections.append(
+                        Detection(
+                            box=seg_boxes_for_match[idx].astype(np.float32, copy=True),
+                            keypoints=keypoints,
+                            kpt_conf=keypoint_conf,
+                            distance=None,
+                        )
+                    )
+                stable_track_ids = self._person_tracker.update(detections, timestamp=float(self._frame_idx))
+                tracker_updated = True
+                for idx, stable_track_id in enumerate(stable_track_ids):
+                    if 0 <= idx < len(track_ids) and int(stable_track_id) > 0:
+                        track_ids[idx] = int(stable_track_id)
+            else:
+                self._person_tracker.update([], timestamp=float(self._frame_idx))
+                tracker_updated = True
+
             seg_track_ids_for_match = [int(track_ids[idx]) for idx in range(match_count)]
 
             # Pose-based validation candidates for this frame.
@@ -2189,6 +2525,19 @@ class RealtimePoseEngine:
                     contour_reject_reasons.append(shape_reject_reason)
                     add_contour_debug(*candidate_debug, f"shape:{shape_reject_reason}")
                     continue
+                pose_idx_for_record = seg_index_to_pose.get(int(idx))
+                if (
+                    pose_idx_for_record is not None
+                    and kpt_xy_np is not None
+                    and kpt_conf_np is not None
+                    and 0 <= pose_idx_for_record < len(kpt_xy_np)
+                    and pose_idx_for_record < len(kpt_conf_np)
+                ):
+                    record_keypoints = kpt_xy_np[pose_idx_for_record].astype(np.float32, copy=True)
+                    record_kpt_conf = kpt_conf_np[pose_idx_for_record].astype(np.float32, copy=True)
+                else:
+                    record_keypoints = empty_kpt_xy.copy()
+                    record_kpt_conf = empty_kpt_conf.copy()
                 if distance_tasks is not None:
                     task_id = len(distance_tasks)
                     distance_tasks.append(
@@ -2207,6 +2556,9 @@ class RealtimePoseEngine:
                             "mask": mask,
                             "person_conf": person_conf,
                             "track_color": track_color,
+                            "pose_idx": pose_idx_for_record,
+                            "keypoints": record_keypoints,
+                            "kpt_conf": record_kpt_conf,
                             "candidate_debug": list(candidate_debug),
                         }
                     )
@@ -2255,6 +2607,9 @@ class RealtimePoseEngine:
                         "person_conf": person_conf,
                         "label": label,
                         "track_color": track_color,
+                        "pose_idx": pose_idx_for_record,
+                        "keypoints": record_keypoints,
+                        "kpt_conf": record_kpt_conf,
                     }
                 )
                 self._remember_contour_track(track_id, box)
@@ -2269,7 +2624,26 @@ class RealtimePoseEngine:
             contour_reject_reasons.append("no_mask")
             add_contour_debug(f"counts:b{len(result.boxes)}", "m0", "no_mask")
 
+        if not tracker_updated:
+            self._person_tracker.update([], timestamp=float(self._frame_idx))
+
         self._prune_contour_track_state()
+
+        if records:
+            records, duplicate_rejects, duplicate_debug = _dedupe_person_records(
+                records,
+                width=width,
+                height=height,
+                conf_threshold=max(float(self._pose_gate_kpt_conf_threshold), float(QUALITATIVE_KPT_CONF_THRESHOLD)),
+            )
+            if duplicate_rejects:
+                contour_reject_reasons.extend(duplicate_rejects)
+                for debug_item in duplicate_debug:
+                    add_contour_debug(debug_item)
+            person_count = len(records)
+            tracked_labels, pair_records = _rebuild_person_record_summaries(records)
+            kept_track_ids = {int(record["track_id"]) for record in records}
+            validated_track_ids = {int(track_id) for track_id in validated_track_ids if int(track_id) in kept_track_ids}
 
         pose_fallback_indices: list[int] = []
         if kpt_xy_np is not None and kpt_conf_np is not None:
@@ -2321,6 +2695,7 @@ class RealtimePoseEngine:
             "person_fill_background": self._person_fill_background,
             "person_fill_background_blend": self._person_fill_background_blend,
             "pose_status_thigh_torso_ratio_threshold": self._pose_status_thigh_torso_ratio_threshold,
+            "input_modality": self._input_modality,
             "width": width,
             "height": height,
         }
@@ -2660,6 +3035,7 @@ class RealtimePoseEngine:
         analysis["person_fill_background"] = self._person_fill_background
         analysis["person_fill_background_blend"] = self._person_fill_background_blend
         analysis["pose_status_thigh_torso_ratio_threshold"] = self._pose_status_thigh_torso_ratio_threshold
+        analysis["input_modality"] = self._input_modality
         return {
             "frame_id": frame_id,
             "analysis": analysis,
@@ -2792,6 +3168,7 @@ class RealtimePoseEngine:
                 for record in records
             ]
             contour_debug_summary = list(analysis.get("contour_debug_summary") or [])
+            contour_reject_reasons = list(analysis.get("contour_reject_reasons") or [])
 
             for pending in pending_records:
                 task_id = int(pending["task_id"])
@@ -2833,8 +3210,31 @@ class RealtimePoseEngine:
                         "person_conf": person_conf,
                         "label": label,
                         "track_color": pending["track_color"],
+                        "pose_idx": pending.get("pose_idx"),
+                        "keypoints": pending.get("keypoints"),
+                        "kpt_conf": pending.get("kpt_conf"),
                     }
                 )
+
+            if records:
+                records, duplicate_rejects, duplicate_debug = _dedupe_person_records(
+                    records,
+                    width=int(analysis.get("width", DISPLAY_SIZE[0]) or DISPLAY_SIZE[0]),
+                    height=int(analysis.get("height", DISPLAY_SIZE[1]) or DISPLAY_SIZE[1]),
+                    conf_threshold=max(float(self._pose_gate_kpt_conf_threshold), float(QUALITATIVE_KPT_CONF_THRESHOLD)),
+                )
+                if duplicate_rejects:
+                    contour_reject_reasons.extend(duplicate_rejects)
+                    for debug_item in duplicate_debug:
+                        add_contour_debug(contour_debug_summary, debug_item)
+                analysis["person_count"] = int(len(records))
+                kept_track_ids = {int(record["track_id"]) for record in records}
+                analysis["validated_track_ids"] = {
+                    int(track_id)
+                    for track_id in (analysis.get("validated_track_ids") or set())
+                    if int(track_id) in kept_track_ids
+                }
+                tracked_labels, pair_records = _rebuild_person_record_summaries(records)
 
             pair_text, pair_stats = _compute_pairwise_distances(
                 pair_records,
@@ -2845,6 +3245,7 @@ class RealtimePoseEngine:
             analysis["pair_text"] = pair_text
             analysis["pair_stats"] = pair_stats
             analysis["contour_debug_summary"] = contour_debug_summary
+            analysis["contour_reject_reasons"] = contour_reject_reasons
             analyzed["raw_person_count"] = int(analysis["person_count"])
             analyzed["person_count"] = int(analysis["person_count"])
             analyzed.pop("_qualitative_finalized", None)
@@ -3033,7 +3434,6 @@ class RealtimePoseEngine:
         final_person_counts: list[int] = []
         post_contour_counts: list[int] = []
         post_contour_reject_reasons: list[str] = []
-        post_contour_debug: list[str] = []
         pose_fallback_counts: list[int] = []
         for input_index in range(input_count):
             analyzed_wrapper = current_analyzed_by_input.get(input_index) or {}
@@ -3054,8 +3454,6 @@ class RealtimePoseEngine:
                 post_contour_reject_reasons.append("raw_candidate_unhandled")
             else:
                 post_contour_reject_reasons.append("no_candidate")
-            debug_summary = [str(item) for item in (analyzed.get("contour_debug_summary") or [])]
-            post_contour_debug.append("|".join(debug_summary) if debug_summary else "-")
             final_person_counts.append(int(analyzed_wrapper.get("person_count", analyzed.get("person_count", 0))))
             pose_fallback_counts.append(len(analyzed.get("pose_fallback_indices") or []))
 
@@ -3069,7 +3467,7 @@ class RealtimePoseEngine:
                 "pose_conf_avg=%.3f pose_conf_peak=%.3f "
                 "pose_gate_kpt_threshold=%.3f pose_kpt_gate_points_max=%s "
                 "post_contour_counts=%s post_contour_reject_reasons=%s "
-                "post_contour_debug=%s final_person_counts=%s pose_fallback_counts=%s"
+                "final_person_counts=%s pose_fallback_counts=%s"
             ),
             self._instance_name,
             input_count,
@@ -3090,7 +3488,6 @@ class RealtimePoseEngine:
             _format_number_list(pose_kpt_gate_points_max),
             _format_number_list(post_contour_counts),
             _format_text_list(post_contour_reject_reasons),
-            _format_text_list(post_contour_debug),
             _format_number_list(final_person_counts),
             _format_number_list(pose_fallback_counts),
         )

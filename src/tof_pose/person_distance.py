@@ -12,6 +12,17 @@ FOREGROUND_KEEP_RATIO = 0.30
 MASK_ERODE_KERNEL = 3
 DRAW_CONTOUR_CLOSE_KERNEL = 3
 DRAW_CONTOUR_SMOOTH_WINDOW = 5
+MASK_ERODE_KERNEL_ARRAY = (
+    np.ones((MASK_ERODE_KERNEL, MASK_ERODE_KERNEL), np.uint8)
+    if MASK_ERODE_KERNEL > 1
+    else None
+)
+DRAW_CONTOUR_CLOSE_KERNEL_ARRAY = (
+    np.ones((DRAW_CONTOUR_CLOSE_KERNEL, DRAW_CONTOUR_CLOSE_KERNEL), np.uint8)
+    if DRAW_CONTOUR_CLOSE_KERNEL > 1
+    else None
+)
+MASK_CLOSE_KERNEL_ARRAY = np.ones((5, 5), np.uint8)
 
 
 @dataclass
@@ -72,9 +83,8 @@ def _smooth_closed_contour(contour: np.ndarray, width: int, height: int) -> np.n
 
 def _extract_draw_contour(mask_uint8: np.ndarray, width: int, height: int) -> np.ndarray | None:
     draw_mask = np.where(mask_uint8 > 0, 255, 0).astype(np.uint8)
-    if DRAW_CONTOUR_CLOSE_KERNEL > 1:
-        kernel = np.ones((DRAW_CONTOUR_CLOSE_KERNEL, DRAW_CONTOUR_CLOSE_KERNEL), np.uint8)
-        draw_mask = cv2.morphologyEx(draw_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+    if DRAW_CONTOUR_CLOSE_KERNEL_ARRAY is not None:
+        draw_mask = cv2.morphologyEx(draw_mask, cv2.MORPH_CLOSE, DRAW_CONTOUR_CLOSE_KERNEL_ARRAY, iterations=1)
 
     contours, _ = cv2.findContours(draw_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     if not contours:
@@ -135,14 +145,13 @@ def estimate_person_distance_from_mask(
     if int(np.count_nonzero(mask_roi)) <= 0:
         return PersonDistanceEstimate(None, (x1, y1), None, 0, "mask_roi_empty", draw_contour)
 
-    if MASK_ERODE_KERNEL > 1:
-        kernel = np.ones((MASK_ERODE_KERNEL, MASK_ERODE_KERNEL), np.uint8)
-        mask_roi = cv2.erode(mask_roi, kernel, iterations=1)
+    if MASK_ERODE_KERNEL_ARRAY is not None:
+        mask_roi = cv2.erode(mask_roi, MASK_ERODE_KERNEL_ARRAY, iterations=1)
 
     mask_roi = cv2.morphologyEx(
         mask_roi,
         cv2.MORPH_CLOSE,
-        np.ones((5, 5), np.uint8),
+        MASK_CLOSE_KERNEL_ARRAY,
         iterations=1,
     )
     if int(np.count_nonzero(mask_roi)) <= 0:
@@ -164,8 +173,12 @@ def estimate_person_distance_from_mask(
     if valid_pixels < MIN_VALID_PIXELS:
         return PersonDistanceEstimate(None, (x1, y1), best_contour, valid_pixels, "depth_valid_pixels_low", draw_contour)
 
-    sorted_depths = np.sort(valid_depths.astype(np.float32), axis=None)
-    keep_count = max(MIN_VALID_PIXELS, int(round(sorted_depths.size * FOREGROUND_KEEP_RATIO)))
-    foreground_depths = sorted_depths[: min(keep_count, sorted_depths.size)]
+    valid_depths_float = valid_depths.astype(np.float32, copy=False)
+    keep_count = max(MIN_VALID_PIXELS, int(round(valid_depths_float.size * FOREGROUND_KEEP_RATIO)))
+    keep_count = min(keep_count, valid_depths_float.size)
+    if keep_count < valid_depths_float.size:
+        foreground_depths = np.partition(valid_depths_float, keep_count - 1)[:keep_count]
+    else:
+        foreground_depths = valid_depths_float
     distance = float(np.median(foreground_depths)) - DEPTH_OFFSET
     return PersonDistanceEstimate(distance, (x1, y1), best_contour, valid_pixels, None, draw_contour)

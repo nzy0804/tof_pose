@@ -18,8 +18,12 @@ enum ResultKind {
 message InferImage {
   string frame_id = 1;
   int64 capture_timestamp_ms = 2;
-  bytes image_data = 3 [deprecated = true];
-  string object_key = 4;
+  // Raw image bytes for inference. SubmitFrames requires this field so the AI
+  // service does not fetch each input frame from object storage.
+  bytes image_data = 3;
+  // Deprecated: legacy object-storage input key. Kept only for compatibility
+  // with old Infer callers; SubmitFrames should not send object_key-only frames.
+  string object_key = 4 [deprecated = true];
 }
 
 message InferResult {
@@ -27,7 +31,7 @@ message InferResult {
   int64 capture_timestamp_ms = 2;
   // Deprecated: pseudo-color result images are no longer generated.
   bytes pseudo_color_image = 3 [deprecated = true];
-  // 100x100 skeleton/contour result image. In OSS mode use skeleton_contour_object_key.
+  // 100x100 skeleton/contour result image returned directly in the gRPC response/event.
   bytes skeleton_contour_image = 4;
   int32 person_count = 5;
   int32 processing_time_ms = 6;
@@ -39,8 +43,9 @@ message InferResult {
   string skeleton_contour_image_format = 11;
   // Deprecated: pseudo-color result images are no longer uploaded.
   string pseudo_color_object_key = 12 [deprecated = true];
-  // OSS key for the only uploaded result image: 100x100 skeleton/contour.
-  string skeleton_contour_object_key = 13;
+  // Deprecated: AI no longer uploads result images. Platforms should use
+  // skeleton_contour_image bytes and upload/store them on their side if needed.
+  string skeleton_contour_object_key = 13 [deprecated = true];
   string person_status = 14;
   string person_distance = 15;
   string action_level = 16;

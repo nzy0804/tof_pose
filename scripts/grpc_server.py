@@ -69,8 +69,8 @@ from tof_pose.realtime_service import RealtimePoseEngine
 from tof_pose.realtime_service import (
     CPU_WORKER_MODE_PROCESS,
     CPU_WORKER_MODE_THREAD,
-    INPUT_MODALITIES,
-    INPUT_MODALITY_DEPTH,
+    DISPLAY_GAMMA,
+    INPUT_MODALITY_IR,
     MODEL_INPUT_SIZES,
     MODEL_INPUT_SIZE_320,
     DEPTH_PERSON_DISTANCE_CLOSE_THRESHOLD,
@@ -133,6 +133,7 @@ class _DynamicInferJob:
     image_data: bytes
     input_index: int
     future: Future
+    model_future: Future
     enqueued_at: float
 
 
@@ -182,11 +183,13 @@ class _DynamicInferBatcher:
             result["output_index"] = output_index
         return results
 
-    def submit_async(self, *, stream_key: str, frames: list[tuple[str, bytes]]) -> Future:
+    def submit_pipeline_async(self, *, stream_key: str, frames: list[tuple[str, bytes]]) -> tuple[Future, Future]:
+        model_request_future: Future = Future()
         request_future: Future = Future()
         if not frames:
+            model_request_future.set_result(None)
             request_future.set_result([])
-            return request_future
+            return model_request_future, request_future
 
         jobs: list[_DynamicInferJob] = []
         with self._condition:
@@ -210,6 +213,7 @@ class _DynamicInferBatcher:
                     image_data=image_data,
                     input_index=input_index,
                     future=Future(),
+                    model_future=Future(),
                     enqueued_at=enqueued_at,
                 )
                 for input_index, (frame_id, image_data) in enumerate(frames)
@@ -218,7 +222,22 @@ class _DynamicInferBatcher:
             self._condition.notify_all()
 
         remaining = len(jobs)
+        remaining_model = len(jobs)
         aggregate_lock = threading.Lock()
+        model_aggregate_lock = threading.Lock()
+
+        def complete_model_request(_completed: Future) -> None:
+            nonlocal remaining_model
+            with model_aggregate_lock:
+                remaining_model -= 1
+                if remaining_model > 0 or model_request_future.done():
+                    return
+                try:
+                    for job in jobs:
+                        job.model_future.result()
+                    model_request_future.set_result(None)
+                except Exception as exc:
+                    model_request_future.set_exception(exc)
 
         def complete_request(_completed: Future) -> None:
             nonlocal remaining
@@ -233,8 +252,12 @@ class _DynamicInferBatcher:
                     request_future.set_exception(exc)
 
         for job in jobs:
+            job.model_future.add_done_callback(complete_model_request)
             job.future.add_done_callback(complete_request)
-        return request_future
+        return model_request_future, request_future
+
+    def submit_async(self, *, stream_key: str, frames: list[tuple[str, bytes]]) -> Future:
+        return self.submit_pipeline_async(stream_key=stream_key, frames=frames)[1]
 
     def submit(self, *, stream_key: str, frames: list[tuple[str, bytes]]) -> list[dict]:
         return self.submit_async(stream_key=stream_key, frames=frames).result()
@@ -298,15 +321,37 @@ class _DynamicInferBatcher:
                     }
                     for job in batch
                 ]
-                results = self._engine.infer_multi_stream_batch(items)
-                if len(results) != len(batch):
-                    raise RuntimeError(f"dynamic model batch returned {len(results)} results for {len(batch)} inputs")
-                for job, result in zip(batch, results):
-                    if not job.future.done():
-                        job.future.set_result(result)
+                batch_result_future = self._engine.infer_multi_stream_batch_async(items)
+                for job in batch:
+                    if not job.model_future.done():
+                        job.model_future.set_result(None)
+
+                def complete_batch(completed: Future, batch_jobs: list[_DynamicInferJob] = batch) -> None:
+                    try:
+                        results = completed.result()
+                        if len(results) != len(batch_jobs):
+                            raise RuntimeError(
+                                f"dynamic model batch returned {len(results)} results for {len(batch_jobs)} inputs"
+                            )
+                        for job, result in zip(batch_jobs, results):
+                            if not job.future.done():
+                                job.future.set_result(result)
+                    except Exception as exc:
+                        logging.exception(
+                            "Dynamic infer batch finalization failed: instance=%s frames=%d",
+                            self._instance_name,
+                            len(batch_jobs),
+                        )
+                        for job in batch_jobs:
+                            if not job.future.done():
+                                job.future.set_exception(exc)
+
+                batch_result_future.add_done_callback(complete_batch)
             except Exception as exc:
                 logging.exception("Dynamic infer batch failed: instance=%s frames=%d", self._instance_name, len(batch))
                 for job in batch:
+                    if not job.model_future.done():
+                        job.model_future.set_exception(exc)
                     if not job.future.done():
                         job.future.set_exception(exc)
 
@@ -538,24 +583,39 @@ class _AsyncInferenceManager:
                 if self._servicer._dynamic_batching:
                     if not (0 <= engine_index < len(self._servicer._dynamic_batchers)):
                         raise RuntimeError(f"dynamic batcher missing for model-{engine_index}")
-                    model_future = self._servicer._dynamic_batchers[engine_index].submit_async(
+                    model_stage_future, result_future = self._servicer._dynamic_batchers[engine_index].submit_pipeline_async(
                         stream_key=stream_key,
                         frames=frames,
                     )
                 else:
-                    model_future = Future()
+                    model_stage_future = Future()
+                    result_future = Future()
                     try:
-                        model_future.set_result(engine.infer_batch(frames))
+                        result_future.set_result(engine.infer_batch(frames))
+                        model_stage_future.set_result(None)
                     except Exception as exc:
-                        model_future.set_exception(exc)
-                model_future.add_done_callback(
-                    lambda completed: self._on_model_done(
+                        model_stage_future.set_exception(exc)
+                        result_future.set_exception(exc)
+                stage_state: dict[str, int | bool] = {}
+                model_stage_future.add_done_callback(
+                    lambda completed: self._on_model_stage_done(
                         job=job,
-                        images=job.images,
-                        model_future=completed,
+                        model_stage_future=completed,
                         engine_index=engine_index,
                         engine_inflight=engine_inflight,
                         engine_start=engine_start,
+                        stage_state=stage_state,
+                    )
+                )
+                result_future.add_done_callback(
+                    lambda completed: self._on_result_ready(
+                        job=job,
+                        images=job.images,
+                        result_future=completed,
+                        engine_index=engine_index,
+                        engine_inflight=engine_inflight,
+                        engine_start=engine_start,
+                        stage_state=stage_state,
                         oss_download_ms=oss_download_ms,
                         oss_download_stats=oss_download_stats,
                     )
@@ -573,25 +633,22 @@ class _AsyncInferenceManager:
             self._mark_model_stage_done(job)
             self._publish_error_and_complete(job, str(exc))
 
-    def _on_model_done(
+    def _on_model_stage_done(
         self,
         *,
         job: _AsyncInferJob,
-        images: list,
-        model_future: Future,
+        model_stage_future: Future,
         engine_index: int,
         engine_inflight: str,
         engine_start: float,
-        oss_download_ms: int,
-        oss_download_stats: dict[str, int],
+        stage_state: dict,
     ) -> None:
         engine_infer_ms = int((time.perf_counter() - engine_start) * 1000)
+        stage_state["engine_infer_ms"] = engine_infer_ms
         try:
-            results = model_future.result()
-            if len(results) != len(images):
-                raise RuntimeError(f"expected {len(images)} results for {len(images)} inputs, got {len(results)}")
-            self._servicer._annotate_result_capture_timestamps(job.device_id, images, results)
+            model_stage_future.result()
         except Exception as exc:
+            stage_state["failed"] = True
             logging.exception(
                 "Async infer model stage failed: device_id=%s batch_id=%s sequence_id=%d instance=%d",
                 job.device_id,
@@ -606,6 +663,39 @@ class _AsyncInferenceManager:
 
         self._servicer._release_engine(engine_index)
         self._mark_model_stage_done(job)
+
+    def _on_result_ready(
+        self,
+        *,
+        job: _AsyncInferJob,
+        images: list,
+        result_future: Future,
+        engine_index: int,
+        engine_inflight: str,
+        engine_start: float,
+        stage_state: dict,
+        oss_download_ms: int,
+        oss_download_stats: dict[str, int],
+    ) -> None:
+        if stage_state.get("failed"):
+            return
+        engine_infer_ms = int(stage_state.get("engine_infer_ms", int((time.perf_counter() - engine_start) * 1000)))
+        try:
+            results = result_future.result()
+            if len(results) != len(images):
+                raise RuntimeError(f"expected {len(images)} results for {len(images)} inputs, got {len(results)}")
+            self._servicer._annotate_result_capture_timestamps(job.device_id, images, results)
+        except Exception as exc:
+            logging.exception(
+                "Async infer result finalization failed: device_id=%s batch_id=%s sequence_id=%d instance=%d",
+                job.device_id,
+                job.batch_id,
+                job.sequence_id,
+                engine_index,
+            )
+            self._publish_error_and_complete(job, str(exc))
+            return
+
         self._result_executor.submit(
             self._publish_model_results,
             job,
@@ -728,11 +818,11 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         pose_fallback: bool = True,
         model_path: str | None = None,
         pose_model_path: str | None = None,
-        seg_conf: float | None = None,
+        seg_conf: float | None = 0.35,
         pose_conf: float | None = None,
         pose_kpt_conf: float | None = None,
-        pose_gate_kpt_conf: float | None = None,
-        pose_kpt_min_points: int = 4,
+        pose_gate_kpt_conf: float | None = 0.4,
+        pose_kpt_min_points: int = 6,
         mask_threshold: float = 0.5,
         mask_min_area_ratio: float | None = None,
         mask_max_area_ratio: float | None = None,
@@ -742,11 +832,12 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         render_workers: int = 1,
         decode_workers: int = 1,
         png_compression: int = 1,
-        output_format: str = "png",
+        output_format: str = "jpeg",
         jpeg_quality: int = 80,
-        input_modality: str = INPUT_MODALITY_DEPTH,
+        input_modality: str = INPUT_MODALITY_IR,
         ir_preprocess: bool = False,
         model_input_size: int = MODEL_INPUT_SIZE_320,
+        display_gamma: float = DISPLAY_GAMMA,
         person_fill_background: str | None = None,
         person_fill_background_blend: float = PERSON_FILL_BACKGROUND_BLEND,
         pose_status_thigh_torso_ratio_threshold: float = POSE_STATUS_THIGH_TORSO_RATIO_THRESHOLD,
@@ -765,10 +856,10 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         dynamic_max_wait_ms: int = 300,
         dynamic_max_queue_size: int = 2000,
         async_infer: bool = False,
-        async_device_window: int = 3,
+        async_device_window: int = 10,
         async_result_buffer_size: int = 1000,
         async_prepare_workers: int = 8,
-        async_result_workers: int = 8,
+        async_result_workers: int = 16,
         oss_config: ObjectStorageConfig | None = None,
         oss_workers: int | None = 4,
         oss_download_workers: int | None = None,
@@ -875,6 +966,7 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
                     input_modality=input_modality,
                     ir_preprocess=ir_preprocess,
                     model_input_size=model_input_size,
+                    display_gamma=display_gamma,
                     person_fill_background=person_fill_background,
                     person_fill_background_blend=person_fill_background_blend,
                     pose_status_thigh_torso_ratio_threshold=pose_status_thigh_torso_ratio_threshold,
@@ -1376,11 +1468,11 @@ def serve(
     pose_fallback: bool = True,
     model_path: str | None = None,
     pose_model_path: str | None = None,
-    seg_conf: float | None = None,
+    seg_conf: float | None = 0.35,
     pose_conf: float | None = None,
     pose_kpt_conf: float | None = None,
-    pose_gate_kpt_conf: float | None = None,
-    pose_kpt_min_points: int = 4,
+    pose_gate_kpt_conf: float | None = 0.4,
+    pose_kpt_min_points: int = 6,
     mask_threshold: float = 0.5,
     mask_min_area_ratio: float | None = None,
     mask_max_area_ratio: float | None = None,
@@ -1390,11 +1482,12 @@ def serve(
     render_workers: int = 1,
     decode_workers: int = 1,
     png_compression: int = 1,
-    output_format: str = "png",
+    output_format: str = "jpeg",
     jpeg_quality: int = 80,
-    input_modality: str = INPUT_MODALITY_DEPTH,
+    input_modality: str = INPUT_MODALITY_IR,
     ir_preprocess: bool = False,
     model_input_size: int = MODEL_INPUT_SIZE_320,
+    display_gamma: float = DISPLAY_GAMMA,
     person_fill_background: str | None = None,
     person_fill_background_blend: float = PERSON_FILL_BACKGROUND_BLEND,
     pose_status_thigh_torso_ratio_threshold: float = POSE_STATUS_THIGH_TORSO_RATIO_THRESHOLD,
@@ -1413,10 +1506,10 @@ def serve(
     dynamic_max_wait_ms: int = 300,
     dynamic_max_queue_size: int = 2000,
     async_infer: bool = False,
-    async_device_window: int = 3,
+    async_device_window: int = 10,
     async_result_buffer_size: int = 1000,
     async_prepare_workers: int = 8,
-    async_result_workers: int = 8,
+    async_result_workers: int = 16,
     oss_config: ObjectStorageConfig | None = None,
     oss_workers: int | None = 4,
     oss_download_workers: int | None = None,
@@ -1459,6 +1552,7 @@ def serve(
             input_modality=input_modality,
             ir_preprocess=ir_preprocess,
             model_input_size=model_input_size,
+            display_gamma=display_gamma,
             person_fill_background=person_fill_background,
             person_fill_background_blend=person_fill_background_blend,
             pose_status_thigh_torso_ratio_threshold=pose_status_thigh_torso_ratio_threshold,
@@ -1523,7 +1617,8 @@ def serve(
         (
             'Starting gRPC server on %s (max_msg_mb=%d, max_workers=%d, model_instances=%d, '
             'parallel_models=%s, cpu_worker_mode=%s, cpu_process_start_method=%s, input_modality=%s, '
-            'ir_preprocess=%s, model_input_size=%d, person_fill_background=%s, person_fill_background_blend=%.3f, '
+            'ir_preprocess=%s, model_input_size=%d, display_gamma=%.3f, '
+            'person_fill_background=%s, person_fill_background_blend=%.3f, '
             'pose_status_thigh_torso_ratio_threshold=%.3f, depth_distance_close_threshold=%.3f, ir_distance_close_gap_ratio=%.3f, '
             'ir_distance_close_center_ratio=%.3f, dynamic_batching=%s, dynamic_max_batch_size=%d, '
             'dynamic_max_wait_ms=%d, dynamic_max_queue_size=%d, async_infer=%s, '
@@ -1540,6 +1635,7 @@ def serve(
         input_modality,
         "true" if ir_preprocess else "false",
         model_input_size,
+        display_gamma,
         person_fill_background or PERSON_FILL_BACKGROUND_DEFAULT,
         person_fill_background_blend,
         pose_status_thigh_torso_ratio_threshold,
@@ -1570,33 +1666,12 @@ def main():
     parser.add_argument('--port', default=50052, type=int)
     parser.add_argument('--max-workers', default=4, type=int)
     parser.add_argument('--max-msg-mb', default=50, type=int)
-    parser.add_argument(
-        '--stateless',
-        action='store_true',
-        help='treat every Infer call as the first frame (no cross-call caching/tracking)',
-    )
-    parser.add_argument(
-        '--pose-only',
-        action='store_true',
-        help='run pose model only (no segmentation masks/contours); person_count is derived from pose keypoints',
-    )
-    parser.add_argument(
-        '--no-pose-validate',
-        action='store_true',
-        help='disable pose-based gating for skeleton drawing (contours use segmentation plus shape rules)',
-    )
-    parser.add_argument(
-        '--no-pose-fallback',
-        action='store_true',
-        help='disable pose fallback when segmentation misses but pose keypoints are confident',
-    )
     parser.add_argument('--model-path', default=None, help='override seg model path')
     parser.add_argument('--pose-model-path', default=None, help='override pose model path')
-    parser.add_argument('--seg-conf', default=None, type=float, help='override segmentation confidence threshold')
+    parser.add_argument('--seg-conf', default=0.35, type=float, help='segmentation confidence threshold')
     parser.add_argument('--pose-conf', default=None, type=float, help='override pose confidence threshold')
-    parser.add_argument('--pose-kpt-conf', default=None, type=float, help='override pose keypoint conf threshold for pose-only person counting')
-    parser.add_argument('--pose-gate-kpt-conf', default=None, type=float, help='override pose keypoint threshold used to validate segmentation tracks')
-    parser.add_argument('--pose-kpt-min-points', default=4, type=int, help='min confident keypoints to count one person in pose-only mode')
+    parser.add_argument('--pose-gate-kpt-conf', default=0.4, type=float, help='pose keypoint threshold used to validate segmentation tracks')
+    parser.add_argument('--pose-kpt-min-points', default=6, type=int, help='min confident keypoints to count one person in pose-only mode')
     parser.add_argument('--mask-threshold', default=0.5, type=float, help='mask binarization threshold for contours')
     parser.add_argument('--mask-min-area-ratio', default=None, type=float, help='minimum mask area ratio accepted for contours')
     parser.add_argument('--mask-max-area-ratio', default=None, type=float, help='maximum mask area ratio accepted for contours')
@@ -1628,40 +1703,23 @@ def main():
         help='multiprocessing start method used when --cpu-worker-mode=process',
     )
     parser.add_argument(
-        '--png-compression',
-        default=1,
-        type=int,
-        help='PNG compression level for returned images, 0 is fastest and 9 is smallest',
-    )
-    parser.add_argument(
-        '--output-format',
-        default='png',
-        choices=('png', 'jpeg', 'jpg'),
-        help='image format for returned result images',
-    )
-    parser.add_argument(
         '--jpeg-quality',
         default=80,
         type=int,
-        help='JPEG quality for returned images when --output-format=jpeg',
+        help='JPEG quality for returned images',
     )
     parser.add_argument(
-        '--input-modality',
-        default=INPUT_MODALITY_DEPTH,
-        choices=INPUT_MODALITIES,
-        help='input image modality: ir returns grayscale images by default; depth returns pseudo color images',
-    )
-    parser.add_argument(
-        '--ir-preprocess',
-        action='store_true',
-        help='enable median filtering plus CLAHE for infrared grayscale inputs',
-    )
-    parser.add_argument(
-        '--model-input-size',
+        '--model_size',
         default=MODEL_INPUT_SIZE_320,
         type=int,
         choices=MODEL_INPUT_SIZES,
-        help='model inference input size; 160 scales the raw image directly before inference',
+        help='model inference input size',
+    )
+    parser.add_argument(
+        '--display-gamma',
+        default=DISPLAY_GAMMA,
+        type=float,
+        help='gamma correction for display/render input images; 1.0 disables, higher values brighten dark regions',
     )
     parser.add_argument(
         '--person-fill-background',
@@ -1708,16 +1766,6 @@ def main():
         help='number of AI model instances to keep in this process; device_id is routed sticky to one instance',
     )
     parser.add_argument(
-        '--serial-models',
-        action='store_true',
-        help='run seg and pose model calls serially instead of in parallel',
-    )
-    parser.add_argument(
-        '--no-warmup',
-        action='store_true',
-        help='skip startup model warmup before binding the gRPC server',
-    )
-    parser.add_argument(
         '--warmup-batch-size',
         default=10,
         type=int,
@@ -1759,7 +1807,7 @@ def main():
     )
     parser.add_argument(
         '--async-device-window',
-        default=3,
+        default=10,
         type=int,
         help='maximum accepted but unfinished batches per device_id for async inference',
     )
@@ -1777,14 +1825,9 @@ def main():
     )
     parser.add_argument(
         '--async-result-workers',
-        default=8,
+        default=16,
         type=int,
         help='background workers for async output upload and result publication',
-    )
-    parser.add_argument(
-        '--null-qualitative-results',
-        action='store_true',
-        help='omit unvalidated qualitative fields: person_status, person_distance, and action_level',
     )
     parser.add_argument('--oss-provider', default=None, choices=('aliyun', 's3'), help='object storage provider for request/result object keys')
     parser.add_argument('--oss-endpoint', default=None, help='object storage endpoint')
@@ -1859,15 +1902,15 @@ def main():
         port=args.port,
         max_workers=args.max_workers,
         max_msg_mb=args.max_msg_mb,
-        stateless=args.stateless,
-        pose_only=args.pose_only,
-        pose_validate_seg=not args.no_pose_validate,
-        pose_fallback=not args.no_pose_fallback,
+        stateless=False,
+        pose_only=False,
+        pose_validate_seg=True,
+        pose_fallback=True,
         model_path=args.model_path,
         pose_model_path=args.pose_model_path,
         seg_conf=args.seg_conf,
         pose_conf=args.pose_conf,
-        pose_kpt_conf=args.pose_kpt_conf,
+        pose_kpt_conf=None,
         pose_gate_kpt_conf=args.pose_gate_kpt_conf,
         pose_kpt_min_points=args.pose_kpt_min_points,
         mask_threshold=args.mask_threshold,
@@ -1878,12 +1921,13 @@ def main():
         device=args.device,
         render_workers=args.render_workers,
         decode_workers=args.decode_workers,
-        png_compression=args.png_compression,
-        output_format=args.output_format,
+        png_compression=1,
+        output_format="jpeg",
         jpeg_quality=args.jpeg_quality,
-        input_modality=args.input_modality,
-        ir_preprocess=args.ir_preprocess,
-        model_input_size=args.model_input_size,
+        input_modality=INPUT_MODALITY_IR,
+        ir_preprocess=False,
+        model_input_size=args.model_size,
+        display_gamma=args.display_gamma,
         person_fill_background=args.person_fill_background,
         person_fill_background_blend=args.person_fill_background_blend,
         pose_status_thigh_torso_ratio_threshold=args.pose_status_thigh_torso_ratio_threshold,
@@ -1893,8 +1937,8 @@ def main():
         cpu_worker_mode=args.cpu_worker_mode,
         cpu_process_start_method=args.cpu_process_start_method,
         model_instances=args.model_instances,
-        parallel_models=not args.serial_models,
-        warmup_models=not args.no_warmup,
+        parallel_models=True,
+        warmup_models=True,
         warmup_batch_size=args.warmup_batch_size,
         device_binding_ttl_sec=args.device_binding_ttl_sec,
         dynamic_batching=args.dynamic_batching,
@@ -1913,7 +1957,7 @@ def main():
         oss_global_workers=args.oss_global_workers,
         oss_download_wait_timeout_ms=args.oss_download_wait_timeout_ms,
         oss_upload_wait_timeout_ms=args.oss_upload_wait_timeout_ms,
-        null_qualitative_results=args.null_qualitative_results,
+        null_qualitative_results=False,
     )
 
 

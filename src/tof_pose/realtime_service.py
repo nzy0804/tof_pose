@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import atexit
 from collections import deque
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 import logging
 import multiprocessing
 import threading
@@ -380,6 +380,7 @@ def _prepare_depth_views_cpu(
     *,
     ir_preprocess: bool = False,
     model_input_size: int = MODEL_INPUT_SIZE_320,
+    display_gamma: float = DISPLAY_GAMMA,
 ) -> dict:
     model_input_size = normalize_model_input_size(model_input_size)
     width, height = DISPLAY_SIZE
@@ -396,7 +397,7 @@ def _prepare_depth_views_cpu(
 
     depth_up = cv2.resize(enhanced, DISPLAY_SIZE, interpolation=cv2.INTER_LINEAR)
     model_depth = cv2.resize(enhanced, (model_input_size, model_input_size), interpolation=cv2.INTER_LINEAR)
-    display_depth_up = _apply_display_gamma_u8(depth_up)
+    display_depth_up = _apply_display_gamma_u8(depth_up, display_gamma)
     if modality == INPUT_MODALITY_IR:
         color_img = _gray_to_bgr(display_depth_up)
         model_color_img = _gray_to_bgr(model_depth)
@@ -424,25 +425,32 @@ def _prepare_color_image_cpu(payload) -> np.ndarray:
 
 def _prepare_depth_views_payload_cpu(payload) -> dict:
     if isinstance(payload, tuple):
-        if len(payload) >= 4:
+        if len(payload) >= 5:
+            depth_gray, input_modality, ir_preprocess, model_input_size, display_gamma = payload[:5]
+        elif len(payload) >= 4:
             depth_gray, input_modality, ir_preprocess, model_input_size = payload[:4]
+            display_gamma = DISPLAY_GAMMA
         elif len(payload) >= 3:
             depth_gray, input_modality, ir_preprocess = payload[:3]
             model_input_size = MODEL_INPUT_SIZE_320
+            display_gamma = DISPLAY_GAMMA
         else:
             depth_gray, input_modality = payload
             ir_preprocess = False
             model_input_size = MODEL_INPUT_SIZE_320
+            display_gamma = DISPLAY_GAMMA
     else:
         depth_gray = payload
         input_modality = INPUT_MODALITY_DEPTH
         ir_preprocess = False
         model_input_size = MODEL_INPUT_SIZE_320
+        display_gamma = DISPLAY_GAMMA
     return _prepare_depth_views_cpu(
         depth_gray,
         input_modality=input_modality,
         ir_preprocess=bool(ir_preprocess),
         model_input_size=model_input_size,
+        display_gamma=display_gamma,
     )
 
 
@@ -1641,6 +1649,19 @@ class _RealtimeStreamState:
     contour_track_state: dict[int, _ContourTrackState] = field(default_factory=dict)
 
 
+@dataclass
+class _MultiStreamModelBatch:
+    input_count: int
+    source_frames: list[dict]
+    stream_groups: dict[str, list[dict]]
+    stream_order: list[str]
+    seg_results: list | None
+    pose_results: list | None
+    timings: dict[str, int]
+    confidence_log_kwargs: dict
+    total_start: float
+
+
 class RealtimePoseEngine:
     def __init__(
         self,
@@ -1675,6 +1696,7 @@ class RealtimePoseEngine:
         input_modality: str = INPUT_MODALITY_DEPTH,
         ir_preprocess: bool = False,
         model_input_size: int = MODEL_INPUT_SIZE_320,
+        display_gamma: float = DISPLAY_GAMMA,
         person_fill_background: str | None = None,
         person_fill_background_blend: float = PERSON_FILL_BACKGROUND_BLEND,
         pose_status_thigh_torso_ratio_threshold: float = POSE_STATUS_THIGH_TORSO_RATIO_THRESHOLD,
@@ -1688,6 +1710,7 @@ class RealtimePoseEngine:
         self.seg_model = MODEL_CLS(str(model_file))
         self.pose_model = MODEL_CLS(str(pose_model_file))
         self._device = str(device).strip() if device else None
+        self._instance_name = str(instance_name).strip() if instance_name else "model-0"
         self._render_workers = max(1, int(render_workers))
         self._decode_workers = max(1, int(decode_workers))
         normalized_cpu_worker_mode = str(cpu_worker_mode or CPU_WORKER_MODE_THREAD).strip().lower()
@@ -1710,6 +1733,10 @@ class RealtimePoseEngine:
             self._render_executor = ThreadPoolExecutor(max_workers=self._render_workers)
         if self._postprocess_workers > 1:
             self._postprocess_executor = ThreadPoolExecutor(max_workers=self._postprocess_workers)
+        self._pipeline_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix=f"{self._instance_name}-postrender",
+        )
         self._png_compression = min(9, max(0, int(png_compression)))
         normalized_output_format = str(output_format or "png").strip().lower()
         if normalized_output_format == "jpg":
@@ -1721,6 +1748,7 @@ class RealtimePoseEngine:
         self._input_modality = _normalize_input_modality(input_modality)
         self._ir_preprocess = bool(ir_preprocess)
         self._model_input_size = normalize_model_input_size(model_input_size)
+        self._display_gamma = float(display_gamma)
         self._seg_infer_imgsz = int(self._model_input_size)
         self._pose_infer_imgsz = int(self._model_input_size)
         self._person_fill_background = _normalize_person_fill_background(person_fill_background)
@@ -1740,8 +1768,8 @@ class RealtimePoseEngine:
             ir_distance_close_center_ratio,
             PERSON_DISTANCE_CLOSE_CENTER_RATIO,
         )
-        self._instance_name = str(instance_name).strip() if instance_name else "model-0"
         self._lock = threading.Lock()
+        self._model_lock = threading.Lock()
         self._stateless = bool(stateless)
         self._persist_tracks = (not self._stateless) if persist_tracks is None else bool(persist_tracks)
         self._pose_only = bool(pose_only)
@@ -2162,6 +2190,7 @@ class RealtimePoseEngine:
             input_modality=self._input_modality,
             ir_preprocess=self._ir_preprocess,
             model_input_size=self._model_input_size,
+            display_gamma=self._display_gamma,
         )
 
     def _analyze_frame(
@@ -3123,7 +3152,7 @@ class RealtimePoseEngine:
         depths = [item["depth"] for item in source_frames]
         if self._cpu_worker_mode == CPU_WORKER_MODE_PROCESS:
             payloads = [
-                (depth, self._input_modality, self._ir_preprocess, self._model_input_size)
+                (depth, self._input_modality, self._ir_preprocess, self._model_input_size, self._display_gamma)
                 for depth in depths
             ]
             return self._map_decode_stage(_prepare_depth_views_payload_cpu, payloads)
@@ -3342,7 +3371,8 @@ class RealtimePoseEngine:
                 "Infer batch timing: inputs=%d outputs=%d model_inputs=%d "
                 "postprocess_inputs=%d instance=%s queue_wait_ms=%d decode_ms=%d model_prepare_ms=%d "
                 "model_infer_ms=%d seg_model_ms=%d pose_model_ms=%d parallel_models=%s "
-                "postprocess_ms=%d interpolate_ms=%d render_ms=%d png_encode_ms=%d total_ms=%d "
+                "postprocess_ms=%d postprocess_queue_wait_ms=%d interpolate_ms=%d "
+                "render_ms=%d png_encode_ms=%d total_ms=%d "
                 "decode_workers=%d render_workers=%d cpu_worker_mode=%s cpu_process_start_method=%s "
                 "png_compression=%d output_format=%s jpeg_quality=%d input_modality=%s "
                 "model_input_size=%d device=%s"
@@ -3360,6 +3390,7 @@ class RealtimePoseEngine:
             int(timings.get("pose_model_ms", 0)),
             "true" if timings.get("parallel_models", 0) else "false",
             int(timings.get("postprocess_ms", 0)),
+            int(timings.get("postprocess_queue_wait_ms", 0)),
             int(timings.get("interpolate_ms", 0)),
             int(timings.get("render_ms", 0)),
             int(timings.get("png_encode_ms", 0)),
@@ -3491,6 +3522,307 @@ class RealtimePoseEngine:
             _format_number_list(final_person_counts),
             _format_number_list(pose_fallback_counts),
         )
+
+    def infer_multi_stream_batch_async(self, items: list[dict]) -> Future:
+        result_future: Future = Future()
+        if not items:
+            result_future.set_result([])
+            return result_future
+        try:
+            batch = self._prepare_multi_stream_model_batch(items)
+        except Exception as exc:
+            result_future.set_exception(exc)
+            return result_future
+        return self._pipeline_executor.submit(self._finish_multi_stream_model_batch, batch)
+
+    def _prepare_multi_stream_model_batch(self, items: list[dict]) -> _MultiStreamModelBatch:
+        normalized_items: list[dict] = []
+        for global_index, item in enumerate(items):
+            frame_id = str(item.get("frame_id", "") or "")
+            image_data = bytes(item.get("image_data", b"") or b"")
+            if not image_data:
+                raise ValueError(f"empty image_data for dynamic batch item {global_index}")
+            try:
+                request_id = int(item.get("request_id", 0) or 0)
+            except (TypeError, ValueError):
+                request_id = 0
+            try:
+                input_index = int(item.get("input_index", global_index))
+            except (TypeError, ValueError):
+                input_index = global_index
+            normalized_items.append(
+                {
+                    **item,
+                    "global_index": global_index,
+                    "request_id": request_id,
+                    "stream_key": self._normalize_stream_key(item.get("stream_key")),
+                    "frame_id": frame_id,
+                    "image_data": image_data,
+                    "input_index": input_index,
+                }
+            )
+
+        frames = [(item["frame_id"], item["image_data"]) for item in normalized_items]
+        timings: dict[str, int] = {"queue_wait_ms": 0}
+        total_start = time.perf_counter()
+
+        decode_start = time.perf_counter()
+        decoded_frames = self._decode_frames(frames)
+        if len(decoded_frames) != len(normalized_items):
+            raise RuntimeError(f"decoded {len(decoded_frames)} frames for {len(normalized_items)} dynamic batch items")
+        timings["decode_ms"] = _elapsed_ms(decode_start)
+
+        source_frames: list[dict] = []
+        stream_groups: dict[str, list[dict]] = {}
+        stream_order: list[str] = []
+        for item, (frame_id, current_depth) in zip(normalized_items, decoded_frames):
+            source_item = {
+                **item,
+                "frame_id": frame_id,
+                "depth": current_depth,
+            }
+            source_frames.append(source_item)
+            stream_key = str(source_item["stream_key"])
+            if stream_key not in stream_groups:
+                stream_groups[stream_key] = []
+                stream_order.append(stream_key)
+            stream_groups[stream_key].append(source_item)
+
+        timings["model_input_count"] = len(source_frames)
+        timings["postprocess_input_count"] = len(source_frames)
+
+        model_prepare_start = time.perf_counter()
+        prepared_views = self._prepare_source_views(source_frames)
+        if len(prepared_views) != len(source_frames):
+            raise RuntimeError(f"prepared {len(prepared_views)} views for {len(source_frames)} source frames")
+        for item, prepared in zip(source_frames, prepared_views):
+            item["prepared"] = prepared
+        color_imgs = [prepared.get("model_color_img", prepared["color_img"]) for prepared in prepared_views]
+        timings["model_prepare_ms"] = _elapsed_ms(model_prepare_start)
+
+        model_lock_start = time.perf_counter()
+        self._model_lock.acquire()
+        try:
+            timings["queue_wait_ms"] = _elapsed_ms(model_lock_start)
+            if self._pose_only:
+                model_start = time.perf_counter()
+                pose_results = self.pose_model.predict(
+                    color_imgs,
+                    conf=self._pose_conf_threshold,
+                    classes=[0],
+                    imgsz=self._pose_infer_imgsz,
+                    device=self._device,
+                    verbose=False,
+                )
+                timings["pose_model_ms"] = _elapsed_ms(model_start)
+                timings["seg_model_ms"] = 0
+                timings["model_infer_ms"] = int(timings["pose_model_ms"])
+                timings["parallel_models"] = 0
+                if len(pose_results) != len(source_frames):
+                    raise RuntimeError(f"pose batch returned {len(pose_results)} results for {len(source_frames)} source frames")
+                seg_results = None
+                confidence_log_kwargs = {"pose_results": pose_results}
+            else:
+                model_start = time.perf_counter()
+                seg_persist = bool(self._persist_tracks and len(stream_groups) == 1)
+
+                def run_seg_model():
+                    seg_model_start = time.perf_counter()
+                    results = self.seg_model.track(
+                        color_imgs,
+                        conf=self._seg_conf_threshold,
+                        persist=seg_persist,
+                        tracker=TRACKER_CONFIG,
+                        classes=[0],
+                        imgsz=self._seg_infer_imgsz,
+                        device=self._device,
+                        verbose=False,
+                    )
+                    return results, _elapsed_ms(seg_model_start)
+
+                def run_pose_model():
+                    pose_model_start = time.perf_counter()
+                    results = self.pose_model.predict(
+                        color_imgs,
+                        conf=self._pose_conf_threshold,
+                        classes=[0],
+                        imgsz=self._pose_infer_imgsz,
+                        device=self._device,
+                        verbose=False,
+                    )
+                    return results, _elapsed_ms(pose_model_start)
+
+                if self._parallel_models and self._model_executor is not None:
+                    seg_future = self._model_executor.submit(run_seg_model)
+                    pose_future = self._model_executor.submit(run_pose_model)
+                    try:
+                        seg_results, timings["seg_model_ms"] = seg_future.result()
+                        pose_results, timings["pose_model_ms"] = pose_future.result()
+                    except Exception:
+                        for future in (seg_future, pose_future):
+                            future.cancel()
+                        for future in (seg_future, pose_future):
+                            if future.cancelled():
+                                continue
+                            try:
+                                future.result()
+                            except Exception:
+                                pass
+                        raise
+                    timings["parallel_models"] = 1
+                else:
+                    seg_results, timings["seg_model_ms"] = run_seg_model()
+                    pose_results, timings["pose_model_ms"] = run_pose_model()
+                    timings["parallel_models"] = 0
+
+                timings["model_infer_ms"] = _elapsed_ms(model_start)
+                if len(seg_results) != len(source_frames):
+                    raise RuntimeError(f"seg batch returned {len(seg_results)} results for {len(source_frames)} source frames")
+                if len(pose_results) != len(source_frames):
+                    raise RuntimeError(f"pose batch returned {len(pose_results)} results for {len(source_frames)} source frames")
+                confidence_log_kwargs = {
+                    "contour_results": seg_results,
+                    "pose_results": pose_results,
+                }
+        finally:
+            self._model_lock.release()
+
+        return _MultiStreamModelBatch(
+            input_count=len(items),
+            source_frames=source_frames,
+            stream_groups=stream_groups,
+            stream_order=stream_order,
+            seg_results=seg_results,
+            pose_results=pose_results,
+            timings=timings,
+            confidence_log_kwargs=confidence_log_kwargs,
+            total_start=total_start,
+        )
+
+    def _finish_multi_stream_model_batch(self, batch: _MultiStreamModelBatch) -> list[dict]:
+        source_frames = batch.source_frames
+        stream_groups = batch.stream_groups
+        stream_order = batch.stream_order
+        timings = batch.timings
+        pose_results = batch.pose_results or []
+        seg_results = batch.seg_results
+
+        state_lock_start = time.perf_counter()
+        self._lock.acquire()
+        original_state = self._capture_stream_state()
+        try:
+            timings["postprocess_queue_wait_ms"] = _elapsed_ms(state_lock_start)
+            if self._pose_only:
+                postprocess_start = time.perf_counter()
+                current_analyzed_by_input: dict[int, dict] = {}
+                output_frames_by_global: dict[int, dict] = {}
+                for stream_key in stream_order:
+                    group = stream_groups[stream_key]
+                    self._restore_stream_state(self._stream_states.get(stream_key))
+                    stream_analyzed: dict[int, dict] = {}
+                    for item in group:
+                        global_index = int(item["global_index"])
+                        stream_analyzed[global_index] = self._analyze_predecoded_unlocked(
+                            f"{item['frame_id']}_current",
+                            item["depth"],
+                            pose_result=pose_results[global_index],
+                            prepared=item.get("prepared"),
+                            finalize_qualitative=False,
+                        )
+                    self._apply_batch_pose_semantic_reuse(stream_analyzed)
+                    for item in group:
+                        self._finalize_analyzed_qualitative_fields(
+                            stream_analyzed[int(item["global_index"])]
+                        )
+                    if not self._stateless:
+                        self._stream_states[stream_key] = self._capture_stream_state()
+                    else:
+                        self._stream_states.pop(stream_key, None)
+                    for item in group:
+                        global_index = int(item["global_index"])
+                        current_analyzed_by_input[global_index] = stream_analyzed[global_index]
+                        output_frames_by_global[global_index] = {
+                            "frame_id": f"{item['frame_id']}_current",
+                            "source_frame_id": item["frame_id"],
+                            "global_index": global_index,
+                            "request_id": int(item["request_id"]),
+                            "input_index": int(item["input_index"]),
+                            "stream_key": stream_key,
+                            "result_kind": "current",
+                        }
+                timings["postprocess_ms"] = _elapsed_ms(postprocess_start)
+            else:
+                if seg_results is None:
+                    raise RuntimeError("missing contour results for multi-stream batch")
+                postprocess_start = time.perf_counter()
+                current_analyzed_by_input = {}
+                output_frames_by_global = {}
+                for stream_key in stream_order:
+                    group = stream_groups[stream_key]
+                    self._restore_stream_state(self._stream_states.get(stream_key))
+                    stream_analyzed: dict[int, dict] = {}
+                    distance_tasks: list[dict] = []
+                    for item in group:
+                        global_index = int(item["global_index"])
+                        stream_analyzed[global_index] = self._analyze_predecoded_unlocked(
+                            f"{item['frame_id']}_current",
+                            item["depth"],
+                            seg_result=seg_results[global_index],
+                            pose_result=pose_results[global_index],
+                            prepared=item.get("prepared"),
+                            distance_tasks=distance_tasks,
+                            finalize_qualitative=False,
+                        )
+                    self._finalize_deferred_distance_results(stream_analyzed, distance_tasks)
+                    self._apply_batch_pose_semantic_reuse(stream_analyzed)
+                    for item in group:
+                        self._finalize_analyzed_qualitative_fields(
+                            stream_analyzed[int(item["global_index"])]
+                        )
+                    if group and not self._stateless:
+                        self._last_source_depth = group[-1]["depth"].copy()
+                    if not self._stateless:
+                        self._stream_states[stream_key] = self._capture_stream_state()
+                    else:
+                        self._stream_states.pop(stream_key, None)
+                    for item in group:
+                        global_index = int(item["global_index"])
+                        current_analyzed_by_input[global_index] = stream_analyzed[global_index]
+                        output_frames_by_global[global_index] = {
+                            "frame_id": f"{item['frame_id']}_current",
+                            "source_frame_id": item["frame_id"],
+                            "global_index": global_index,
+                            "request_id": int(item["request_id"]),
+                            "input_index": int(item["input_index"]),
+                            "stream_key": stream_key,
+                            "result_kind": "current",
+                        }
+                timings["postprocess_ms"] = _elapsed_ms(postprocess_start)
+
+            interpolate_start = time.perf_counter()
+            output_frames = [output_frames_by_global[index] for index in range(len(source_frames))]
+            analyzed_results = [current_analyzed_by_input[index] for index in range(len(source_frames))]
+            timings["interpolate_ms"] = _elapsed_ms(interpolate_start)
+        finally:
+            self._restore_stream_state(original_state)
+            self._lock.release()
+
+        self._log_model_confidences(
+            len(source_frames),
+            current_analyzed_by_input,
+            **batch.confidence_log_kwargs,
+        )
+        results = self._encode_analyzed_results(analyzed_results, timings)
+        for result, item in zip(results, output_frames):
+            result["source_frame_id"] = item["source_frame_id"]
+            result["input_index"] = int(item["input_index"])
+            result["output_index"] = int(item["input_index"])
+            result["request_id"] = int(item["request_id"])
+            result["stream_key"] = item["stream_key"]
+            result["result_kind"] = item["result_kind"]
+        timings["total_ms"] = _elapsed_ms(batch.total_start)
+        self._log_batch_timings(batch.input_count, len(output_frames), timings)
+        return results
 
     def infer_multi_stream_batch(self, items: list[dict]) -> list[dict]:
         """Run one model batch while keeping postprocess caches isolated by stream_key."""

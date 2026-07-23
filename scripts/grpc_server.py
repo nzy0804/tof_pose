@@ -12,6 +12,7 @@ import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 
 import grpc
@@ -66,7 +67,13 @@ except Exception:
     pass
 
 from tof_pose.realtime_service import RealtimePoseEngine
+from tof_pose.model_bundle import (
+    ModelBundleMaterializer,
+    resolve_model_bundle_key_path,
+)
 from tof_pose.realtime_service import (
+    CONTOUR_EXISTING_TRACK_CONF_THRESHOLD,
+    CONTOUR_NEW_TRACK_CONF_THRESHOLD,
     CPU_WORKER_MODE_PROCESS,
     CPU_WORKER_MODE_THREAD,
     DISPLAY_GAMMA,
@@ -76,7 +83,6 @@ from tof_pose.realtime_service import (
     DEPTH_PERSON_DISTANCE_CLOSE_THRESHOLD,
     PERSON_FILL_BACKGROUND_DEFAULT,
     PERSON_FILL_BACKGROUND_BLEND,
-    PERSON_FILL_BACKGROUND_NAMES,
     PERSON_DISTANCE_CLOSE_CENTER_RATIO,
     PERSON_DISTANCE_CLOSE_GAP_RATIO,
     POSE_STATUS_THIGH_TORSO_RATIO_THRESHOLD,
@@ -146,11 +152,21 @@ class _DynamicInferBatcher:
         max_batch_size: int,
         max_wait_ms: int,
         max_queue_size: int,
+        min_batch_size: int = 1,
+        idle_wait_ms: int = 0,
     ) -> None:
         self._engine = engine
         self._instance_name = instance_name
         self._max_batch_size = max(1, int(max_batch_size))
+        self._min_batch_size = min(
+            self._max_batch_size,
+            max(1, int(min_batch_size)),
+        )
         self._max_wait_ms = max(0, int(max_wait_ms))
+        self._idle_wait_ms = min(
+            self._max_wait_ms,
+            max(0, int(idle_wait_ms)),
+        )
         self._max_queue_size = max(1, int(max_queue_size))
         self._condition = threading.Condition()
         self._queue: deque[_DynamicInferJob] = deque()
@@ -170,6 +186,14 @@ class _DynamicInferBatcher:
     @property
     def max_wait_ms(self) -> int:
         return self._max_wait_ms
+
+    @property
+    def min_batch_size(self) -> int:
+        return self._min_batch_size
+
+    @property
+    def idle_wait_ms(self) -> int:
+        return self._idle_wait_ms
 
     def close(self) -> None:
         with self._condition:
@@ -262,34 +286,80 @@ class _DynamicInferBatcher:
     def submit(self, *, stream_key: str, frames: list[tuple[str, bytes]]) -> list[dict]:
         return self.submit_async(stream_key=stream_key, frames=frames).result()
 
-    def _take_batch(self) -> tuple[list[_DynamicInferJob], int] | None:
+    def _take_batch(self) -> tuple[list[_DynamicInferJob], int, int] | None:
         with self._condition:
             while not self._queue and not self._closed:
                 self._condition.wait()
             if self._closed and not self._queue:
                 return None
 
-            first_enqueued_at = self._queue[0].enqueued_at
+            collect_started_at = time.perf_counter()
+            hard_deadline = collect_started_at + (self._max_wait_ms / 1000.0)
+            idle_deadline = collect_started_at + (self._idle_wait_ms / 1000.0)
+            last_queue_size = len(self._queue)
             while len(self._queue) < self._max_batch_size and not self._closed:
                 if self._max_wait_ms <= 0:
                     break
-                elapsed_ms = int((time.perf_counter() - first_enqueued_at) * 1000)
-                remaining_ms = self._max_wait_ms - elapsed_ms
-                if remaining_ms <= 0:
+
+                now = time.perf_counter()
+                if now >= hard_deadline:
                     break
-                self._condition.wait(timeout=remaining_ms / 1000.0)
+                if (
+                    len(self._queue) >= self._min_batch_size
+                    and (self._idle_wait_ms <= 0 or now >= idle_deadline)
+                ):
+                    break
+
+                wait_deadline = hard_deadline
+                if len(self._queue) >= self._min_batch_size:
+                    wait_deadline = min(wait_deadline, idle_deadline)
+                self._condition.wait(timeout=max(0.0, wait_deadline - now))
+
+                queue_size = len(self._queue)
+                if queue_size > last_queue_size:
+                    last_queue_size = queue_size
+                    idle_deadline = time.perf_counter() + (
+                        self._idle_wait_ms / 1000.0
+                    )
 
             batch_size = min(len(self._queue), self._max_batch_size)
             batch = [self._queue.popleft() for _ in range(batch_size)]
             queue_remaining = len(self._queue)
-            return batch, queue_remaining
+            coalesce_ms = int(
+                (time.perf_counter() - collect_started_at) * 1000
+            )
+            return batch, queue_remaining, coalesce_ms
+
+    def _complete_batch(
+        self,
+        batch_jobs: tuple[_DynamicInferJob, ...],
+        completed: Future,
+    ) -> None:
+        try:
+            results = completed.result()
+            if len(results) != len(batch_jobs):
+                raise RuntimeError(
+                    f"dynamic model batch returned {len(results)} results for {len(batch_jobs)} inputs"
+                )
+            for job, result in zip(batch_jobs, results):
+                if not job.future.done():
+                    job.future.set_result(result)
+        except Exception as exc:
+            logging.exception(
+                "Dynamic infer batch finalization failed: instance=%s frames=%d",
+                self._instance_name,
+                len(batch_jobs),
+            )
+            for job in batch_jobs:
+                if not job.future.done():
+                    job.future.set_exception(exc)
 
     def _run(self) -> None:
         while True:
             taken = self._take_batch()
             if taken is None:
                 return
-            batch, queue_remaining = taken
+            batch, queue_remaining, coalesce_ms = taken
             if not batch:
                 continue
 
@@ -299,13 +369,17 @@ class _DynamicInferBatcher:
             logging.info(
                 (
                     "Dynamic infer batch: instance=%s frames=%d requests=%d streams=%d "
-                    "wait_ms=%d max_batch_size=%d max_wait_ms=%d queue_remaining=%d"
+                    "wait_ms=%d coalesce_ms=%d min_batch_size=%d idle_wait_ms=%d "
+                    "max_batch_size=%d max_wait_ms=%d queue_remaining=%d"
                 ),
                 self._instance_name,
                 len(batch),
                 request_count,
                 stream_count,
                 wait_ms,
+                coalesce_ms,
+                self._min_batch_size,
+                self._idle_wait_ms,
                 self._max_batch_size,
                 self._max_wait_ms,
                 queue_remaining,
@@ -326,27 +400,9 @@ class _DynamicInferBatcher:
                     if not job.model_future.done():
                         job.model_future.set_result(None)
 
-                def complete_batch(completed: Future, batch_jobs: list[_DynamicInferJob] = batch) -> None:
-                    try:
-                        results = completed.result()
-                        if len(results) != len(batch_jobs):
-                            raise RuntimeError(
-                                f"dynamic model batch returned {len(results)} results for {len(batch_jobs)} inputs"
-                            )
-                        for job, result in zip(batch_jobs, results):
-                            if not job.future.done():
-                                job.future.set_result(result)
-                    except Exception as exc:
-                        logging.exception(
-                            "Dynamic infer batch finalization failed: instance=%s frames=%d",
-                            self._instance_name,
-                            len(batch_jobs),
-                        )
-                        for job in batch_jobs:
-                            if not job.future.done():
-                                job.future.set_exception(exc)
-
-                batch_result_future.add_done_callback(complete_batch)
+                batch_result_future.add_done_callback(
+                    partial(self._complete_batch, tuple(batch))
+                )
             except Exception as exc:
                 logging.exception("Dynamic infer batch failed: instance=%s frames=%d", self._instance_name, len(batch))
                 for job in batch:
@@ -818,6 +874,8 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         pose_fallback: bool = True,
         model_path: str | None = None,
         pose_model_path: str | None = None,
+        model_bundle_path: str | None = None,
+        model_bundle_key_path: str | None = None,
         seg_conf: float | None = 0.35,
         pose_conf: float | None = None,
         pose_kpt_conf: float | None = None,
@@ -826,11 +884,11 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         mask_threshold: float = 0.5,
         mask_min_area_ratio: float | None = None,
         mask_max_area_ratio: float | None = None,
-        contour_new_conf: float | None = None,
-        contour_existing_conf: float | None = None,
+        contour_new_conf: float | None = CONTOUR_NEW_TRACK_CONF_THRESHOLD,
+        contour_existing_conf: float | None = CONTOUR_EXISTING_TRACK_CONF_THRESHOLD,
         device: str | None = None,
         render_workers: int = 1,
-        decode_workers: int = 1,
+        decode_workers: int = 8,
         png_compression: int = 1,
         output_format: str = "jpeg",
         jpeg_quality: int = 80,
@@ -838,7 +896,7 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         ir_preprocess: bool = False,
         model_input_size: int = MODEL_INPUT_SIZE_320,
         display_gamma: float = DISPLAY_GAMMA,
-        person_fill_background: str | None = None,
+        person_fill_background: str | None = PERSON_FILL_BACKGROUND_DEFAULT,
         person_fill_background_blend: float = PERSON_FILL_BACKGROUND_BLEND,
         pose_status_thigh_torso_ratio_threshold: float = POSE_STATUS_THIGH_TORSO_RATIO_THRESHOLD,
         depth_distance_close_threshold: float = DEPTH_PERSON_DISTANCE_CLOSE_THRESHOLD,
@@ -853,7 +911,9 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         device_binding_ttl_sec: float = 120.0,
         dynamic_batching: bool = False,
         dynamic_max_batch_size: int = 80,
-        dynamic_max_wait_ms: int = 300,
+        dynamic_min_batch_size: int = 80,
+        dynamic_idle_wait_ms: int = 15,
+        dynamic_max_wait_ms: int = 150,
         dynamic_max_queue_size: int = 2000,
         async_infer: bool = False,
         async_device_window: int = 10,
@@ -862,10 +922,10 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         async_result_workers: int = 16,
         oss_config: ObjectStorageConfig | None = None,
         oss_workers: int | None = 4,
-        oss_download_workers: int | None = None,
-        oss_upload_workers: int | None = None,
-        oss_global_workers: int = 8,
-        oss_download_wait_timeout_ms: int = 150,
+        oss_download_workers: int | None = 8,
+        oss_upload_workers: int | None = 32,
+        oss_global_workers: int = 32,
+        oss_download_wait_timeout_ms: int = 0,
         oss_upload_wait_timeout_ms: int = 0,
         null_qualitative_results: bool = False,
     ):
@@ -879,7 +939,16 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         self._engine_device_counts = [0 for _ in range(self._engine_count)]
         self._dynamic_batching = bool(dynamic_batching)
         self._dynamic_max_batch_size = max(1, int(dynamic_max_batch_size))
+        self._dynamic_min_batch_size = min(
+            self._dynamic_max_batch_size,
+            max(1, int(dynamic_min_batch_size)),
+        )
+        self._dynamic_idle_wait_ms = max(0, int(dynamic_idle_wait_ms))
         self._dynamic_max_wait_ms = max(0, int(dynamic_max_wait_ms))
+        self._dynamic_idle_wait_ms = min(
+            self._dynamic_idle_wait_ms,
+            self._dynamic_max_wait_ms,
+        )
         self._dynamic_max_queue_size = max(1, int(dynamic_max_queue_size))
         self._dynamic_batchers: list[_DynamicInferBatcher] = []
         self._async_infer = bool(async_infer)
@@ -937,59 +1006,90 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
                 self._oss_download_wait_timeout_ms,
                 self._oss_upload_wait_timeout_ms,
             )
+        bundle_materializer: ModelBundleMaterializer | None = None
+        if model_bundle_path:
+            if model_path or pose_model_path:
+                raise ValueError(
+                    "model bundle cannot be combined with component model paths"
+                )
+            if not warmup_models:
+                raise ValueError("model warmup is required when loading a model bundle")
+            bundle_materializer = ModelBundleMaterializer(
+                model_bundle_path,
+                resolve_model_bundle_key_path(model_bundle_key_path),
+            )
+            model_path, pose_model_path = (
+                str(path) for path in bundle_materializer.__enter__()
+            )
+            logging.info("Authenticated model bundle opened for startup")
         for idx in range(self._engine_count):
             logging.info("Initializing AI model instance %d/%d on device=%s", idx + 1, self._engine_count, device or "auto")
-            self._engines.append(
-                RealtimePoseEngine(
-                    stateless=bool(stateless),
-                    pose_only=bool(pose_only),
-                    pose_validate_seg=bool(pose_validate_seg),
-                    pose_fallback=bool(pose_fallback),
-                    model_path=Path(model_path) if model_path else None,
-                    pose_model_path=Path(pose_model_path) if pose_model_path else None,
-                    seg_conf_threshold=seg_conf,
-                    pose_conf_threshold=pose_conf,
-                    pose_kpt_conf_threshold=pose_kpt_conf,
-                    pose_gate_kpt_conf_threshold=pose_gate_kpt_conf,
-                    pose_kpt_min_points=pose_kpt_min_points,
-                    mask_threshold=mask_threshold,
-                    mask_min_area_ratio=mask_min_area_ratio,
-                    mask_max_area_ratio=mask_max_area_ratio,
-                    contour_new_track_conf_threshold=contour_new_conf,
-                    contour_existing_track_conf_threshold=contour_existing_conf,
-                    device=device,
-                    render_workers=render_workers,
-                    decode_workers=decode_workers,
-                    png_compression=png_compression,
-                    output_format=output_format,
-                    jpeg_quality=jpeg_quality,
-                    input_modality=input_modality,
-                    ir_preprocess=ir_preprocess,
-                    model_input_size=model_input_size,
-                    display_gamma=display_gamma,
-                    person_fill_background=person_fill_background,
-                    person_fill_background_blend=person_fill_background_blend,
-                    pose_status_thigh_torso_ratio_threshold=pose_status_thigh_torso_ratio_threshold,
-                    depth_distance_close_threshold=depth_distance_close_threshold,
-                    ir_distance_close_gap_ratio=ir_distance_close_gap_ratio,
-                    ir_distance_close_center_ratio=ir_distance_close_center_ratio,
-                    cpu_worker_mode=cpu_worker_mode,
-                    cpu_process_start_method=cpu_process_start_method,
-                    instance_name=f"model-{idx}",
-                    parallel_models=parallel_models,
+            try:
+                self._engines.append(
+                    RealtimePoseEngine(
+                        stateless=bool(stateless),
+                        pose_only=bool(pose_only),
+                        pose_validate_seg=bool(pose_validate_seg),
+                        pose_fallback=bool(pose_fallback),
+                        model_path=Path(model_path) if model_path else None,
+                        pose_model_path=Path(pose_model_path) if pose_model_path else None,
+                        seg_conf_threshold=seg_conf,
+                        pose_conf_threshold=pose_conf,
+                        pose_kpt_conf_threshold=pose_kpt_conf,
+                        pose_gate_kpt_conf_threshold=pose_gate_kpt_conf,
+                        pose_kpt_min_points=pose_kpt_min_points,
+                        mask_threshold=mask_threshold,
+                        mask_min_area_ratio=mask_min_area_ratio,
+                        mask_max_area_ratio=mask_max_area_ratio,
+                        contour_new_track_conf_threshold=contour_new_conf,
+                        contour_existing_track_conf_threshold=contour_existing_conf,
+                        device=device,
+                        render_workers=render_workers,
+                        decode_workers=decode_workers,
+                        png_compression=png_compression,
+                        output_format=output_format,
+                        jpeg_quality=jpeg_quality,
+                        input_modality=input_modality,
+                        ir_preprocess=ir_preprocess,
+                        model_input_size=model_input_size,
+                        display_gamma=display_gamma,
+                        person_fill_background=person_fill_background,
+                        person_fill_background_blend=person_fill_background_blend,
+                        pose_status_thigh_torso_ratio_threshold=pose_status_thigh_torso_ratio_threshold,
+                        depth_distance_close_threshold=depth_distance_close_threshold,
+                        ir_distance_close_gap_ratio=ir_distance_close_gap_ratio,
+                        ir_distance_close_center_ratio=ir_distance_close_center_ratio,
+                        cpu_worker_mode=cpu_worker_mode,
+                        cpu_process_start_method=cpu_process_start_method,
+                        instance_name=f"model-{idx}",
+                        parallel_models=parallel_models,
+                    )
                 )
-            )
+            except BaseException:
+                if bundle_materializer is not None:
+                    bundle_materializer.close()
+                raise
         if warmup_models:
             warmup_batch_size = max(1, int(warmup_batch_size))
-            for idx, engine in enumerate(self._engines):
-                logging.info("Warming AI model instance %d/%d with batch_size=%d", idx + 1, self._engine_count, warmup_batch_size)
-                engine.warmup(batch_size=warmup_batch_size)
+            try:
+                for idx, engine in enumerate(self._engines):
+                    logging.info("Warming AI model instance %d/%d with batch_size=%d", idx + 1, self._engine_count, warmup_batch_size)
+                    engine.warmup(batch_size=warmup_batch_size)
+            except BaseException:
+                if bundle_materializer is not None:
+                    bundle_materializer.close()
+                raise
+        if bundle_materializer is not None:
+            bundle_materializer.close()
+            logging.info("Temporary model components removed after warmup")
         if self._dynamic_batching:
             self._dynamic_batchers = [
                 _DynamicInferBatcher(
                     engine=engine,
                     instance_name=f"model-{idx}",
                     max_batch_size=self._dynamic_max_batch_size,
+                    min_batch_size=self._dynamic_min_batch_size,
+                    idle_wait_ms=self._dynamic_idle_wait_ms,
                     max_wait_ms=self._dynamic_max_wait_ms,
                     max_queue_size=self._dynamic_max_queue_size,
                 )
@@ -998,10 +1098,13 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
             logging.info(
                 (
                     "Dynamic batching enabled: model_instances=%d max_batch_size=%d "
-                    "max_wait_ms=%d max_queue_size=%d"
+                    "min_batch_size=%d idle_wait_ms=%d max_wait_ms=%d "
+                    "max_queue_size=%d"
                 ),
                 self._engine_count,
                 self._dynamic_max_batch_size,
+                self._dynamic_min_batch_size,
+                self._dynamic_idle_wait_ms,
                 self._dynamic_max_wait_ms,
                 self._dynamic_max_queue_size,
             )
@@ -1460,7 +1563,7 @@ def serve(
     host: str = '0.0.0.0',
     port: int = 50052,
     max_workers: int = 4,
-    max_msg_mb: int = 50,
+    max_msg_mb: int = 250,
     *,
     stateless: bool = False,
     pose_only: bool = False,
@@ -1468,6 +1571,8 @@ def serve(
     pose_fallback: bool = True,
     model_path: str | None = None,
     pose_model_path: str | None = None,
+    model_bundle_path: str | None = None,
+    model_bundle_key_path: str | None = None,
     seg_conf: float | None = 0.35,
     pose_conf: float | None = None,
     pose_kpt_conf: float | None = None,
@@ -1476,11 +1581,11 @@ def serve(
     mask_threshold: float = 0.5,
     mask_min_area_ratio: float | None = None,
     mask_max_area_ratio: float | None = None,
-    contour_new_conf: float | None = None,
-    contour_existing_conf: float | None = None,
+    contour_new_conf: float | None = CONTOUR_NEW_TRACK_CONF_THRESHOLD,
+    contour_existing_conf: float | None = CONTOUR_EXISTING_TRACK_CONF_THRESHOLD,
     device: str | None = None,
     render_workers: int = 1,
-    decode_workers: int = 1,
+    decode_workers: int = 8,
     png_compression: int = 1,
     output_format: str = "jpeg",
     jpeg_quality: int = 80,
@@ -1488,7 +1593,7 @@ def serve(
     ir_preprocess: bool = False,
     model_input_size: int = MODEL_INPUT_SIZE_320,
     display_gamma: float = DISPLAY_GAMMA,
-    person_fill_background: str | None = None,
+    person_fill_background: str | None = PERSON_FILL_BACKGROUND_DEFAULT,
     person_fill_background_blend: float = PERSON_FILL_BACKGROUND_BLEND,
     pose_status_thigh_torso_ratio_threshold: float = POSE_STATUS_THIGH_TORSO_RATIO_THRESHOLD,
     depth_distance_close_threshold: float = DEPTH_PERSON_DISTANCE_CLOSE_THRESHOLD,
@@ -1503,7 +1608,9 @@ def serve(
     device_binding_ttl_sec: float = 120.0,
     dynamic_batching: bool = False,
     dynamic_max_batch_size: int = 80,
-    dynamic_max_wait_ms: int = 300,
+    dynamic_min_batch_size: int = 80,
+    dynamic_idle_wait_ms: int = 15,
+    dynamic_max_wait_ms: int = 150,
     dynamic_max_queue_size: int = 2000,
     async_infer: bool = False,
     async_device_window: int = 10,
@@ -1512,10 +1619,10 @@ def serve(
     async_result_workers: int = 16,
     oss_config: ObjectStorageConfig | None = None,
     oss_workers: int | None = 4,
-    oss_download_workers: int | None = None,
-    oss_upload_workers: int | None = None,
-    oss_global_workers: int = 8,
-    oss_download_wait_timeout_ms: int = 150,
+    oss_download_workers: int | None = 8,
+    oss_upload_workers: int | None = 32,
+    oss_global_workers: int = 32,
+    oss_download_wait_timeout_ms: int = 0,
     oss_upload_wait_timeout_ms: int = 0,
     null_qualitative_results: bool = False,
 ):
@@ -1533,6 +1640,8 @@ def serve(
             pose_fallback=pose_fallback,
             model_path=model_path,
             pose_model_path=pose_model_path,
+            model_bundle_path=model_bundle_path,
+            model_bundle_key_path=model_bundle_key_path,
             seg_conf=seg_conf,
             pose_conf=pose_conf,
             pose_kpt_conf=pose_kpt_conf,
@@ -1568,6 +1677,8 @@ def serve(
             device_binding_ttl_sec=device_binding_ttl_sec,
             dynamic_batching=dynamic_batching,
             dynamic_max_batch_size=dynamic_max_batch_size,
+            dynamic_min_batch_size=dynamic_min_batch_size,
+            dynamic_idle_wait_ms=dynamic_idle_wait_ms,
             dynamic_max_wait_ms=dynamic_max_wait_ms,
             dynamic_max_queue_size=dynamic_max_queue_size,
             async_infer=async_infer,
@@ -1616,11 +1727,9 @@ def serve(
     logging.info(
         (
             'Starting gRPC server on %s (max_msg_mb=%d, max_workers=%d, model_instances=%d, '
-            'parallel_models=%s, cpu_worker_mode=%s, cpu_process_start_method=%s, input_modality=%s, '
-            'ir_preprocess=%s, model_input_size=%d, display_gamma=%.3f, '
-            'person_fill_background=%s, person_fill_background_blend=%.3f, '
-            'pose_status_thigh_torso_ratio_threshold=%.3f, depth_distance_close_threshold=%.3f, ir_distance_close_gap_ratio=%.3f, '
-            'ir_distance_close_center_ratio=%.3f, dynamic_batching=%s, dynamic_max_batch_size=%d, '
+            'parallel_models=%s, cpu_worker_mode=%s, cpu_process_start_method=%s, '
+            'dynamic_batching=%s, dynamic_max_batch_size=%d, dynamic_min_batch_size=%d, '
+            'dynamic_idle_wait_ms=%d, '
             'dynamic_max_wait_ms=%d, dynamic_max_queue_size=%d, async_infer=%s, '
             'async_device_window=%d, async_result_buffer_size=%d, async_prepare_workers=%d, '
             'async_result_workers=%d)'
@@ -1632,18 +1741,10 @@ def serve(
         "true" if parallel_models else "false",
         cpu_worker_mode,
         cpu_process_start_method,
-        input_modality,
-        "true" if ir_preprocess else "false",
-        model_input_size,
-        display_gamma,
-        person_fill_background or PERSON_FILL_BACKGROUND_DEFAULT,
-        person_fill_background_blend,
-        pose_status_thigh_torso_ratio_threshold,
-        depth_distance_close_threshold,
-        ir_distance_close_gap_ratio,
-        ir_distance_close_center_ratio,
         "true" if dynamic_batching else "false",
         dynamic_max_batch_size,
+        dynamic_min_batch_size,
+        dynamic_idle_wait_ms,
         dynamic_max_wait_ms,
         dynamic_max_queue_size,
         "true" if async_infer else "false",
@@ -1665,18 +1766,23 @@ def main():
     parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--port', default=50052, type=int)
     parser.add_argument('--max-workers', default=4, type=int)
-    parser.add_argument('--max-msg-mb', default=50, type=int)
-    parser.add_argument('--model-path', default=None, help='override seg model path')
-    parser.add_argument('--pose-model-path', default=None, help='override pose model path')
-    parser.add_argument('--seg-conf', default=0.35, type=float, help='segmentation confidence threshold')
+    parser.add_argument('--max-msg-mb', default=250, type=int)
+    parser.add_argument(
+        '--model-bundle-path',
+        default=None,
+        help='authenticated model bundle path',
+    )
+    parser.add_argument(
+        '--model-bundle-key-path',
+        default=None,
+        help='model bundle key path; defaults to MAIXSENSE_MODEL_KEY_PATH',
+    )
+    parser.add_argument('--model-path', default=None, help=argparse.SUPPRESS)
+    parser.add_argument('--pose-model-path', default=None, help=argparse.SUPPRESS)
     parser.add_argument('--pose-conf', default=None, type=float, help='override pose confidence threshold')
-    parser.add_argument('--pose-gate-kpt-conf', default=0.4, type=float, help='pose keypoint threshold used to validate segmentation tracks')
-    parser.add_argument('--pose-kpt-min-points', default=6, type=int, help='min confident keypoints to count one person in pose-only mode')
     parser.add_argument('--mask-threshold', default=0.5, type=float, help='mask binarization threshold for contours')
     parser.add_argument('--mask-min-area-ratio', default=None, type=float, help='minimum mask area ratio accepted for contours')
     parser.add_argument('--mask-max-area-ratio', default=None, type=float, help='maximum mask area ratio accepted for contours')
-    parser.add_argument('--contour-new-conf', default=None, type=float, help='confidence threshold for accepting a new contour track')
-    parser.add_argument('--contour-existing-conf', default=None, type=float, help='confidence threshold for keeping a consistent existing contour track')
     parser.add_argument('--device', default=None, help='model inference device, for example cuda:0 or cpu')
     parser.add_argument(
         '--render-workers',
@@ -1686,7 +1792,7 @@ def main():
     )
     parser.add_argument(
         '--decode-workers',
-        default=1,
+        default=8,
         type=int,
         help='CPU workers for decoding input images and preparing model inputs',
     )
@@ -1722,42 +1828,10 @@ def main():
         help='gamma correction for display/render input images; 1.0 disables, higher values brighten dark regions',
     )
     parser.add_argument(
-        '--person-fill-background',
-        default=PERSON_FILL_BACKGROUND_DEFAULT,
-        help=(
-            'background image used to fill detected person masks; pass an asset name '
-            f'({", ".join(PERSON_FILL_BACKGROUND_NAMES)}) or an image file path'
-        ),
-    )
-    parser.add_argument(
-        '--person-fill-background-blend',
-        default=PERSON_FILL_BACKGROUND_BLEND,
-        type=float,
-        help='background gray blend ratio for filled person masks, 0 keeps original person gray and 1 uses background gray',
-    )
-    parser.add_argument(
         '--pose-status-thigh-torso-ratio-threshold',
         default=POSE_STATUS_THIGH_TORSO_RATIO_THRESHOLD,
         type=float,
         help='person_status threshold: thigh_y / torso_y <= this value is sitting, otherwise standing',
-    )
-    parser.add_argument(
-        '--depth-distance-close-threshold',
-        default=DEPTH_PERSON_DISTANCE_CLOSE_THRESHOLD,
-        type=float,
-        help='depth-mode close/far threshold for pairwise person distance',
-    )
-    parser.add_argument(
-        '--ir-distance-close-gap-ratio',
-        default=PERSON_DISTANCE_CLOSE_GAP_RATIO,
-        type=float,
-        help='IR-mode close/far threshold as image-width gap ratio',
-    )
-    parser.add_argument(
-        '--ir-distance-close-center-ratio',
-        default=PERSON_DISTANCE_CLOSE_CENTER_RATIO,
-        type=float,
-        help='IR-mode close/far threshold as average-person-extent center-distance ratio',
     )
     parser.add_argument(
         '--model-instances',
@@ -1789,10 +1863,22 @@ def main():
         help='maximum frames in one dynamic model batch before immediate inference',
     )
     parser.add_argument(
-        '--dynamic-max-wait-ms',
-        default=300,
+        '--dynamic-min-batch-size',
+        default=80,
         type=int,
-        help='maximum milliseconds the first queued frame waits for more frames before inference',
+        help='minimum queued frames before the short idle coalescing deadline applies',
+    )
+    parser.add_argument(
+        '--dynamic-idle-wait-ms',
+        default=15,
+        type=int,
+        help='milliseconds to wait after the latest arrival once the minimum batch size is reached',
+    )
+    parser.add_argument(
+        '--dynamic-max-wait-ms',
+        default=150,
+        type=int,
+        help='hard maximum milliseconds spent collecting each dynamic batch',
     )
     parser.add_argument(
         '--dynamic-max-queue-size',
@@ -1851,25 +1937,25 @@ def main():
     )
     parser.add_argument(
         '--oss-download-workers',
-        default=None,
+        default=8,
         type=int,
-        help='per-request concurrent workers for object storage downloads; defaults to --oss-workers',
+        help='per-request concurrent workers for object storage downloads',
     )
     parser.add_argument(
         '--oss-upload-workers',
-        default=None,
+        default=32,
         type=int,
-        help='per-request concurrent workers for object storage uploads; defaults to --oss-workers',
+        help='per-request concurrent workers for object storage uploads',
     )
     parser.add_argument(
         '--oss-global-workers',
-        default=8,
+        default=32,
         type=int,
         help='global concurrent object storage operations shared by all requests; 0 disables global limiting',
     )
     parser.add_argument(
         '--oss-download-wait-timeout-ms',
-        default=150,
+        default=0,
         type=int,
         help='maximum milliseconds to wait for request image downloads before failing the request; 0 waits for all downloads',
     )
@@ -1908,16 +1994,13 @@ def main():
         pose_fallback=True,
         model_path=args.model_path,
         pose_model_path=args.pose_model_path,
-        seg_conf=args.seg_conf,
+        model_bundle_path=args.model_bundle_path,
+        model_bundle_key_path=args.model_bundle_key_path,
         pose_conf=args.pose_conf,
         pose_kpt_conf=None,
-        pose_gate_kpt_conf=args.pose_gate_kpt_conf,
-        pose_kpt_min_points=args.pose_kpt_min_points,
         mask_threshold=args.mask_threshold,
         mask_min_area_ratio=args.mask_min_area_ratio,
         mask_max_area_ratio=args.mask_max_area_ratio,
-        contour_new_conf=args.contour_new_conf,
-        contour_existing_conf=args.contour_existing_conf,
         device=args.device,
         render_workers=args.render_workers,
         decode_workers=args.decode_workers,
@@ -1928,12 +2011,7 @@ def main():
         ir_preprocess=False,
         model_input_size=args.model_size,
         display_gamma=args.display_gamma,
-        person_fill_background=args.person_fill_background,
-        person_fill_background_blend=args.person_fill_background_blend,
         pose_status_thigh_torso_ratio_threshold=args.pose_status_thigh_torso_ratio_threshold,
-        depth_distance_close_threshold=args.depth_distance_close_threshold,
-        ir_distance_close_gap_ratio=args.ir_distance_close_gap_ratio,
-        ir_distance_close_center_ratio=args.ir_distance_close_center_ratio,
         cpu_worker_mode=args.cpu_worker_mode,
         cpu_process_start_method=args.cpu_process_start_method,
         model_instances=args.model_instances,
@@ -1943,6 +2021,8 @@ def main():
         device_binding_ttl_sec=args.device_binding_ttl_sec,
         dynamic_batching=args.dynamic_batching,
         dynamic_max_batch_size=args.dynamic_max_batch_size,
+        dynamic_min_batch_size=args.dynamic_min_batch_size,
+        dynamic_idle_wait_ms=args.dynamic_idle_wait_ms,
         dynamic_max_wait_ms=args.dynamic_max_wait_ms,
         dynamic_max_queue_size=args.dynamic_max_queue_size,
         async_infer=args.async_infer,

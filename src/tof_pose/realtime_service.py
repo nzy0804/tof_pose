@@ -35,7 +35,7 @@ POSE_INFER_INTERVAL = 1
 DISPLAY_SIZE = (320, 320)
 SKELETON_CONTOUR_OUTPUT_SIZE = (100, 100)
 DISPLAY_SCALE = 3
-DISPLAY_GAMMA = 1.5
+DISPLAY_GAMMA = 5.0
 
 MEDIAN_BLUR_K = 5
 CLAHE_CLIP_LIMIT = 2.0
@@ -1685,7 +1685,7 @@ class RealtimePoseEngine:
         contour_existing_track_conf_threshold: float | None = None,
         device: str | None = None,
         render_workers: int = 1,
-        decode_workers: int = 1,
+        decode_workers: int = 8,
         png_compression: int = 1,
         output_format: str = "png",
         jpeg_quality: int = 80,
@@ -1697,7 +1697,7 @@ class RealtimePoseEngine:
         ir_preprocess: bool = False,
         model_input_size: int = MODEL_INPUT_SIZE_320,
         display_gamma: float = DISPLAY_GAMMA,
-        person_fill_background: str | None = None,
+        person_fill_background: str | None = PERSON_FILL_BACKGROUND_DEFAULT,
         person_fill_background_blend: float = PERSON_FILL_BACKGROUND_BLEND,
         pose_status_thigh_torso_ratio_threshold: float = POSE_STATUS_THIGH_TORSO_RATIO_THRESHOLD,
         depth_distance_close_threshold: float = DEPTH_PERSON_DISTANCE_CLOSE_THRESHOLD,
@@ -1707,8 +1707,8 @@ class RealtimePoseEngine:
         model_file = Path(model_path) if model_path else DEFAULT_MODEL_PATH
         pose_model_file = Path(pose_model_path) if pose_model_path else DEFAULT_POSE_MODEL_PATH
 
-        self.seg_model = MODEL_CLS(str(model_file))
-        self.pose_model = MODEL_CLS(str(pose_model_file))
+        self.seg_model = MODEL_CLS(str(model_file), task="segment")
+        self.pose_model = MODEL_CLS(str(pose_model_file), task="pose")
         self._device = str(device).strip() if device else None
         self._instance_name = str(instance_name).strip() if instance_name else "model-0"
         self._render_workers = max(1, int(render_workers))
@@ -1996,10 +1996,9 @@ class RealtimePoseEngine:
             self.reset()
 
         LOGGER.info(
-            "Warmup timing: instance=%s batch_size=%d model_input_size=%d seg_model_ms=%d pose_model_ms=%d total_ms=%d device=%s",
+            "Warmup timing: instance=%s batch_size=%d seg_model_ms=%d pose_model_ms=%d total_ms=%d device=%s",
             self._instance_name,
             batch_size,
-            self._model_input_size,
             seg_model_ms,
             pose_model_ms,
             total_ms,
@@ -3374,8 +3373,7 @@ class RealtimePoseEngine:
                 "postprocess_ms=%d postprocess_queue_wait_ms=%d interpolate_ms=%d "
                 "render_ms=%d png_encode_ms=%d total_ms=%d "
                 "decode_workers=%d render_workers=%d cpu_worker_mode=%s cpu_process_start_method=%s "
-                "png_compression=%d output_format=%s jpeg_quality=%d input_modality=%s "
-                "model_input_size=%d device=%s"
+                "png_compression=%d output_format=%s jpeg_quality=%d device=%s"
             ),
             input_count,
             output_count,
@@ -3402,8 +3400,6 @@ class RealtimePoseEngine:
             self._png_compression,
             self._output_format,
             self._jpeg_quality,
-            self._input_modality,
-            self._model_input_size,
             self._device or "auto",
         )
 
@@ -3415,6 +3411,9 @@ class RealtimePoseEngine:
         contour_results=None,
         pose_results=None,
     ) -> None:
+        if not LOGGER.isEnabledFor(logging.DEBUG):
+            return
+
         contour_counts: list[int] = []
         contour_conf_max: list[float | None] = []
         contour_conf_values: list[float] = []
@@ -3488,7 +3487,7 @@ class RealtimePoseEngine:
             final_person_counts.append(int(analyzed_wrapper.get("person_count", analyzed.get("person_count", 0))))
             pose_fallback_counts.append(len(analyzed.get("pose_fallback_indices") or []))
 
-        LOGGER.info(
+        LOGGER.debug(
             (
                 "Infer model confidence: instance=%s inputs=%d "
                 "contour_threshold=%.3f mask_threshold=%.3f mask_area_ratio=[%.3f,%.3f] "

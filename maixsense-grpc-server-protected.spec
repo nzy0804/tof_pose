@@ -40,6 +40,7 @@ protected_modules = [
     "ai_pb2",
     "ai_pb2_grpc",
     "scripts.grpc_server",
+    "tof_pose.input_image",
     "tof_pose.realtime_service",
     "tof_pose.tracking",
     "tof_pose.object_storage",

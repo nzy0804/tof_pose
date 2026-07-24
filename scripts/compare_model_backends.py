@@ -170,8 +170,13 @@ def _run_backend(
     decode_start = time.perf_counter()
     decoded_frames = engine._decode_frames(frames)
     source_frames = [
-        {"frame_id": frame_id, "input_index": index, "depth": depth}
-        for index, (frame_id, depth) in enumerate(decoded_frames)
+        {
+            "frame_id": frame_id,
+            "input_index": index,
+            "depth": depth,
+            "received_depth": received_depth,
+        }
+        for index, (frame_id, depth, received_depth) in enumerate(decoded_frames)
     ]
     decode_ms = int((time.perf_counter() - decode_start) * 1000)
 

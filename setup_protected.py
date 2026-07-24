@@ -13,6 +13,7 @@ PROTECTED_MODULES = {
     "ai_pb2": "ai_pb2.py",
     "ai_pb2_grpc": "ai_pb2_grpc.py",
     "scripts.grpc_server": "scripts/grpc_server.py",
+    "tof_pose.input_image": "src/tof_pose/input_image.py",
     "tof_pose.realtime_service": "src/tof_pose/realtime_service.py",
     "tof_pose.tracking": "src/tof_pose/tracking.py",
     "tof_pose.person_distance": "src/tof_pose/person_distance.py",

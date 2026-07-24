@@ -17,6 +17,9 @@ import ultralytics as _ultralytics
 MODEL_CLS = getattr(_ultralytics, ''.join(chr(code) for code in (89, 79, 76, 79)))
 
 from tof_pose.paths import DEFAULT_MODEL_PATH, DEFAULT_POSE_MODEL_PATH
+from tof_pose.input_image import (
+    decode_received_grayscale_views,
+)
 from tof_pose.person_distance import estimate_person_distance_from_mask, extract_draw_contour_from_mask
 from tof_pose.pose_drawing import draw_stick_figure
 from tof_pose.tracking import Detection, PersonTracker
@@ -35,7 +38,6 @@ POSE_INFER_INTERVAL = 1
 DISPLAY_SIZE = (320, 320)
 SKELETON_CONTOUR_OUTPUT_SIZE = (100, 100)
 DISPLAY_SCALE = 3
-DISPLAY_GAMMA = 5.0
 
 MEDIAN_BLUR_K = 5
 CLAHE_CLIP_LIMIT = 2.0
@@ -286,19 +288,17 @@ def _ensure_uint8_gray_cpu(gray: np.ndarray) -> np.ndarray:
     return normalized.astype(np.uint8)
 
 
-def _decode_image_bytes_cpu(data: bytes) -> np.ndarray:
-    arr = np.frombuffer(data, dtype=np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
-    if img is None:
-        raise ValueError("cannot decode image")
-    if img.ndim == 3:
-        return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    return img
+def _decode_image_views_cpu(data: bytes) -> tuple[np.ndarray, np.ndarray]:
+    received, decrypted = decode_received_grayscale_views(data)
+    return decrypted, received
 
 
-def _decode_frame_cpu(frame: tuple[str, bytes]) -> tuple[str, np.ndarray]:
+def _decode_frame_cpu(
+    frame: tuple[str, bytes],
+) -> tuple[str, np.ndarray, np.ndarray]:
     frame_id, image_bytes = frame
-    return frame_id, _decode_image_bytes_cpu(image_bytes)
+    decrypted, received = _decode_image_views_cpu(image_bytes)
+    return frame_id, decrypted, received
 
 
 def _normalize_input_modality(input_modality: str | None) -> str:
@@ -321,16 +321,6 @@ def _apply_display_colormap(depth_u8: np.ndarray, input_modality: str) -> np.nda
     if input_modality == INPUT_MODALITY_DEPTH:
         return _apply_depth_display_colormap(depth_u8)
     return _gray_to_bgr(depth_u8)
-
-
-def _apply_display_gamma_u8(image_u8: np.ndarray, gamma: float = DISPLAY_GAMMA) -> np.ndarray:
-    if image_u8.dtype != np.uint8:
-        image_u8 = np.clip(image_u8, 0, 255).astype(np.uint8)
-    gamma = float(gamma)
-    if gamma <= 0 or abs(gamma - 1.0) < 1e-3:
-        return image_u8.copy()
-    table = ((np.arange(256, dtype=np.float32) / 255.0) ** (1.0 / gamma) * 255.0)
-    return cv2.LUT(image_u8, np.clip(table, 0, 255).astype(np.uint8))
 
 
 def _gray_to_bgr(gray_u8: np.ndarray) -> np.ndarray:
@@ -378,15 +368,21 @@ def _prepare_depth_views_cpu(
     depth_gray: np.ndarray,
     input_modality: str = INPUT_MODALITY_DEPTH,
     *,
+    received_gray: np.ndarray | None = None,
     ir_preprocess: bool = False,
     model_input_size: int = MODEL_INPUT_SIZE_320,
-    display_gamma: float = DISPLAY_GAMMA,
 ) -> dict:
     model_input_size = normalize_model_input_size(model_input_size)
     width, height = DISPLAY_SIZE
     modality = _normalize_input_modality(input_modality)
     depth_u8 = _ensure_uint8_gray_cpu(depth_gray)
     input_source = depth_u8
+    received_source = (
+        input_source
+        if received_gray is None
+        else _ensure_uint8_gray_cpu(received_gray)
+    )
+    render_source_img = _gray_to_bgr(received_source)
     depth_raw = cv2.resize(input_source, DISPLAY_SIZE, interpolation=cv2.INTER_LINEAR)
 
     enhanced = input_source
@@ -397,17 +393,17 @@ def _prepare_depth_views_cpu(
 
     depth_up = cv2.resize(enhanced, DISPLAY_SIZE, interpolation=cv2.INTER_LINEAR)
     model_depth = cv2.resize(enhanced, (model_input_size, model_input_size), interpolation=cv2.INTER_LINEAR)
-    display_depth_up = _apply_display_gamma_u8(depth_up, display_gamma)
     if modality == INPUT_MODALITY_IR:
-        color_img = _gray_to_bgr(display_depth_up)
+        color_img = _gray_to_bgr(depth_up)
         model_color_img = _gray_to_bgr(model_depth)
     else:
         model_color_img = cv2.applyColorMap(model_depth, cv2.COLORMAP_MAGMA)
-        color_img = _apply_display_colormap(display_depth_up, modality)
+        color_img = _apply_display_colormap(depth_up, modality)
     return {
-        "depth_up": display_depth_up,
+        "depth_up": depth_up,
         "depth_raw": depth_raw,
         "color_img": color_img,
+        "render_source_img": render_source_img,
         "model_color_img": model_color_img,
         "model_input_size": model_input_size,
         "model_width": int(model_input_size),
@@ -426,31 +422,31 @@ def _prepare_color_image_cpu(payload) -> np.ndarray:
 def _prepare_depth_views_payload_cpu(payload) -> dict:
     if isinstance(payload, tuple):
         if len(payload) >= 5:
-            depth_gray, input_modality, ir_preprocess, model_input_size, display_gamma = payload[:5]
+            depth_gray, input_modality, ir_preprocess, model_input_size, received_gray = payload[:5]
         elif len(payload) >= 4:
             depth_gray, input_modality, ir_preprocess, model_input_size = payload[:4]
-            display_gamma = DISPLAY_GAMMA
+            received_gray = None
         elif len(payload) >= 3:
             depth_gray, input_modality, ir_preprocess = payload[:3]
             model_input_size = MODEL_INPUT_SIZE_320
-            display_gamma = DISPLAY_GAMMA
+            received_gray = None
         else:
             depth_gray, input_modality = payload
             ir_preprocess = False
             model_input_size = MODEL_INPUT_SIZE_320
-            display_gamma = DISPLAY_GAMMA
+            received_gray = None
     else:
         depth_gray = payload
         input_modality = INPUT_MODALITY_DEPTH
         ir_preprocess = False
         model_input_size = MODEL_INPUT_SIZE_320
-        display_gamma = DISPLAY_GAMMA
+        received_gray = None
     return _prepare_depth_views_cpu(
         depth_gray,
         input_modality=input_modality,
+        received_gray=received_gray,
         ir_preprocess=bool(ir_preprocess),
         model_input_size=model_input_size,
-        display_gamma=display_gamma,
     )
 
 
@@ -1404,6 +1400,28 @@ def _fill_person_contour_region(
     return _fill_person_mask_region_roi(display, mask, x1, y1, background, background_blend)
 
 
+def _render_base_image_cpu(
+    analysis: dict,
+    target_width: int,
+    target_height: int,
+) -> np.ndarray:
+    source = analysis.get("render_source_img")
+    if not isinstance(source, np.ndarray) or source.ndim not in (2, 3):
+        source = analysis["color_img"]
+    if source.ndim == 2:
+        source = _gray_to_bgr(_ensure_uint8_gray_cpu(source))
+    if source.shape[:2] == (target_height, target_width):
+        return source.copy()
+
+    source_height, source_width = source.shape[:2]
+    interpolation = (
+        cv2.INTER_AREA
+        if target_width < source_width or target_height < source_height
+        else cv2.INTER_LINEAR
+    )
+    return cv2.resize(source, (target_width, target_height), interpolation=interpolation)
+
+
 def _render_skeleton_contour_cpu(
     analysis: dict,
     output_size: tuple[int, int] | None = None,
@@ -1427,20 +1445,7 @@ def _render_skeleton_contour_cpu(
     if target_width <= 0 or target_height <= 0:
         raise ValueError("output_size must be positive")
 
-    if target_width == source_width and target_height == source_height:
-        display = source.copy()
-    else:
-        depth_up = analysis.get("depth_up")
-        if (
-            analysis.get("input_modality") == INPUT_MODALITY_IR
-            and isinstance(depth_up, np.ndarray)
-            and depth_up.ndim == 2
-            and depth_up.shape[:2] == (source_height, source_width)
-        ):
-            display_gray = cv2.resize(depth_up, (target_width, target_height), interpolation=cv2.INTER_AREA)
-            display = _gray_to_bgr(display_gray)
-        else:
-            display = cv2.resize(source, (target_width, target_height), interpolation=cv2.INTER_AREA)
+    display = _render_base_image_cpu(analysis, target_width, target_height)
 
     scale_x = float(target_width) / float(source_width)
     scale_y = float(target_height) / float(source_height)
@@ -1763,7 +1768,6 @@ class RealtimePoseEngine:
         input_modality: str = INPUT_MODALITY_DEPTH,
         ir_preprocess: bool = False,
         model_input_size: int = MODEL_INPUT_SIZE_320,
-        display_gamma: float = DISPLAY_GAMMA,
         person_fill_background: str | None = PERSON_FILL_BACKGROUND_DEFAULT,
         person_fill_background_blend: float = PERSON_FILL_BACKGROUND_BLEND,
         pose_status_thigh_torso_ratio_threshold: float = POSE_STATUS_THIGH_TORSO_RATIO_THRESHOLD,
@@ -1815,7 +1819,6 @@ class RealtimePoseEngine:
         self._input_modality = _normalize_input_modality(input_modality)
         self._ir_preprocess = bool(ir_preprocess)
         self._model_input_size = normalize_model_input_size(model_input_size)
-        self._display_gamma = float(display_gamma)
         self._seg_infer_imgsz = int(self._model_input_size)
         self._pose_infer_imgsz = int(self._model_input_size)
         self._person_fill_background = _normalize_person_fill_background(person_fill_background)
@@ -2227,8 +2230,11 @@ class RealtimePoseEngine:
         for tid in stale:
             self._contour_track_state.pop(int(tid), None)
 
-    def _decode_image(self, data: bytes) -> np.ndarray:
-        return _decode_image_bytes_cpu(data)
+    def _decode_image(
+        self,
+        data: bytes,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        return _decode_image_views_cpu(data)
 
     def _ensure_uint8_gray(self, gray: np.ndarray) -> np.ndarray:
         """Ensure input is a single-channel uint8 image.
@@ -2250,13 +2256,17 @@ class RealtimePoseEngine:
         normalized = cv2.normalize(gray_float, None, 0, 255, cv2.NORM_MINMAX)
         return normalized.astype(np.uint8)
 
-    def _prepare_depth_views(self, depth_gray: np.ndarray) -> dict:
+    def _prepare_depth_views(
+        self,
+        depth_gray: np.ndarray,
+        received_gray: np.ndarray | None = None,
+    ) -> dict:
         return _prepare_depth_views_cpu(
             depth_gray,
             input_modality=self._input_modality,
+            received_gray=received_gray,
             ir_preprocess=self._ir_preprocess,
             model_input_size=self._model_input_size,
-            display_gamma=self._display_gamma,
         )
 
     def _analyze_frame(
@@ -2274,6 +2284,7 @@ class RealtimePoseEngine:
         depth_up = prepared["depth_up"]
         depth_raw = prepared["depth_raw"]
         color_img = prepared["color_img"]
+        render_source_img = prepared["render_source_img"]
         model_color_img = prepared.get("model_color_img", color_img)
         width = prepared["width"]
         height = prepared["height"]
@@ -2325,6 +2336,7 @@ class RealtimePoseEngine:
                 "depth_up": depth_up,
                 "depth_raw": depth_raw,
                 "color_img": color_img,
+                "render_source_img": render_source_img,
                 "records": [],
                 "person_count": int(len(pose_draw_indices)),
                 "pair_text": "Pair Dist: N/A",
@@ -2772,6 +2784,7 @@ class RealtimePoseEngine:
             "depth_up": depth_up,
             "depth_raw": depth_raw,
             "color_img": color_img,
+            "render_source_img": render_source_img,
             "records": records,
             "person_count": person_count,
             "pair_text": pair_text,
@@ -2799,7 +2812,11 @@ class RealtimePoseEngine:
         return analysis
 
     def _render_display(self, analysis: dict, display_mode: str) -> np.ndarray:
-        display = analysis["color_img"].copy()
+        display = _render_base_image_cpu(
+            analysis,
+            int(analysis["width"]),
+            int(analysis["height"]),
+        )
         records = analysis["records"]
         kpt_xy_np = analysis["kpt_xy_np"]
         kpt_conf_np = analysis["kpt_conf_np"]
@@ -3119,12 +3136,19 @@ class RealtimePoseEngine:
             return analyzed
         return self._finalize_analyzed_qualitative_fields(analyzed)
 
-    def _reuse_analyzed_result_with_depth(self, analyzed: dict, frame_id: str, depth: np.ndarray) -> dict:
-        prepared = self._prepare_depth_views(depth)
+    def _reuse_analyzed_result_with_depth(
+        self,
+        analyzed: dict,
+        frame_id: str,
+        depth: np.ndarray,
+        received_depth: np.ndarray | None = None,
+    ) -> dict:
+        prepared = self._prepare_depth_views(depth, received_depth)
         analysis = dict(analyzed["analysis"])
         analysis["depth_up"] = prepared["depth_up"]
         analysis["depth_raw"] = prepared["depth_raw"]
         analysis["color_img"] = prepared["color_img"]
+        analysis["render_source_img"] = prepared["render_source_img"]
         analysis["width"] = prepared["width"]
         analysis["height"] = prepared["height"]
         analysis["person_fill_background"] = self._person_fill_background
@@ -3213,18 +3237,32 @@ class RealtimePoseEngine:
 
         return encoded_results
 
-    def _decode_frames(self, frames: list[tuple[str, bytes]]) -> list[tuple[str, np.ndarray]]:
+    def _decode_frames(
+        self,
+        frames: list[tuple[str, bytes]],
+    ) -> list[tuple[str, np.ndarray, np.ndarray]]:
         return self._map_decode_stage(_decode_frame_cpu, frames)
 
     def _prepare_source_views(self, source_frames: list[dict]) -> list[dict]:
-        depths = [item["depth"] for item in source_frames]
         if self._cpu_worker_mode == CPU_WORKER_MODE_PROCESS:
             payloads = [
-                (depth, self._input_modality, self._ir_preprocess, self._model_input_size, self._display_gamma)
-                for depth in depths
+                (
+                    item["depth"],
+                    self._input_modality,
+                    self._ir_preprocess,
+                    self._model_input_size,
+                    item.get("received_depth"),
+                )
+                for item in source_frames
             ]
             return self._map_decode_stage(_prepare_depth_views_payload_cpu, payloads)
-        return [self._prepare_depth_views(depth) for depth in depths]
+        return [
+            self._prepare_depth_views(
+                item["depth"],
+                item.get("received_depth"),
+            )
+            for item in source_frames
+        ]
 
     def _finalize_deferred_distance_results(
         self,
@@ -3423,7 +3461,13 @@ class RealtimePoseEngine:
                 target.pop("_qualitative_finalized", None)
 
     def _infer_one_unlocked(self, frame_id: str, image_bytes: bytes) -> dict:
-        analyzed = self._analyze_predecoded_unlocked(frame_id, self._decode_image(image_bytes))
+        depth, received_depth = self._decode_image(image_bytes)
+        prepared = self._prepare_depth_views(depth, received_depth)
+        analyzed = self._analyze_predecoded_unlocked(
+            frame_id,
+            depth,
+            prepared=prepared,
+        )
         return self._encode_analyzed_result(analyzed)
 
     def infer(self, frame_id: str, image_bytes: bytes) -> dict:
@@ -3643,11 +3687,12 @@ class RealtimePoseEngine:
         source_frames: list[dict] = []
         stream_groups: dict[str, list[dict]] = {}
         stream_order: list[str] = []
-        for item, (frame_id, current_depth) in zip(normalized_items, decoded_frames):
+        for item, (frame_id, current_depth, received_depth) in zip(normalized_items, decoded_frames):
             source_item = {
                 **item,
                 "frame_id": frame_id,
                 "depth": current_depth,
+                "received_depth": received_depth,
             }
             source_frames.append(source_item)
             stream_key = str(source_item["stream_key"])
@@ -3941,11 +3986,12 @@ class RealtimePoseEngine:
             source_frames: list[dict] = []
             stream_groups: dict[str, list[dict]] = {}
             stream_order: list[str] = []
-            for item, (frame_id, current_depth) in zip(normalized_items, decoded_frames):
+            for item, (frame_id, current_depth, received_depth) in zip(normalized_items, decoded_frames):
                 source_item = {
                     **item,
                     "frame_id": frame_id,
                     "depth": current_depth,
+                    "received_depth": received_depth,
                 }
                 source_frames.append(source_item)
                 stream_key = str(source_item["stream_key"])
@@ -4172,12 +4218,13 @@ class RealtimePoseEngine:
             timings["decode_ms"] = _elapsed_ms(decode_start)
 
             source_frames: list[dict] = []
-            for input_index, (frame_id, current_depth) in enumerate(decoded_frames):
+            for input_index, (frame_id, current_depth, received_depth) in enumerate(decoded_frames):
                 source_frames.append(
                     {
                         "frame_id": frame_id,
                         "input_index": input_index,
                         "depth": current_depth,
+                        "received_depth": received_depth,
                     }
                 )
 
@@ -4188,7 +4235,7 @@ class RealtimePoseEngine:
                 interpolate_start = time.perf_counter()
                 output_frames: list[dict] = []
                 analyzed_results: list[dict] = []
-                for input_index, (frame_id, current_depth) in enumerate(decoded_frames):
+                for input_index, (frame_id, current_depth, _received_depth) in enumerate(decoded_frames):
                     current_analyzed = current_analyzed_by_input[input_index]
                     current_frame = {
                         "frame_id": f"{frame_id}_current",

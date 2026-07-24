@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
+from tof_pose.input_image import decode_received_grayscale
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -204,12 +206,7 @@ class SceneRateController:
 
     @staticmethod
     def _decode_gray(image_data: bytes) -> np.ndarray:
-        encoded = np.frombuffer(image_data, dtype=np.uint8)
-        image = cv2.imdecode(encoded, cv2.IMREAD_UNCHANGED)
-        if image is None:
-            raise ValueError("cannot decode image for adaptive scene analysis")
-        if image.ndim == 3:
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        image = decode_received_grayscale(image_data)
         if image.dtype != np.uint8:
             image_float = image.astype(np.float32, copy=False)
             min_value = float(np.min(image_float)) if image_float.size else 0.0

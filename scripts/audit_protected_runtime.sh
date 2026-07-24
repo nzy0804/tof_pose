@@ -15,6 +15,7 @@ protected_paths=(
   "ai_pb2"
   "ai_pb2_grpc"
   "scripts/grpc_server"
+  "tof_pose/input_image"
   "tof_pose/realtime_service"
   "tof_pose/tracking"
   "tof_pose/object_storage"
@@ -66,6 +67,7 @@ audit_runtime() {
 
   if find "$runtime" -type f \
       \( -name 'grpc_server.py' \
+      -o -name 'input_image.py' \
       -o -name 'realtime_service.py' \
       -o -name 'tracking.py' \
       -o -name 'object_storage.py' \

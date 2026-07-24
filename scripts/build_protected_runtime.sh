@@ -35,7 +35,7 @@ cp "$SOURCE_DIR/scripts/grpc_server.py" "$SOURCE_STAGE/scripts/"
 cp "$SOURCE_DIR/scripts/grpc_server_bootstrap.py" "$SOURCE_STAGE/scripts/"
 cp "$SOURCE_DIR/src/tof_pose/__init__.py" "$SOURCE_STAGE/src/tof_pose/"
 
-for module in realtime_service tracking person_distance pose_drawing object_storage model_bundle paths scene_rate_controller; do
+for module in input_image realtime_service tracking person_distance pose_drawing object_storage model_bundle paths scene_rate_controller; do
   cp "$SOURCE_DIR/src/tof_pose/$module.py" "$SOURCE_STAGE/src/tof_pose/"
 done
 

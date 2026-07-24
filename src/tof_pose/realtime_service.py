@@ -1501,6 +1501,70 @@ def _render_skeleton_contour_cpu(
     return display
 
 
+def _build_scene_observation(analysis: dict) -> dict:
+    source = analysis.get("color_img")
+    if isinstance(source, np.ndarray) and source.ndim >= 2:
+        source_height, source_width = source.shape[:2]
+    else:
+        source_height, source_width = 1, 1
+
+    tracks: list[dict] = []
+    for record in analysis.get("records") or []:
+        try:
+            track_id = int(record.get("track_id", -1))
+        except (TypeError, ValueError):
+            continue
+        if track_id < 0:
+            continue
+
+        mask = record.get("mask")
+        mask_area_ratio = 0.0
+        mask_center = (0.0, 0.0)
+        if isinstance(mask, np.ndarray) and mask.ndim >= 2 and mask.size > 0:
+            binary_mask = np.asarray(mask > 0, dtype=np.uint8)
+            mask_height, mask_width = binary_mask.shape[:2]
+            nonzero_count = int(cv2.countNonZero(binary_mask))
+            mask_area_ratio = float(nonzero_count) / float(binary_mask.size)
+            if nonzero_count > 0:
+                moments = cv2.moments(binary_mask, binaryImage=True)
+                if moments["m00"] > 0:
+                    mask_center = (
+                        float(moments["m10"] / moments["m00"]) / max(1, mask_width),
+                        float(moments["m01"] / moments["m00"]) / max(1, mask_height),
+                    )
+
+        keypoints = record.get("keypoints")
+        confidences = record.get("kpt_conf")
+        normalized_keypoints: list[tuple[float, float, float]] = []
+        if keypoints is not None and confidences is not None:
+            keypoint_array = np.asarray(keypoints)
+            confidence_array = np.asarray(confidences).reshape(-1)
+            if keypoint_array.ndim >= 2 and keypoint_array.shape[-1] >= 2:
+                for point, confidence in zip(keypoint_array, confidence_array):
+                    normalized_keypoints.append(
+                        (
+                            float(point[0]) / max(1, source_width),
+                            float(point[1]) / max(1, source_height),
+                            float(confidence),
+                        )
+                    )
+
+        tracks.append(
+            {
+                "track_id": track_id,
+                "confidence": float(record.get("person_conf", 0.0) or 0.0),
+                "mask_area_ratio": mask_area_ratio,
+                "mask_center": mask_center,
+                "keypoints": normalized_keypoints,
+            }
+        )
+
+    return {
+        "person_count": int(analysis.get("person_count", len(tracks)) or 0),
+        "tracks": tracks,
+    }
+
+
 def _render_analyzed_result_cpu(analyzed: dict) -> dict:
     analysis = analyzed["analysis"]
     return {
@@ -1511,6 +1575,7 @@ def _render_analyzed_result_cpu(analyzed: dict) -> dict:
         "person_count": int(analyzed["person_count"]),
         "processing_time_ms": int(analyzed["processing_time_ms"]),
         **_copy_qualitative_result_fields(analyzed),
+        "_scene_observation": _build_scene_observation(analysis),
     }
 
 
@@ -1557,6 +1622,7 @@ def _encode_rendered_result_cpu(payload: tuple[dict, str, int, int]) -> dict:
         "person_count": person_count,
         "processing_time_ms": int(rendered["processing_time_ms"]),
         **_copy_qualitative_result_fields(rendered),
+        "_scene_observation": rendered.get("_scene_observation"),
     }
 
 
@@ -1587,6 +1653,7 @@ def _render_and_encode_analyzed_result_cpu(payload: tuple[dict, str, int, int]) 
         "person_count": person_count,
         "processing_time_ms": int(analyzed["processing_time_ms"]),
         **_copy_qualitative_result_fields(analyzed),
+        "_scene_observation": _build_scene_observation(analysis),
         "_render_ms": render_ms,
         "_encode_ms": encode_ms,
     }
@@ -3083,6 +3150,7 @@ class RealtimePoseEngine:
             "person_count": int(analyzed["person_count"]),
             "processing_time_ms": int(analyzed["processing_time_ms"]),
             **_copy_qualitative_result_fields(analyzed),
+            "_scene_observation": _build_scene_observation(analysis),
         }
 
     def _encode_rendered_result(self, rendered: dict) -> dict:
@@ -3097,6 +3165,7 @@ class RealtimePoseEngine:
             "person_count": person_count,
             "processing_time_ms": int(rendered["processing_time_ms"]),
             **_copy_qualitative_result_fields(rendered),
+            "_scene_observation": rendered.get("_scene_observation"),
         }
 
     def _encode_analyzed_result(self, analyzed: dict) -> dict:

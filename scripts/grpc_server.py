@@ -26,19 +26,6 @@ for path in (ROOT, SRC):
     if path not in sys.path:
         sys.path.insert(0, path)
 
-# Ensure Ultralytics can write its settings/config somewhere writable.
-# NOTE: keep runtime compatibility with Ultralytics' expected env var name,
-# while avoiding the token appearing verbatim in deployment configs.
-_cfg_env = "".join(["Y", "O", "L", "O", "_CONFIG_DIR"])
-if not os.environ.get(_cfg_env):
-    home_dir = os.path.expanduser('~')
-    if home_dir and home_dir != '~':
-        os.environ[_cfg_env] = os.path.join(home_dir, '.ultralytics')
-        try:
-            os.makedirs(os.environ[_cfg_env], exist_ok=True)
-        except Exception:
-            pass
-
 import ai_pb2
 import ai_pb2_grpc
 
@@ -90,6 +77,13 @@ from tof_pose.realtime_service import (
 from tof_pose.object_storage import (
     ObjectStorageConfig,
     create_object_storage_client,
+)
+from tof_pose.scene_rate_controller import (
+    SCENE_MODE_OFF,
+    SCENE_MODES,
+    SceneBatchPlan,
+    SceneRateConfig,
+    SceneRateController,
 )
 
 
@@ -476,11 +470,13 @@ class _AsyncInferenceManager:
         result_buffer_size: int,
         prepare_workers: int,
         result_workers: int,
+        scene_rate_controller: SceneRateController,
         retry_after_ms: int = 100,
     ) -> None:
         self._servicer = servicer
         self._device_window = max(1, int(device_window))
         self._retry_after_ms = max(0, int(retry_after_ms))
+        self._scene_rate_controller = scene_rate_controller
         self._lock = threading.Lock()
         self._device_states: dict[str, _AsyncDeviceState] = {}
         self._prepare_executor = ThreadPoolExecutor(
@@ -629,6 +625,16 @@ class _AsyncInferenceManager:
             )
             if len(frames) != len(job.images):
                 raise RuntimeError(f"expected {len(job.images)} downloaded frames, got {len(frames)}")
+            scene_plan = self._scene_rate_controller.plan_batch(
+                device_id=job.device_id,
+                sequence_id=job.sequence_id,
+                frames=frames,
+                capture_timestamps_ms=[
+                    int(getattr(image, "capture_timestamp_ms", 0) or 0)
+                    for image in job.images
+                ],
+            )
+            model_frames = [frames[index] for index in scene_plan.model_indices]
 
             engine_index, engine, stream_key, engine_inflight = self._servicer._acquire_engine(
                 job.device_id,
@@ -641,13 +647,13 @@ class _AsyncInferenceManager:
                         raise RuntimeError(f"dynamic batcher missing for model-{engine_index}")
                     model_stage_future, result_future = self._servicer._dynamic_batchers[engine_index].submit_pipeline_async(
                         stream_key=stream_key,
-                        frames=frames,
+                        frames=model_frames,
                     )
                 else:
                     model_stage_future = Future()
                     result_future = Future()
                     try:
-                        result_future.set_result(engine.infer_batch(frames))
+                        result_future.set_result(engine.infer_batch(model_frames))
                         model_stage_future.set_result(None)
                     except Exception as exc:
                         model_stage_future.set_exception(exc)
@@ -674,6 +680,7 @@ class _AsyncInferenceManager:
                         stage_state=stage_state,
                         oss_download_ms=oss_download_ms,
                         oss_download_stats=oss_download_stats,
+                        scene_plan=scene_plan,
                     )
                 )
             except Exception:
@@ -732,14 +739,28 @@ class _AsyncInferenceManager:
         stage_state: dict,
         oss_download_ms: int,
         oss_download_stats: dict[str, int],
+        scene_plan: SceneBatchPlan,
     ) -> None:
         if stage_state.get("failed"):
             return
         engine_infer_ms = int(stage_state.get("engine_infer_ms", int((time.perf_counter() - engine_start) * 1000)))
         try:
-            results = result_future.result()
+            model_results = result_future.result()
+            if len(model_results) != scene_plan.model_input_count:
+                raise RuntimeError(
+                    (
+                        f"expected {scene_plan.model_input_count} model results "
+                        f"for {scene_plan.input_count} inputs, got {len(model_results)}"
+                    )
+                )
+            results = self._scene_rate_controller.finalize_batch(
+                plan=scene_plan,
+                model_results=model_results,
+            )
             if len(results) != len(images):
-                raise RuntimeError(f"expected {len(images)} results for {len(images)} inputs, got {len(results)}")
+                raise RuntimeError(
+                    f"expected {len(images)} finalized results, got {len(results)}"
+                )
             self._servicer._annotate_result_capture_timestamps(job.device_id, images, results)
         except Exception as exc:
             logging.exception(
@@ -760,6 +781,7 @@ class _AsyncInferenceManager:
             oss_download_stats,
             engine_infer_ms,
             engine_inflight,
+            scene_plan,
         )
 
     def _result_message_from_dict(self, result: dict, fallback_output_index: int) -> ai_pb2.InferResult:
@@ -804,6 +826,7 @@ class _AsyncInferenceManager:
         oss_download_stats: dict[str, int],
         engine_infer_ms: int,
         engine_inflight: str,
+        scene_plan: SceneBatchPlan,
     ) -> None:
         try:
             result_image_ms, result_image_stats = self._servicer._prepare_result_images_for_response(results)
@@ -822,7 +845,8 @@ class _AsyncInferenceManager:
                     "inputs=%d results=%d oss_download_ms=%d oss_download_count=%d "
                     "engine_infer_ms=%d result_image_ms=%d result_image_count=%d "
                     "result_image_bytes=%d "
-                    "processing_time_ms=%d engine_inflight=%s"
+                    "processing_time_ms=%d engine_inflight=%s adaptive_mode=%s "
+                    "scene_state=%s model_inputs=%d scheduled_inputs=%d"
                 ),
                 job.device_id,
                 job.batch_id,
@@ -837,6 +861,10 @@ class _AsyncInferenceManager:
                 result_image_stats.get("bytes", 0),
                 event.processing_time_ms,
                 engine_inflight,
+                scene_plan.mode,
+                scene_plan.state_after_plan,
+                scene_plan.model_input_count,
+                scene_plan.scheduled_input_count,
             )
         except Exception as exc:
             logging.exception(
@@ -920,6 +948,7 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         async_result_buffer_size: int = 1000,
         async_prepare_workers: int = 8,
         async_result_workers: int = 16,
+        scene_rate_config: SceneRateConfig | None = None,
         oss_config: ObjectStorageConfig | None = None,
         oss_workers: int | None = 4,
         oss_download_workers: int | None = 8,
@@ -957,6 +986,7 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
         self._async_prepare_workers = max(1, int(async_prepare_workers))
         self._async_result_workers = max(1, int(async_result_workers))
         self._async_manager: _AsyncInferenceManager | None = None
+        self._scene_rate_controller = SceneRateController(scene_rate_config)
         self._capture_timestamp_lock = threading.Lock()
         self._last_capture_timestamp_by_device: dict[str, int] = {}
         self._oss_config = oss_config
@@ -1117,6 +1147,7 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
                 result_buffer_size=self._async_result_buffer_size,
                 prepare_workers=self._async_prepare_workers,
                 result_workers=self._async_result_workers,
+                scene_rate_controller=self._scene_rate_controller,
             )
             logging.info(
                 (
@@ -1127,6 +1158,26 @@ class ModelServiceServicer(ai_pb2_grpc.ModelServiceServicer):
                 self._async_result_buffer_size,
                 self._async_prepare_workers,
                 self._async_result_workers,
+            )
+        elif self._scene_rate_controller.enabled:
+            logging.warning(
+                "Adaptive scene rate is enabled without async inference and will not affect Infer requests"
+            )
+        if self._scene_rate_controller.enabled:
+            config = self._scene_rate_controller.config
+            logging.info(
+                (
+                    "Adaptive scene rate enabled: mode=%s empty_hz=%.3f "
+                    "static_hz=%.3f active_hz=%.3f motion_pixel_threshold=%d "
+                    "motion_weak_ratio=%.4f motion_strong_ratio=%.4f"
+                ),
+                self._scene_rate_controller.mode,
+                config.empty_hz,
+                config.static_hz,
+                config.active_hz,
+                config.motion_pixel_threshold,
+                config.motion_weak_ratio,
+                config.motion_strong_ratio,
             )
 
     def _prune_stale_device_bindings(self, now: float) -> None:
@@ -1617,6 +1668,7 @@ def serve(
     async_result_buffer_size: int = 1000,
     async_prepare_workers: int = 8,
     async_result_workers: int = 16,
+    scene_rate_config: SceneRateConfig | None = None,
     oss_config: ObjectStorageConfig | None = None,
     oss_workers: int | None = 4,
     oss_download_workers: int | None = 8,
@@ -1686,6 +1738,7 @@ def serve(
             async_result_buffer_size=async_result_buffer_size,
             async_prepare_workers=async_prepare_workers,
             async_result_workers=async_result_workers,
+            scene_rate_config=scene_rate_config,
             oss_config=oss_config,
             oss_workers=oss_workers,
             oss_download_workers=oss_download_workers,
@@ -1915,6 +1968,30 @@ def main():
         type=int,
         help='background workers for async output upload and result publication',
     )
+    parser.add_argument(
+        '--adaptive-infer-mode',
+        default=SCENE_MODE_OFF,
+        choices=SCENE_MODES,
+        help='adaptive scene-rate policy for async inference',
+    )
+    parser.add_argument('--adaptive-empty-hz', default=1.0, type=float)
+    parser.add_argument('--adaptive-static-hz', default=5.0, type=float)
+    parser.add_argument('--adaptive-active-hz', default=10.0, type=float)
+    parser.add_argument('--adaptive-motion-pixel-threshold', default=12, type=int)
+    parser.add_argument('--adaptive-motion-weak-ratio', default=0.015, type=float)
+    parser.add_argument('--adaptive-motion-strong-ratio', default=0.05, type=float)
+    parser.add_argument('--adaptive-motion-weak-frames', default=2, type=int)
+    parser.add_argument('--adaptive-active-min-ms', default=3000, type=int)
+    parser.add_argument('--adaptive-static-confirm-ms', default=3000, type=int)
+    parser.add_argument('--adaptive-empty-confirm-count', default=3, type=int)
+    parser.add_argument('--adaptive-empty-confirm-ms', default=1000, type=int)
+    parser.add_argument('--adaptive-state-stale-ms', default=6000, type=int)
+    parser.add_argument('--adaptive-state-ttl-sec', default=300.0, type=float)
+    parser.add_argument('--adaptive-min-track-confidence', default=0.35, type=float)
+    parser.add_argument('--adaptive-max-mask-area-change-ratio', default=0.10, type=float)
+    parser.add_argument('--adaptive-max-mask-center-shift-ratio', default=0.03, type=float)
+    parser.add_argument('--adaptive-max-keypoint-speed-ratio', default=0.12, type=float)
+    parser.add_argument('--adaptive-keypoint-confidence', default=0.35, type=float)
     parser.add_argument('--oss-provider', default=None, choices=('aliyun', 's3'), help='object storage provider for request/result object keys')
     parser.add_argument('--oss-endpoint', default=None, help='object storage endpoint')
     parser.add_argument('--oss-bucket', default=None, help='object storage bucket name')
@@ -1967,6 +2044,27 @@ def main():
     )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
+    scene_rate_config = SceneRateConfig(
+        mode=args.adaptive_infer_mode,
+        empty_hz=args.adaptive_empty_hz,
+        static_hz=args.adaptive_static_hz,
+        active_hz=args.adaptive_active_hz,
+        motion_pixel_threshold=args.adaptive_motion_pixel_threshold,
+        motion_weak_ratio=args.adaptive_motion_weak_ratio,
+        motion_strong_ratio=args.adaptive_motion_strong_ratio,
+        motion_weak_frames=args.adaptive_motion_weak_frames,
+        active_min_ms=args.adaptive_active_min_ms,
+        static_confirm_ms=args.adaptive_static_confirm_ms,
+        empty_confirm_count=args.adaptive_empty_confirm_count,
+        empty_confirm_ms=args.adaptive_empty_confirm_ms,
+        state_stale_ms=args.adaptive_state_stale_ms,
+        state_ttl_sec=args.adaptive_state_ttl_sec,
+        min_track_confidence=args.adaptive_min_track_confidence,
+        max_mask_area_change_ratio=args.adaptive_max_mask_area_change_ratio,
+        max_mask_center_shift_ratio=args.adaptive_max_mask_center_shift_ratio,
+        max_keypoint_speed_ratio=args.adaptive_max_keypoint_speed_ratio,
+        keypoint_confidence=args.adaptive_keypoint_confidence,
+    )
     oss_config = ObjectStorageConfig.from_values(
         provider=args.oss_provider,
         endpoint=args.oss_endpoint,
@@ -2030,6 +2128,7 @@ def main():
         async_result_buffer_size=args.async_result_buffer_size,
         async_prepare_workers=args.async_prepare_workers,
         async_result_workers=args.async_result_workers,
+        scene_rate_config=scene_rate_config,
         oss_config=oss_config,
         oss_workers=args.oss_workers,
         oss_download_workers=args.oss_download_workers,

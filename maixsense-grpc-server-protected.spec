@@ -47,6 +47,7 @@ protected_modules = [
     "tof_pose.paths",
     "tof_pose.person_distance",
     "tof_pose.pose_drawing",
+    "tof_pose.scene_rate_controller",
 ]
 
 hiddenimports = protected_modules + [

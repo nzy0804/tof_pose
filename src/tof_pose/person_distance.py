@@ -120,7 +120,7 @@ def estimate_person_distance_from_mask(
     mask_is_binary: bool = False,
     include_draw_contour: bool = True,
 ) -> PersonDistanceEstimate:
-    """根据 YOLO segmentation mask 估计人体距离并提取轮廓。"""
+    """根据人体分割 mask 估计人体距离并提取轮廓。"""
     height, width = depth_map.shape[:2]
     clipped = _clip_box(box, width, height)
     if clipped is None:

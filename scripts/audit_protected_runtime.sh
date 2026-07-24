@@ -22,6 +22,7 @@ protected_paths=(
   "tof_pose/paths"
   "tof_pose/person_distance"
   "tof_pose/pose_drawing"
+  "tof_pose/scene_rate_controller"
 )
 
 audit_extensions() {
@@ -72,6 +73,7 @@ audit_runtime() {
       -o -name 'person_distance.py' \
       -o -name 'pose_drawing.py' \
       -o -name 'paths.py' \
+      -o -name 'scene_rate_controller.py' \
       -o -name 'ai_pb2.py' \
       -o -name 'ai_pb2_grpc.py' \
       -o -name 'setup_protected.py' \

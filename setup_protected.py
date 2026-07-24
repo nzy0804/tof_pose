@@ -20,6 +20,7 @@ PROTECTED_MODULES = {
     "tof_pose.object_storage": "src/tof_pose/object_storage.py",
     "tof_pose.model_bundle": "src/tof_pose/model_bundle.py",
     "tof_pose.paths": "src/tof_pose/paths.py",
+    "tof_pose.scene_rate_controller": "src/tof_pose/scene_rate_controller.py",
 }
 
 

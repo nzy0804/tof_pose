@@ -16,7 +16,7 @@ MODELS_DIR = ASSETS_DIR / "models"
 OUTPUTS_DIR = (Path.cwd() / "outputs") if _bundled_root() else (_ROOT / "outputs")
 VIDEOS_DIR = OUTPUTS_DIR / "videos"
 
-DEFAULT_MODEL_PATH = MODELS_DIR / "yolo11l-seg.pt"
-DEFAULT_POSE_MODEL_PATH = MODELS_DIR / "yolo11l-pose.pt"
+DEFAULT_MODEL_PATH = MODELS_DIR / "model-seg.pt"
+DEFAULT_POSE_MODEL_PATH = MODELS_DIR / "model-pose.pt"
 DEFAULT_CAPTURE_VIDEO = VIDEOS_DIR / "tof_capture.mp4"
 DEFAULT_POSE_VIDEO = VIDEOS_DIR / "tof_pose_result.mp4"

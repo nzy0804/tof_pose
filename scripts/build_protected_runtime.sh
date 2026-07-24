@@ -35,7 +35,7 @@ cp "$SOURCE_DIR/scripts/grpc_server.py" "$SOURCE_STAGE/scripts/"
 cp "$SOURCE_DIR/scripts/grpc_server_bootstrap.py" "$SOURCE_STAGE/scripts/"
 cp "$SOURCE_DIR/src/tof_pose/__init__.py" "$SOURCE_STAGE/src/tof_pose/"
 
-for module in realtime_service tracking person_distance pose_drawing object_storage model_bundle paths; do
+for module in realtime_service tracking person_distance pose_drawing object_storage model_bundle paths scene_rate_controller; do
   cp "$SOURCE_DIR/src/tof_pose/$module.py" "$SOURCE_STAGE/src/tof_pose/"
 done
 
@@ -69,9 +69,11 @@ bash "$SOURCE_DIR/scripts/audit_protected_runtime.sh" --extensions-only "$PACKAG
 PYTHONPATH="$PACKAGE_STAGE:$PACKAGE_STAGE/src" python - <<'PY'
 from scripts.grpc_server import main
 from tof_pose.realtime_service import RealtimePoseEngine
+from tof_pose.scene_rate_controller import SceneRateController
 
 assert callable(main)
 assert RealtimePoseEngine is not None
+assert SceneRateController is not None
 print("protected import smoke passed")
 PY
 
